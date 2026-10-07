@@ -15,29 +15,30 @@ MARKET_HISTORY_MAX = 120
 
 KALSHI_BASE = os.getenv(
     "KALSHI_BASE_URL",
-    "https://api.elections.kalshi.com/trade-api/v2",
+    "https://api.elections.kalshi.com/trade-api/v2"
 )
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "BTC-Strike-AI/6.0"
+    "User-Agent": "BTC-Strike-AI/7.0"
 })
 
 cache = {
     "time": 0,
-    "state": None,
+    "state": None
 }
 
 history_cache = {
     "time": 0,
-    "candles": [],
+    "candles": []
 }
 
 market_history = []
+feed_health = {}
 
 
 # =========================================================
-# BASIC HELPERS
+# HELPERS
 # =========================================================
 
 def num(value):
@@ -49,13 +50,13 @@ def num(value):
 
 def get_json(url, params=None):
     try:
-        response = session.get(
+        r = session.get(
             url,
             params=params,
-            timeout=TIMEOUT,
+            timeout=TIMEOUT
         )
-        response.raise_for_status()
-        return response.json()
+        r.raise_for_status()
+        return r.json()
     except Exception:
         return None
 
@@ -70,7 +71,9 @@ def parse_time(value):
         )
 
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
 
         return dt
 
@@ -86,12 +89,33 @@ def seconds_left(value):
 
     return max(
         0,
-        int(dt.timestamp() - time.time())
+        int(
+            dt.timestamp() - time.time()
+        )
     )
 
 
+def mark_feed(name, value):
+
+    now = time.time()
+
+    item = feed_health.setdefault(
+        name,
+        {}
+    )
+
+    if value is not None:
+        item["last_success"] = now
+        item["last_value"] = value
+        item["online"] = True
+    else:
+        item["online"] = False
+
+    return value
+
+
 # =========================================================
-# BTC LIVE PRICE
+# BTC LIVE FEEDS
 # =========================================================
 
 def get_spot_feeds():
@@ -101,15 +125,20 @@ def get_spot_feeds():
     # Binance
     data = get_json(
         "https://api.binance.com/api/v3/ticker/price",
-        {"symbol": "BTCUSDT"},
+        {"symbol": "BTCUSDT"}
     )
 
     if isinstance(data, dict):
-        feeds["Binance"] = num(
+        value = num(
             data.get("price")
         )
     else:
-        feeds["Binance"] = None
+        value = None
+
+    feeds["Binance"] = mark_feed(
+        "Binance",
+        value
+    )
 
     # Coinbase
     data = get_json(
@@ -117,27 +146,38 @@ def get_spot_feeds():
     )
 
     try:
-        feeds["Coinbase"] = num(
+        value = num(
             data["data"]["amount"]
         )
     except Exception:
-        feeds["Coinbase"] = None
+        value = None
+
+    feeds["Coinbase"] = mark_feed(
+        "Coinbase",
+        value
+    )
 
     # Kraken
     data = get_json(
         "https://api.kraken.com/0/public/Ticker",
-        {"pair": "XBTUSD"},
+        {"pair": "XBTUSD"}
     )
 
     try:
         result = data["result"]
         pair = next(iter(result))
 
-        feeds["Kraken"] = num(
+        value = num(
             result[pair]["c"][0]
         )
+
     except Exception:
-        feeds["Kraken"] = None
+        value = None
+
+    feeds["Kraken"] = mark_feed(
+        "Kraken",
+        value
+    )
 
     # Bitstamp
     data = get_json(
@@ -145,27 +185,36 @@ def get_spot_feeds():
     )
 
     if isinstance(data, dict):
-        feeds["Bitstamp"] = num(
+        value = num(
             data.get("last")
         )
     else:
-        feeds["Bitstamp"] = None
+        value = None
+
+    feeds["Bitstamp"] = mark_feed(
+        "Bitstamp",
+        value
+    )
 
     valid = [
         value
         for value in feeds.values()
-        if value is not None and value > 0
+        if value is not None
+        and value > 0
     ]
 
     if not valid:
         return None, feeds
 
-    median = statistics.median(valid)
+    median = statistics.median(
+        valid
+    )
 
     filtered = [
         value
         for value in valid
-        if abs(value - median) / median <= 0.0035
+        if abs(value - median)
+        / median <= 0.0035
     ]
 
     reference = statistics.median(
@@ -176,116 +225,244 @@ def get_spot_feeds():
 
 
 # =========================================================
-# 1-MINUTE HISTORY
+# BTC DATA QUALITY
 # =========================================================
 
-def coinbase_candles():
+def calculate_feed_quality(feeds):
 
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=21)
+    now = time.time()
 
-    data = get_json(
-        "https://api.exchange.coinbase.com/products/BTC-USD/candles",
-        {
-            "granularity": 60,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-        },
-    )
+    live = 0
+    fresh = 0
 
-    candles = []
+    values = []
 
-    if isinstance(data, list):
+    details = {}
 
-        for row in data:
+    for name, value in feeds.items():
 
-            try:
-                timestamp = float(row[0])
-                close = num(row[4])
-
-                if close is not None:
-                    candles.append(
-                        (timestamp, close)
-                    )
-
-            except Exception:
-                pass
-
-    candles.sort()
-
-    return candles
-
-
-def kraken_candles():
-
-    data = get_json(
-        "https://api.kraken.com/0/public/OHLC",
-        {
-            "pair": "XBTUSD",
-            "interval": 1,
-        },
-    )
-
-    candles = []
-
-    try:
-        result = data["result"]
-
-        pair = next(
-            key
-            for key in result
-            if key != "last"
+        item = feed_health.get(
+            name,
+            {}
         )
 
-        for row in result[pair][-21:]:
+        last_success = item.get(
+            "last_success"
+        )
 
-            timestamp = float(row[0])
-            close = num(row[4])
+        age = (
+            now - last_success
+            if last_success
+            else None
+        )
 
-            if close is not None:
-                candles.append(
-                    (timestamp, close)
-                )
+        online = (
+            value is not None
+        )
 
-    except Exception:
-        pass
+        is_fresh = (
+            online
+            and
+            age is not None
+            and
+            age <= 20
+        )
 
-    candles.sort()
+        if online:
+            live += 1
+            values.append(value)
 
-    return candles
+        if is_fresh:
+            fresh += 1
+
+        details[name] = {
+            "online": online,
+            "fresh": is_fresh,
+            "age": (
+                round(age, 1)
+                if age is not None
+                else None
+            ),
+            "price": (
+                round(value, 2)
+                if value is not None
+                else None
+            )
+        }
+
+    spread = None
+
+    if len(values) >= 2:
+
+        median = statistics.median(
+            values
+        )
+
+        if median:
+            spread = (
+                max(values)
+                - min(values)
+            ) / median * 100
+
+    score = 0
+
+    # Number of working feeds
+    if live == 4:
+        score += 35
+    elif live == 3:
+        score += 30
+    elif live == 2:
+        score += 20
+    elif live == 1:
+        score += 8
+
+    # Freshness
+    if fresh == 4:
+        score += 25
+    elif fresh == 3:
+        score += 22
+    elif fresh == 2:
+        score += 15
+    elif fresh == 1:
+        score += 5
+
+    # Exchange agreement
+    if spread is not None:
+
+        if spread <= 0.03:
+            score += 30
+
+        elif spread <= 0.08:
+            score += 25
+
+        elif spread <= 0.20:
+            score += 15
+
+        elif spread <= 0.35:
+            score += 5
+
+    # Require at least two independent feeds
+    if live >= 2:
+        score += 10
+
+    score = min(
+        100,
+        score
+    )
+
+    if score >= 85:
+        grade = "HIGH"
+
+    elif score >= 70:
+        grade = "GOOD"
+
+    elif score >= 50:
+        grade = "FAIR"
+
+    else:
+        grade = "LOW"
+
+    return {
+        "score": score,
+        "grade": grade,
+        "live": live,
+        "fresh": fresh,
+        "spread": (
+            round(spread, 4)
+            if spread is not None
+            else None
+        ),
+        "details": details
+    }
 
 
-def binance_candles():
+# =========================================================
+# CANDLE HISTORY
+# =========================================================
+
+def get_candle_source(
+    url,
+    params,
+    mode
+):
 
     data = get_json(
-        "https://api.binance.com/api/v3/klines",
-        {
-            "symbol": "BTCUSDT",
-            "interval": "1m",
-            "limit": 21,
-        },
+        url,
+        params
     )
 
     candles = []
 
-    if isinstance(data, list):
+    if mode == "coinbase":
 
-        for row in data:
+        rows = (
+            data
+            if isinstance(data, list)
+            else []
+        )
+
+        for row in rows:
 
             try:
-                timestamp = (
-                    float(row[0]) / 1000
+                candles.append(
+                    (
+                        float(row[0]),
+                        num(row[4])
+                    )
+                )
+            except Exception:
+                pass
+
+    elif mode == "kraken":
+
+        try:
+            result = data["result"]
+
+            pair = next(
+                key
+                for key in result
+                if key != "last"
+            )
+
+            for row in result[pair][-21:]:
+
+                candles.append(
+                    (
+                        float(row[0]),
+                        num(row[4])
+                    )
                 )
 
-                close = num(row[4])
+        except Exception:
+            pass
 
-                if close is not None:
-                    candles.append(
-                        (timestamp, close)
+    elif mode == "binance":
+
+        rows = (
+            data
+            if isinstance(data, list)
+            else []
+        )
+
+        for row in rows:
+
+            try:
+
+                candles.append(
+                    (
+                        float(row[0]) / 1000,
+                        num(row[4])
                     )
+                )
 
             except Exception:
                 pass
+
+    candles = [
+        (ts, close)
+        for ts, close in candles
+        if close is not None
+    ]
 
     candles.sort()
 
@@ -302,21 +479,70 @@ def get_history():
         now - history_cache["time"]
         < HISTORY_REFRESH
     ):
+
         return history_cache["candles"]
 
+    end = datetime.now(
+        timezone.utc
+    )
+
+    start = (
+        end
+        - timedelta(minutes=21)
+    )
+
     sources = [
-        coinbase_candles,
-        kraken_candles,
-        binance_candles,
+
+        (
+            "Coinbase",
+            "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+            {
+                "granularity": 60,
+                "start": start.isoformat(),
+                "end": end.isoformat()
+            },
+            "coinbase"
+        ),
+
+        (
+            "Kraken",
+            "https://api.kraken.com/0/public/OHLC",
+            {
+                "pair": "XBTUSD",
+                "interval": 1
+            },
+            "kraken"
+        ),
+
+        (
+            "Binance",
+            "https://api.binance.com/api/v3/klines",
+            {
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "limit": 21
+            },
+            "binance"
+        )
     ]
 
     best = []
 
-    for source in sources:
+    for (
+        name,
+        url,
+        params,
+        mode
+    ) in sources:
 
-        candles = source()
+        candles = get_candle_source(
+            url,
+            params,
+            mode
+        )
 
         if len(candles) >= 16:
+
             best = candles
             break
 
@@ -326,27 +552,34 @@ def get_history():
     return best
 
 
-def momentum(candles, minutes):
+def momentum(
+    candles,
+    minutes
+):
 
     if len(candles) < 2:
         return None
 
-    current_time, current = candles[-1]
+    current_ts, current = candles[-1]
 
-    target_time = (
-        current_time - minutes * 60
+    target_ts = (
+        current_ts
+        - minutes * 60
     )
 
     previous = None
 
     for timestamp, close in candles:
 
-        if timestamp <= target_time:
+        if timestamp <= target_ts:
             previous = close
         else:
             break
 
-    if previous in (None, 0):
+    if previous in (
+        None,
+        0
+    ):
         return None
 
     return (
@@ -373,14 +606,22 @@ def price_structure(candles):
         and
         min(second) > min(first)
     ):
-        return "HIGHER HIGHS / HIGHER LOWS"
+
+        return (
+            "HIGHER HIGHS / "
+            "HIGHER LOWS"
+        )
 
     if (
         max(second) < max(first)
         and
         min(second) < min(first)
     ):
-        return "LOWER HIGHS / LOWER LOWS"
+
+        return (
+            "LOWER HIGHS / "
+            "LOWER LOWS"
+        )
 
     return "MIXED"
 
@@ -389,7 +630,10 @@ def price_structure(candles):
 # KALSHI
 # =========================================================
 
-def probability(market, *keys):
+def probability(
+    market,
+    *keys
+):
 
     for key in keys:
 
@@ -407,72 +651,102 @@ def probability(market, *keys):
     return None
 
 
-def normalize_market(market):
+def normalize_market(
+    market
+):
 
     if (
-        not isinstance(market, dict)
+        not isinstance(
+            market,
+            dict
+        )
         or
-        not market.get("ticker")
+        not market.get(
+            "ticker"
+        )
     ):
         return None
 
     return {
-        "ticker": market.get("ticker"),
 
-        "title": (
-            market.get("title")
-            or
-            market.get("subtitle")
-            or
-            ""
-        ),
+        "ticker":
+            market.get("ticker"),
 
-        "yes_bid": probability(
-            market,
-            "yes_bid_dollars",
-            "yes_bid",
-        ),
+        "title":
+            (
+                market.get("title")
+                or
+                market.get("subtitle")
+                or
+                ""
+            ),
 
-        "yes_ask": probability(
-            market,
-            "yes_ask_dollars",
-            "yes_ask",
-        ),
+        "yes_bid":
+            probability(
+                market,
+                "yes_bid_dollars",
+                "yes_bid"
+            ),
 
-        "last": probability(
-            market,
-            "last_price_dollars",
-            "last_price",
-        ),
+        "yes_ask":
+            probability(
+                market,
+                "yes_ask_dollars",
+                "yes_ask"
+            ),
 
-        "floor_strike": num(
-            market.get("floor_strike")
-        ),
+        "last":
+            probability(
+                market,
+                "last_price_dollars",
+                "last_price"
+            ),
 
-        "cap_strike": num(
-            market.get("cap_strike")
-        ),
+        "floor_strike":
+            num(
+                market.get(
+                    "floor_strike"
+                )
+            ),
 
-        "close_time": (
-            market.get("close_time")
-            or
-            market.get("expiration_time")
-        ),
+        "cap_strike":
+            num(
+                market.get(
+                    "cap_strike"
+                )
+            ),
 
-        "status": market.get("status"),
+        "close_time":
+            (
+                market.get(
+                    "close_time"
+                )
+                or
+                market.get(
+                    "expiration_time"
+                )
+            ),
 
-        "raw": market,
+        "status":
+            market.get(
+                "status"
+            ),
+
+        "raw":
+            market
     }
 
 
-def get_target(market):
+def get_target(
+    market
+):
 
     if not market:
         return None
 
     for key in (
         "floor_strike",
-        "cap_strike",
+        "cap_strike"
     ):
 
         value = market.get(key)
@@ -482,6 +756,7 @@ def get_target(market):
             and
             value > 1000
         ):
+
             return value
 
     raw = market.get(
@@ -508,6 +783,7 @@ def get_target(market):
                 and
                 value > 1000
             ):
+
                 return value
 
     return None
@@ -517,7 +793,7 @@ def get_kalshi():
 
     manual = os.getenv(
         "KALSHI_TICKER",
-        "",
+        ""
     ).strip()
 
     if manual:
@@ -526,19 +802,24 @@ def get_kalshi():
             f"{KALSHI_BASE}/markets/{manual}"
         )
 
-        if isinstance(data, dict):
+        if isinstance(
+            data,
+            dict
+        ):
 
             market = normalize_market(
                 data.get(
                     "market",
-                    data,
+                    data
                 )
             )
 
             if market:
 
                 market["target"] = (
-                    get_target(market)
+                    get_target(
+                        market
+                    )
                 )
 
                 return market
@@ -546,15 +827,24 @@ def get_kalshi():
     data = get_json(
         f"{KALSHI_BASE}/markets",
         {
-            "series_ticker": "KXBTC15M",
-            "status": "open",
-            "limit": 100,
-        },
+            "series_ticker":
+                "KXBTC15M",
+            "status":
+                "open",
+            "limit":
+                100
+        }
     )
 
     markets = (
-        data.get("markets", [])
-        if isinstance(data, dict)
+        data.get(
+            "markets",
+            []
+        )
+        if isinstance(
+            data,
+            dict
+        )
         else []
     )
 
@@ -563,14 +853,22 @@ def get_kalshi():
         data = get_json(
             f"{KALSHI_BASE}/markets",
             {
-                "status": "open",
-                "limit": 200,
-            },
+                "status":
+                    "open",
+                "limit":
+                    200
+            }
         )
 
         all_markets = (
-            data.get("markets", [])
-            if isinstance(data, dict)
+            data.get(
+                "markets",
+                []
+            )
+            if isinstance(
+                data,
+                dict
+            )
             else []
         )
 
@@ -580,7 +878,7 @@ def get_kalshi():
             if str(
                 market.get(
                     "ticker",
-                    "",
+                    ""
                 )
             ).startswith(
                 "KXBTC15M"
@@ -588,6 +886,7 @@ def get_kalshi():
         ]
 
     now = time.time()
+
     candidates = []
 
     for raw in markets:
@@ -595,7 +894,7 @@ def get_kalshi():
         ticker = str(
             raw.get(
                 "ticker",
-                "",
+                ""
             )
         )
 
@@ -605,9 +904,13 @@ def get_kalshi():
             continue
 
         close = parse_time(
-            raw.get("close_time")
+            raw.get(
+                "close_time"
+            )
             or
-            raw.get("expiration_time")
+            raw.get(
+                "expiration_time"
+            )
         )
 
         if (
@@ -615,17 +918,26 @@ def get_kalshi():
             and
             close.timestamp() > now
         ):
-            candidates.append(raw)
+
+            candidates.append(
+                raw
+            )
 
     if not candidates:
         return None
 
-    def close_timestamp(market):
+    def close_timestamp(
+        market
+    ):
 
         dt = parse_time(
-            market.get("close_time")
+            market.get(
+                "close_time"
+            )
             or
-            market.get("expiration_time")
+            market.get(
+                "expiration_time"
+            )
         )
 
         if dt:
@@ -644,62 +956,90 @@ def get_kalshi():
     if market:
 
         market["target"] = (
-            get_target(market)
+            get_target(
+                market
+            )
         )
 
     return market
 
 
-# =========================================================
-# KALSHI HISTORY
-# =========================================================
-
-def yes_mid(market):
+def yes_mid(
+    market
+):
 
     if not market:
         return None
 
-    bid = market.get("yes_bid")
-    ask = market.get("yes_ask")
+    bid = market.get(
+        "yes_bid"
+    )
+
+    ask = market.get(
+        "yes_ask"
+    )
 
     if (
         bid is not None
         and
         ask is not None
     ):
-        return (bid + ask) / 2
 
-    return market.get("last")
+        return (
+            bid + ask
+        ) / 2
+
+    return market.get(
+        "last"
+    )
 
 
-def record_market(market):
+# =========================================================
+# KALSHI HISTORY
+# =========================================================
 
-    mid = yes_mid(market)
+def record_market(
+    market
+):
+
+    mid = yes_mid(
+        market
+    )
 
     if mid is None:
         return
 
-    ticker = market.get("ticker")
     now = time.time()
+
+    ticker = market.get(
+        "ticker"
+    )
 
     market_history.append(
         (
             now,
             ticker,
-            mid,
+            mid
         )
     )
 
-    cutoff = now - 20 * 60
+    cutoff = (
+        now - 20 * 60
+    )
 
     while (
         market_history
         and
-        market_history[0][0] < cutoff
+        market_history[0][0]
+        < cutoff
     ):
+
         market_history.pop(0)
 
-    if len(market_history) > MARKET_HISTORY_MAX:
+    if (
+        len(market_history)
+        > MARKET_HISTORY_MAX
+    ):
 
         del market_history[
             :-MARKET_HISTORY_MAX
@@ -708,13 +1048,15 @@ def record_market(market):
 
 def kalshi_change(
     ticker,
-    seconds=60,
+    seconds=60
 ):
 
-    if not ticker:
-        return None
+    if (
+        not ticker
+        or
+        not market_history
+    ):
 
-    if not market_history:
         return None
 
     now = time.time()
@@ -725,17 +1067,23 @@ def kalshi_change(
     for (
         timestamp,
         saved_ticker,
-        mid,
-    ) in reversed(market_history):
+        mid
+    ) in reversed(
+        market_history
+    ):
 
         if saved_ticker != ticker:
             continue
 
         if current is None:
+
             current = mid
             continue
 
-        if timestamp <= now - seconds:
+        if (
+            timestamp
+            <= now - seconds
+        ):
 
             previous = mid
             break
@@ -745,6 +1093,7 @@ def kalshi_change(
         or
         previous is None
     ):
+
         return None
 
     return (
@@ -753,20 +1102,125 @@ def kalshi_change(
 
 
 # =========================================================
-# SMART BRAIN
+# KALSHI QUALITY
+# =========================================================
+
+def calculate_kalshi_quality(
+    market
+):
+
+    if not market:
+
+        return {
+            "score": 0,
+            "grade": "OFFLINE"
+        }
+
+    score = 0
+
+    if market.get(
+        "ticker"
+    ):
+        score += 30
+
+    if market.get(
+        "target"
+    ) is not None:
+        score += 25
+
+    if yes_mid(
+        market
+    ) is not None:
+        score += 25
+
+    if market.get(
+        "close_time"
+    ):
+        score += 20
+
+    if score >= 85:
+        grade = "HIGH"
+
+    elif score >= 70:
+        grade = "GOOD"
+
+    elif score >= 50:
+        grade = "FAIR"
+
+    else:
+        grade = "LOW"
+
+    return {
+        "score": score,
+        "grade": grade
+    }
+
+
+# =========================================================
+# OVERALL DATA QUALITY
+# =========================================================
+
+def overall_quality(
+    btc_quality,
+    kalshi_quality,
+    history_points
+):
+
+    score = (
+        btc_quality["score"]
+        * 0.60
+        +
+        kalshi_quality["score"]
+        * 0.25
+    )
+
+    if history_points >= 20:
+        score += 15
+
+    elif history_points >= 16:
+        score += 10
+
+    elif history_points >= 10:
+        score += 5
+
+    score = round(
+        min(
+            100,
+            score
+        )
+    )
+
+    if score >= 85:
+        grade = "HIGH"
+
+    elif score >= 70:
+        grade = "GOOD"
+
+    elif score >= 50:
+        grade = "FAIR"
+
+    else:
+        grade = "LOW"
+
+    return score, grade
+
+
+# =========================================================
+# SMART MOMENTUM BRAIN
 # =========================================================
 
 def acceleration_state(
     m1,
     m5,
-    m15,
+    m15
 ):
 
     if None in (
         m1,
         m5,
-        m15,
+        m15
     ):
+
         return "UNKNOWN"
 
     if (
@@ -776,6 +1230,7 @@ def acceleration_state(
         and
         m1 < -0.01
     ):
+
         return "ACCELERATING DOWN"
 
     if (
@@ -785,6 +1240,7 @@ def acceleration_state(
         and
         m1 > 0.01
     ):
+
         return "ACCELERATING UP"
 
     if (
@@ -794,7 +1250,10 @@ def acceleration_state(
         and
         m1 > 0.02
     ):
-        return "SHORT-TERM REVERSAL UP"
+
+        return (
+            "SHORT-TERM REVERSAL UP"
+        )
 
     if (
         m15 > 0.04
@@ -803,7 +1262,10 @@ def acceleration_state(
         and
         m1 < -0.02
     ):
-        return "SHORT-TERM REVERSAL DOWN"
+
+        return (
+            "SHORT-TERM REVERSAL DOWN"
+        )
 
     return "STABLE / MIXED"
 
@@ -811,14 +1273,15 @@ def acceleration_state(
 def reversal_state(
     m1,
     m5,
-    m15,
+    m15
 ):
 
     if None in (
         m1,
         m5,
-        m15,
+        m15
     ):
+
         return "UNKNOWN"
 
     if (
@@ -828,7 +1291,10 @@ def reversal_state(
         and
         m1 > 0.02
     ):
-        return "HIGH — BULLISH REVERSAL"
+
+        return (
+            "HIGH — BULLISH REVERSAL"
+        )
 
     if (
         m15 > 0.04
@@ -837,7 +1303,10 @@ def reversal_state(
         and
         m1 < -0.02
     ):
-        return "HIGH — BEARISH REVERSAL"
+
+        return (
+            "HIGH — BEARISH REVERSAL"
+        )
 
     if (
         m15 < -0.04
@@ -846,7 +1315,10 @@ def reversal_state(
         and
         m1 > 0
     ):
-        return "MEDIUM — POSSIBLE BULLISH TURN"
+
+        return (
+            "MEDIUM — POSSIBLE BULLISH TURN"
+        )
 
     if (
         m15 > 0.04
@@ -855,64 +1327,106 @@ def reversal_state(
         and
         m1 < 0
     ):
-        return "MEDIUM — POSSIBLE BEARISH TURN"
+
+        return (
+            "MEDIUM — POSSIBLE BEARISH TURN"
+        )
 
     return "LOW"
 
+
+# =========================================================
+# DECISION ENGINE
+# =========================================================
 
 def build_signal(
     price,
     market,
     candles,
+    quality_score
 ):
 
     m1 = momentum(
         candles,
-        1,
+        1
     )
 
     m5 = momentum(
         candles,
-        5,
+        5
     )
 
     m15 = momentum(
         candles,
-        15,
+        15
     )
 
     structure = price_structure(
         candles
     )
 
-    acceleration = acceleration_state(
-        m1,
-        m5,
-        m15,
+    acceleration = (
+        acceleration_state(
+            m1,
+            m5,
+            m15
+        )
     )
 
-    reversal = reversal_state(
-        m1,
-        m5,
-        m15,
+    reversal = (
+        reversal_state(
+            m1,
+            m5,
+            m15
+        )
     )
 
     result = {
-        "verdict": "WAIT",
-        "label": "WAIT",
-        "confidence": 0,
-        "score": 0,
-        "bullish": 0,
-        "bearish": 0,
-        "agreement": "NO DATA",
-        "ready": False,
-        "structure": structure,
-        "acceleration": acceleration,
-        "reversal": reversal,
-        "pressure": None,
-        "kalshi_change": None,
-        "warning": None,
-        "reasons": [],
+
+        "verdict":
+            "WAIT",
+
+        "label":
+            "WAIT",
+
+        "confidence":
+            0,
+
+        "score":
+            0,
+
+        "bullish":
+            0,
+
+        "bearish":
+            0,
+
+        "agreement":
+            "NO DATA",
+
+        "ready":
+            False,
+
+        "structure":
+            structure,
+
+        "acceleration":
+            acceleration,
+
+        "reversal":
+            reversal,
+
+        "pressure":
+            None,
+
+        "kalshi_change":
+            None,
+
+        "warning":
+            None,
+
+        "reasons":
+            []
     }
 
     if price is None:
@@ -958,7 +1472,7 @@ def build_signal(
     if None in (
         m1,
         m5,
-        m15,
+        m15
     ):
 
         result["label"] = (
@@ -980,9 +1494,7 @@ def build_signal(
     bearish_reasons = []
     neutral_reasons = []
 
-    # -----------------------------------------------------
-    # BTC VS TARGET
-    # -----------------------------------------------------
+    # BTC VS STRIKE
 
     distance_pct = (
         (price - target)
@@ -1011,9 +1523,7 @@ def build_signal(
             "BTC is very close to the Kalshi target."
         )
 
-    # -----------------------------------------------------
-    # 1M
-    # -----------------------------------------------------
+    # 1 MINUTE
 
     if m1 > 0.01:
 
@@ -1037,9 +1547,7 @@ def build_signal(
             "1m momentum is neutral."
         )
 
-    # -----------------------------------------------------
-    # 5M
-    # -----------------------------------------------------
+    # 5 MINUTE
 
     if m5 > 0.02:
 
@@ -1063,9 +1571,7 @@ def build_signal(
             "5m momentum is neutral."
         )
 
-    # -----------------------------------------------------
-    # 15M
-    # -----------------------------------------------------
+    # 15 MINUTE
 
     if m15 > 0.04:
 
@@ -1089,9 +1595,7 @@ def build_signal(
             "15m momentum is neutral."
         )
 
-    # -----------------------------------------------------
     # STRUCTURE
-    # -----------------------------------------------------
 
     if structure == (
         "HIGHER HIGHS / HIGHER LOWS"
@@ -1119,11 +1623,11 @@ def build_signal(
             "Price structure is mixed."
         )
 
-    # -----------------------------------------------------
     # KALSHI YES
-    # -----------------------------------------------------
 
-    mid = yes_mid(market)
+    mid = yes_mid(
+        market
+    )
 
     pressure = None
 
@@ -1155,10 +1659,6 @@ def build_signal(
                 "Kalshi YES pricing is near neutral."
             )
 
-    # -----------------------------------------------------
-    # RECORD KALSHI MOVEMENT
-    # -----------------------------------------------------
-
     ticker = market.get(
         "ticker"
     )
@@ -1169,12 +1669,10 @@ def build_signal(
 
     k_change = kalshi_change(
         ticker,
-        60,
+        60
     )
 
-    # -----------------------------------------------------
     # ACCELERATION
-    # -----------------------------------------------------
 
     if acceleration == (
         "ACCELERATING UP"
@@ -1196,12 +1694,12 @@ def build_signal(
             "Short-term momentum is accelerating downward."
         )
 
-    # -----------------------------------------------------
     # TIME
-    # -----------------------------------------------------
 
     remaining = seconds_left(
-        market.get("close_time")
+        market.get(
+            "close_time"
+        )
     )
 
     final_minute = (
@@ -1216,13 +1714,19 @@ def build_signal(
         remaining <= 180
     )
 
-    # -----------------------------------------------------
-    # REVERSAL SAFETY
-    # -----------------------------------------------------
+    difference = abs(
+        bullish - bearish
+    )
 
-    if reversal.startswith("HIGH"):
+    # REVERSAL BRAKE
 
-        result["verdict"] = "WAIT"
+    if reversal.startswith(
+        "HIGH"
+    ):
+
+        result["verdict"] = (
+            "WAIT"
+        )
 
         result["label"] = (
             "WAIT — REVERSAL RISK"
@@ -1232,120 +1736,156 @@ def build_signal(
 
         result["warning"] = reversal
 
-    else:
+    elif (
+        bullish >= 5
+        and
+        bullish - bearish >= 3
+    ):
 
-        difference = abs(
-            bullish - bearish
+        result["verdict"] = (
+            "UP"
         )
 
-        if (
-            bullish >= 5
-            and
-            bullish - bearish >= 3
-        ):
+        result["label"] = (
+            "UP — STRONG CONFIRMATION"
+        )
 
-            result["verdict"] = "UP"
+        result["confidence"] = 90
 
-            result["label"] = (
-                "UP — STRONG CONFIRMATION"
-            )
+    elif (
+        bearish >= 5
+        and
+        bearish - bullish >= 3
+    ):
 
-            result["confidence"] = 90
+        result["verdict"] = (
+            "DOWN"
+        )
 
-        elif (
-            bearish >= 5
-            and
-            bearish - bullish >= 3
-        ):
+        result["label"] = (
+            "DOWN — STRONG CONFIRMATION"
+        )
 
-            result["verdict"] = "DOWN"
+        result["confidence"] = 90
 
-            result["label"] = (
-                "DOWN — STRONG CONFIRMATION"
-            )
+    elif (
+        bullish >= 4
+        and
+        bullish > bearish
+        and
+        difference >= 2
+    ):
 
-            result["confidence"] = 90
+        result["verdict"] = (
+            "UP"
+        )
 
-        elif (
-            bullish >= 4
-            and
-            bullish > bearish
-            and
-            difference >= 2
-        ):
+        result["label"] = (
+            "UP — CONFIRMED"
+        )
 
-            result["verdict"] = "UP"
+        result["confidence"] = 72
 
-            result["label"] = (
-                "UP — CONFIRMED"
-            )
+    elif (
+        bearish >= 4
+        and
+        bearish > bullish
+        and
+        difference >= 2
+    ):
 
-            result["confidence"] = 72
+        result["verdict"] = (
+            "DOWN"
+        )
 
-        elif (
-            bearish >= 4
-            and
-            bearish > bullish
-            and
-            difference >= 2
-        ):
+        result["label"] = (
+            "DOWN — CONFIRMED"
+        )
 
-            result["verdict"] = "DOWN"
+        result["confidence"] = 72
 
-            result["label"] = (
-                "DOWN — CONFIRMED"
-            )
+    else:
 
-            result["confidence"] = 72
+        result["verdict"] = (
+            "WAIT"
+        )
 
-        else:
+        result["label"] = (
+            "WAIT — CONFLICT"
+        )
 
-            result["verdict"] = "WAIT"
+        result["confidence"] = 50
 
-            result["label"] = (
-                "WAIT — CONFLICT"
-            )
+        result["warning"] = (
+            "Signals are not aligned enough."
+        )
 
-            result["confidence"] = 50
+    # FINAL MINUTE BRAKE
+
+    if (
+        final_minute
+        and
+        difference < 4
+        and
+        result["verdict"] != "WAIT"
+    ):
+
+        result["verdict"] = (
+            "WAIT"
+        )
+
+        result["label"] = (
+            "WAIT — FINAL MINUTE"
+        )
+
+        result["confidence"] = 55
+
+        result["warning"] = (
+            "Final 60 seconds require stronger confirmation."
+        )
+
+    elif (
+        final_three
+        and
+        difference < 3
+    ):
+
+        result["warning"] = (
+            "Final 3 minutes — reversal risk is elevated."
+        )
+
+    # DATA QUALITY BRAKE
+
+    if quality_score < 50:
+
+        result["verdict"] = (
+            "WAIT"
+        )
+
+        result["label"] = (
+            "WAIT — LOW DATA QUALITY"
+        )
+
+        result["confidence"] = 35
+
+        result["warning"] = (
+            "Not enough reliable live data to trust the signal."
+        )
+
+    elif quality_score < 70:
+
+        result["confidence"] = min(
+            result["confidence"],
+            65
+        )
+
+        if result["verdict"] != "WAIT":
 
             result["warning"] = (
-                "Signals are not aligned enough."
+                "Data quality is FAIR; confidence reduced."
             )
 
-        # Extra caution in final minute.
-        if (
-            final_minute
-            and
-            difference < 4
-            and
-            result["verdict"] != "WAIT"
-        ):
-
-            result["verdict"] = "WAIT"
-
-            result["label"] = (
-                "WAIT — FINAL MINUTE"
-            )
-
-            result["confidence"] = 55
-
-            result["warning"] = (
-                "Final 60 seconds require stronger confirmation."
-            )
-
-        elif (
-            final_three
-            and
-            difference < 3
-        ):
-
-            result["warning"] = (
-                "Final 3 minutes — reversal risk is elevated."
-            )
-
-    # -----------------------------------------------------
-    # CONFIDENCE BOOST FOR ACCELERATION
-    # -----------------------------------------------------
+    # ACCELERATION BOOST
 
     if (
         result["verdict"] == "UP"
@@ -1387,7 +1927,7 @@ def build_signal(
     result["pressure"] = (
         round(
             pressure,
-            2,
+            2
         )
         if pressure is not None
         else None
@@ -1396,23 +1936,25 @@ def build_signal(
     result["kalshi_change"] = (
         round(
             k_change,
-            2,
+            2
         )
         if k_change is not None
         else None
     )
 
-    # -----------------------------------------------------
     # EXPLANATION
-    # -----------------------------------------------------
 
     if result["verdict"] == "UP":
 
-        reasons = bullish_reasons[:]
+        reasons = (
+            bullish_reasons[:]
+        )
 
     elif result["verdict"] == "DOWN":
 
-        reasons = bearish_reasons[:]
+        reasons = (
+            bearish_reasons[:]
+        )
 
     else:
 
@@ -1423,7 +1965,10 @@ def build_signal(
         )
 
         if not reasons:
-            reasons = neutral_reasons[:3]
+
+            reasons = (
+                neutral_reasons[:3]
+            )
 
     reasons.append(
         f"Momentum state: {acceleration}."
@@ -1433,29 +1978,21 @@ def build_signal(
         f"Reversal risk: {reversal}."
     )
 
-    if k_change is not None:
-
-        if abs(k_change) >= 2:
-
-            reasons.append(
-                "Kalshi YES moved "
-                f"{k_change:+.1f}¢ "
-                "over the last minute."
-            )
-
-    if final_minute:
+    if (
+        k_change is not None
+        and
+        abs(k_change) >= 2
+    ):
 
         reasons.append(
-            "Final 60 seconds: extra confirmation required."
+            "Kalshi YES moved "
+            f"{k_change:+.1f}¢ "
+            "over the last minute."
         )
 
-    elif final_three:
-
-        reasons.append(
-            "Final 3 minutes: time pressure is elevated."
-        )
-
-    result["reasons"] = reasons[:8]
+    result["reasons"] = (
+        reasons[:8]
+    )
 
     return result
 
@@ -1466,35 +2003,72 @@ def build_signal(
 
 def collect_state():
 
-    btc, feeds = get_spot_feeds()
+    btc, feeds = (
+        get_spot_feeds()
+    )
 
-    candles = get_history()
+    candles = (
+        get_history()
+    )
 
-    market = get_kalshi()
+    market = (
+        get_kalshi()
+    )
+
+    btc_quality = (
+        calculate_feed_quality(
+            feeds
+        )
+    )
+
+    if market:
+
+        market["target"] = (
+            get_target(
+                market
+            )
+        )
+
+    kalshi_quality = (
+        calculate_kalshi_quality(
+            market
+        )
+    )
+
+    quality_score, quality_grade = (
+        overall_quality(
+            btc_quality,
+            kalshi_quality,
+            len(candles)
+        )
+    )
 
     signal = build_signal(
         btc,
         market,
         candles,
+        quality_score
     )
 
     m1 = momentum(
         candles,
-        1,
+        1
     )
 
     m5 = momentum(
         candles,
-        5,
+        5
     )
 
     m15 = momentum(
         candles,
-        15,
+        15
     )
 
     target = (
-        market.get("target")
+        market.get(
+            "target"
+        )
         if market
         else None
     )
@@ -1528,74 +2102,107 @@ def collect_state():
 
         "btc":
             (
-                round(btc, 2)
+                round(
+                    btc,
+                    2
+                )
                 if btc is not None
                 else None
             ),
 
         "feeds": {
-            key: (
-                round(value, 2)
-                if value is not None
-                else None
-            )
+            key:
+                (
+                    round(
+                        value,
+                        2
+                    )
+                    if value is not None
+                    else None
+                )
             for key, value
             in feeds.items()
         },
 
         "feed_count":
-            sum(
-                value is not None
-                for value
-                in feeds.values()
-            ),
+            btc_quality["live"],
+
+        "feed_quality":
+            btc_quality,
 
         "history_points":
             len(candles),
+
+        "kalshi_quality":
+            kalshi_quality,
+
+        "data_quality": {
+
+            "score":
+                quality_score,
+
+            "grade":
+                quality_grade
+        },
 
         "kalshi": {
 
             "ticker":
                 (
-                    market.get("ticker")
+                    market.get(
+                        "ticker"
+                    )
                     if market
                     else None
                 ),
 
             "target":
                 (
-                    round(target, 2)
+                    round(
+                        target,
+                        2
+                    )
                     if target
                     else None
                 ),
 
             "yes_bid":
                 (
-                    market.get("yes_bid")
+                    market.get(
+                        "yes_bid"
+                    )
                     if market
                     else None
                 ),
 
             "yes_ask":
                 (
-                    market.get("yes_ask")
+                    market.get(
+                        "yes_ask"
+                    )
                     if market
                     else None
                 ),
 
             "yes_mid":
-                yes_mid(market),
+                yes_mid(
+                    market
+                ),
 
             "last":
                 (
-                    market.get("last")
+                    market.get(
+                        "last"
+                    )
                     if market
                     else None
                 ),
 
             "close_time":
                 (
-                    market.get("close_time")
+                    market.get(
+                        "close_time"
+                    )
                     if market
                     else None
                 ),
@@ -1609,7 +2216,7 @@ def collect_state():
                     )
                     if market
                     else None
-                ),
+                )
         },
 
         "distance": {
@@ -1618,7 +2225,7 @@ def collect_state():
                 (
                     round(
                         distance,
-                        2,
+                        2
                     )
                     if distance is not None
                     else None
@@ -1628,11 +2235,11 @@ def collect_state():
                 (
                     round(
                         distance_pct,
-                        4,
+                        4
                     )
                     if distance_pct is not None
                     else None
-                ),
+                )
         },
 
         "momentum": {
@@ -1641,7 +2248,7 @@ def collect_state():
                 (
                     round(
                         m1,
-                        4,
+                        4
                     )
                     if m1 is not None
                     else None
@@ -1651,7 +2258,7 @@ def collect_state():
                 (
                     round(
                         m5,
-                        4,
+                        4
                     )
                     if m5 is not None
                     else None
@@ -1661,15 +2268,15 @@ def collect_state():
                 (
                     round(
                         m15,
-                        4,
+                        4
                     )
                     if m15 is not None
                     else None
-                ),
+                )
         },
 
         "signal":
-            signal,
+            signal
     }
 
 
@@ -1679,6 +2286,7 @@ def collect_state():
 
 @app.route("/")
 def home():
+
     return render_template_string(
         PAGE
     )
@@ -1705,7 +2313,9 @@ def api_state():
     cache["state"] = state
     cache["time"] = now
 
-    return jsonify(state)
+    return jsonify(
+        state
+    )
 
 
 # =========================================================
@@ -1714,6 +2324,7 @@ def api_state():
 
 PAGE = r"""
 <!doctype html>
+
 <html>
 
 <head>
@@ -1728,45 +2339,45 @@ PAGE = r"""
 <style>
 
 *{
- box-sizing:border-box;
+ box-sizing:border-box
 }
 
 body{
  margin:0;
  background:#070a0f;
  color:#f4f7fb;
- font-family:Arial,sans-serif;
+ font-family:Arial,sans-serif
 }
 
 .wrap{
  max-width:1100px;
  margin:auto;
- padding:18px;
+ padding:18px
 }
 
 .header{
  display:flex;
  justify-content:space-between;
  align-items:center;
- margin-bottom:15px;
+ margin-bottom:15px
 }
 
 h1{
  margin:0;
- font-size:25px;
+ font-size:25px
 }
 
 .sub{
- margin-top:4px;
  color:#8994a5;
  font-size:12px;
+ margin-top:4px
 }
 
 .status{
  padding:8px 12px;
  border-radius:20px;
  background:#111822;
- font-size:12px;
+ font-size:12px
 }
 
 .dot{
@@ -1775,106 +2386,132 @@ h1{
  height:8px;
  border-radius:50%;
  background:#20d879;
- margin-right:6px;
+ margin-right:6px
 }
 
 .verdict{
- margin-bottom:14px;
  padding:24px;
  text-align:center;
  border-radius:18px;
- background:#111822;
- border:1px solid #202a38;
+ background:#211b0b;
+ border:1px solid #e8b84d;
+ margin-bottom:14px
 }
 
 .verdict.up{
  background:#092018;
- border-color:#18d77a;
+ border-color:#18d77a
 }
 
 .verdict.down{
  background:#250c11;
- border-color:#ff4d5d;
+ border-color:#ff4d5d
 }
 
 .verdict.wait{
  background:#211b0b;
- border-color:#e8b84d;
+ border-color:#e8b84d
 }
 
 .verdict-label{
  font-size:39px;
- font-weight:900;
+ font-weight:900
 }
 
 .conf{
  margin-top:7px;
- color:#aeb8c8;
+ color:#aeb8c8
 }
 
 .agreement{
  margin-top:6px;
  font-size:16px;
- font-weight:800;
+ font-weight:800
 }
 
 .warning{
  margin-top:7px;
  color:#ffcf5a;
  font-size:12px;
- font-weight:700;
+ font-weight:700
 }
 
 .grid{
  display:grid;
  grid-template-columns:repeat(4,1fr);
- gap:12px;
+ gap:12px
 }
 
 .card{
- padding:15px;
- border-radius:14px;
  background:#10151e;
  border:1px solid #202a38;
+ border-radius:14px;
+ padding:15px
 }
 
 .card h3{
  margin:0 0 8px;
  color:#8994a5;
  font-size:12px;
- text-transform:uppercase;
+ text-transform:uppercase
 }
 
 .big{
  font-size:25px;
- font-weight:800;
+ font-weight:800
 }
 
 .value{
  font-size:17px;
- font-weight:700;
+ font-weight:700
 }
 
 .green{
- color:#20d879;
+ color:#20d879
 }
 
 .red{
- color:#ff5262;
+ color:#ff5262
 }
 
 .yellow{
- color:#e8b84d;
+ color:#e8b84d
 }
 
 .small{
- margin-top:5px;
  color:#7f8998;
  font-size:11px;
+ margin-top:5px
 }
 
 .wide{
- grid-column:span 2;
+ grid-column:span 2
+}
+
+.quality-row{
+ display:flex;
+ align-items:center;
+ gap:15px
+}
+
+.quality-score{
+ font-size:28px;
+ font-weight:900
+}
+
+.bar{
+ height:7px;
+ background:#222b37;
+ border-radius:10px;
+ overflow:hidden;
+ margin-top:10px
+}
+
+.bar-fill{
+ height:100%;
+ width:0%;
+ background:#20d879;
+ transition:.3s
 }
 
 .reasons{
@@ -1882,23 +2519,23 @@ h1{
  padding-left:20px;
  color:#c8d0dc;
  font-size:13px;
- line-height:1.7;
+ line-height:1.7
 }
 
 .note{
- margin-top:6px;
  color:#697585;
  font-size:10px;
+ margin-top:6px
 }
 
 @media(max-width:800px){
 
  .grid{
-  grid-template-columns:repeat(2,1fr);
+  grid-template-columns:repeat(2,1fr)
  }
 
  .wide{
-  grid-column:span 2;
+  grid-column:span 2
  }
 
 }
@@ -1906,15 +2543,15 @@ h1{
 @media(max-width:500px){
 
  .wrap{
-  padding:10px;
+  padding:10px
  }
 
  .verdict-label{
-  font-size:28px;
+  font-size:28px
  }
 
  .big{
-  font-size:21px;
+  font-size:21px
  }
 
 }
@@ -1926,6 +2563,7 @@ h1{
 <body>
 
 <div class="wrap">
+
 
 <div class="header">
 
@@ -1967,7 +2605,10 @@ CONNECTING
 <div class="conf">
 
 Confidence:
-<b id="confidence">0%</b>
+
+<b id="confidence">
+0%
+</b>
 
 </div>
 
@@ -2193,7 +2834,56 @@ until market close
 <div class="card wide">
 
 <h3>
-Why The Engine Chose This
+DATA QUALITY BRAIN
+</h3>
+
+<div class="quality-row">
+
+<div
+ id="qualityScore"
+ class="quality-score"
+>
+--
+</div>
+
+<div>
+
+<div id="qualityGrade">
+--
+</div>
+
+<div class="small">
+Feeds + freshness + exchange agreement + Kalshi + history
+</div>
+
+</div>
+
+</div>
+
+<div class="bar">
+
+<div
+ id="qualityBar"
+ class="bar-fill"
+>
+</div>
+
+</div>
+
+<div
+ id="qualityDetails"
+ class="small"
+>
+--
+</div>
+
+</div>
+
+
+<div class="card wide">
+
+<h3>
+WHY THE ENGINE CHOSE THIS
 </h3>
 
 <ul
@@ -2213,7 +2903,7 @@ Waiting for live data...
 <div class="card wide">
 
 <h3>
-Feed Health
+FEED HEALTH
 </h3>
 
 <div
@@ -2243,14 +2933,14 @@ function money(v){
   return "--";
 
  return "$"
-  +
-  Number(v).toLocaleString(
-   undefined,
-   {
-    minimumFractionDigits:2,
-    maximumFractionDigits:2
-   }
-  );
+ +
+ Number(v).toLocaleString(
+  undefined,
+  {
+   minimumFractionDigits:2,
+   maximumFractionDigits:2
+  }
+ );
 
 }
 
@@ -2293,13 +2983,15 @@ function setValue(
  cls
 ){
 
- const element =
-  document.getElementById(id);
+ const e =
+  document.getElementById(
+   id
+  );
 
- element.textContent =
+ e.textContent =
   text;
 
- element.className =
+ e.className =
   "value "
   +
   (cls || "");
@@ -2320,7 +3012,9 @@ function clock(seconds){
 
  return (
   String(
-   Math.floor(seconds / 60)
+   Math.floor(
+    seconds / 60
+   )
   ).padStart(2,"0")
   +
   ":"
@@ -2345,27 +3039,27 @@ function refresh(){
  )
 
  .then(
-  response => {
+  r => {
 
-   if(!response.ok)
+   if(!r.ok)
     throw new Error(
      "API "
      +
-     response.status
+     r.status
     );
 
-   return response.json();
+   return r.json();
 
   }
  )
 
  .then(
-  data => {
+  d => {
 
    document.getElementById(
     "status"
    ).textContent =
-    data.ok
+    d.ok
      ? "LIVE"
      : "DATA ERROR";
 
@@ -2373,30 +3067,34 @@ function refresh(){
    document.getElementById(
     "btc"
    ).textContent =
-    money(data.btc);
+    money(
+     d.btc
+    );
 
 
    document.getElementById(
     "target"
    ).textContent =
     money(
-     data.kalshi.target
+     d.kalshi.target
     );
 
 
    document.getElementById(
     "ticker"
    ).textContent =
-    data.kalshi.ticker
-    || "--";
+    d.kalshi.ticker
+    ||
+    "--";
 
 
    document.getElementById(
     "feedCount"
    ).textContent =
     (
-     data.feed_count
-     || 0
+     d.feed_count
+     ||
+     0
     )
     +
     " feeds live";
@@ -2407,16 +3105,18 @@ function refresh(){
      "distance"
     );
 
+
    distance.textContent =
     money(
-     data.distance.dollars
+     d.distance.dollars
     );
+
 
    distance.className =
     "big "
     +
     color(
-     data.distance.dollars
+     d.distance.dollars
     );
 
 
@@ -2424,7 +3124,7 @@ function refresh(){
     "distancePct"
    ).textContent =
     pct(
-     data.distance.percent
+     d.distance.percent
     );
 
 
@@ -2432,17 +3132,17 @@ function refresh(){
     "countdown"
    ).textContent =
     clock(
-     data.kalshi.countdown
+     d.kalshi.countdown
     );
 
 
    setValue(
     "m1",
     pct(
-     data.momentum.m1
+     d.momentum.m1
     ),
     color(
-     data.momentum.m1
+     d.momentum.m1
     )
    );
 
@@ -2450,10 +3150,10 @@ function refresh(){
    setValue(
     "m5",
     pct(
-     data.momentum.m5
+     d.momentum.m5
     ),
     color(
-     data.momentum.m5
+     d.momentum.m5
     )
    );
 
@@ -2461,112 +3161,131 @@ function refresh(){
    setValue(
     "m15",
     pct(
-     data.momentum.m15
+     d.momentum.m15
     ),
     color(
-     data.momentum.m15
+     d.momentum.m15
     )
    );
 
 
    setValue(
     "structure",
-    data.signal.structure
-    || "--",
+    d.signal.structure
+    ||
+    "--",
     ""
    );
 
 
-   let accelerationClass =
+   let accelClass =
     "yellow";
 
+
    if(
-    data.signal.acceleration
+    d.signal.acceleration
     &&
-    data.signal.acceleration.includes(
+    d.signal.acceleration.includes(
      "UP"
     )
    ){
-    accelerationClass =
+
+    accelClass =
      "green";
+
    }
 
+
    if(
-    data.signal.acceleration
+    d.signal.acceleration
     &&
-    data.signal.acceleration.includes(
+    d.signal.acceleration.includes(
      "DOWN"
     )
    ){
-    accelerationClass =
+
+    accelClass =
      "red";
+
    }
 
 
    setValue(
     "acceleration",
-    data.signal.acceleration
-    || "--",
-    accelerationClass
+    d.signal.acceleration
+    ||
+    "--",
+    accelClass
    );
 
 
    let reversalClass =
     "yellow";
 
+
    if(
-    data.signal.reversal
+    d.signal.reversal
     &&
-    data.signal.reversal.includes(
+    d.signal.reversal.includes(
      "BULLISH"
     )
    ){
+
     reversalClass =
      "green";
+
    }
 
+
    if(
-    data.signal.reversal
+    d.signal.reversal
     &&
-    data.signal.reversal.includes(
+    d.signal.reversal.includes(
      "BEARISH"
     )
    ){
+
     reversalClass =
      "red";
+
    }
 
 
    setValue(
     "reversal",
-    data.signal.reversal
-    || "--",
+    d.signal.reversal
+    ||
+    "--",
     reversalClass
    );
 
 
    const mid =
-    data.kalshi.yes_mid;
+    d.kalshi.yes_mid;
 
 
    setValue(
     "yesMid",
 
     mid==null
-     ? "--"
+     ?
+      "--"
      :
-     (
-      Number(mid)*100
-     ).toFixed(1)
-     +
-     "%",
+      (
+       Number(mid)*100
+      ).toFixed(1)
+      +
+      "%",
 
     mid==null
-     ? ""
+     ?
+      ""
      :
-     mid>=0.50
-      ? "green"
-      : "red"
+      mid>=0.50
+       ?
+        "green"
+       :
+        "red"
    );
 
 
@@ -2574,44 +3293,48 @@ function refresh(){
     "kalshiChange"
    ).textContent =
 
-    data.signal.kalshi_change==null
+    d.signal.kalshi_change==null
      ?
-     "Building Kalshi history..."
+      "Building Kalshi history..."
      :
-     "1m YES move: "
-     +
-     (
-      data.signal.kalshi_change>=0
-       ? "+"
-       : ""
-     )
-     +
-     Number(
-      data.signal.kalshi_change
-     ).toFixed(1)
-     +
-     "¢";
+      "1m YES move: "
+      +
+      (
+       d.signal.kalshi_change>=0
+        ?
+         "+"
+        :
+         ""
+      )
+      +
+      Number(
+       d.signal.kalshi_change
+      ).toFixed(1)
+      +
+      "¢";
 
 
    setValue(
     "score",
 
-    data.signal.score==null
-     ? "--"
+    d.signal.score==null
+     ?
+      "--"
      :
-     Number(
-      data.signal.score
-     ).toFixed(0),
+      Number(
+       d.signal.score
+      ).toFixed(0),
 
     color(
-     data.signal.score
+     d.signal.score
     )
    );
 
 
    const verdict =
-    data.signal.verdict
-    || "WAIT";
+    d.signal.verdict
+    ||
+    "WAIT";
 
 
    const box =
@@ -2625,28 +3348,33 @@ function refresh(){
     +
     (
      verdict==="UP"
-      ? "up"
+      ?
+       "up"
       :
      verdict==="DOWN"
-      ? "down"
+      ?
+       "down"
       :
-      "wait"
+       "wait"
     );
 
 
    document.getElementById(
     "verdictLabel"
    ).textContent =
-    data.signal.label
+
+    d.signal.label
     ||
     (
      verdict==="UP"
-      ? "🟢 UP"
+      ?
+       "🟢 UP"
       :
      verdict==="DOWN"
-      ? "🔴 DOWN"
+      ?
+       "🔴 DOWN"
       :
-      "🟡 WAIT"
+       "🟡 WAIT"
     );
 
 
@@ -2654,8 +3382,9 @@ function refresh(){
     "confidence"
    ).textContent =
     (
-     data.signal.confidence
-     || 0
+     d.signal.confidence
+     ||
+     0
     )
     +
     "%";
@@ -2664,15 +3393,17 @@ function refresh(){
    document.getElementById(
     "agreement"
    ).textContent =
-    data.signal.agreement
-    || "--";
+    d.signal.agreement
+    ||
+    "--";
 
 
    document.getElementById(
     "warning"
    ).textContent =
-    data.signal.warning
-    || "";
+    d.signal.warning
+    ||
+    "";
 
 
    const reasons =
@@ -2680,11 +3411,13 @@ function refresh(){
      "reasons"
     );
 
-   reasons.innerHTML = "";
+
+   reasons.innerHTML =
+    "";
 
 
    (
-    data.signal.reasons
+    d.signal.reasons
     ||
     [
      "Waiting for live data..."
@@ -2708,12 +3441,120 @@ function refresh(){
    );
 
 
+   /* DATA QUALITY */
+
+   const quality =
+    d.data_quality
+    ||
+    {};
+
+   const qualityScore =
+    quality.score
+    ||
+    0;
+
+
+   document.getElementById(
+    "qualityScore"
+   ).textContent =
+    qualityScore
+    +
+    "/100";
+
+
+   document.getElementById(
+    "qualityGrade"
+   ).textContent =
+    "QUALITY: "
+    +
+    (
+     quality.grade
+     ||
+     "--"
+    );
+
+
+   document.getElementById(
+    "qualityBar"
+   ).style.width =
+    qualityScore
+    +
+    "%";
+
+
+   const fq =
+    d.feed_quality
+    ||
+    {};
+
+
+   document.getElementById(
+    "qualityDetails"
+   ).textContent =
+
+    "BTC feeds: "
+    +
+    (
+     fq.live
+     ||
+     0
+    )
+    +
+    "/4 live • "
+    +
+    (
+     fq.fresh
+     ||
+     0
+    )
+    +
+    "/4 fresh • Exchange spread: "
+    +
+    (
+     fq.spread==null
+      ?
+       "n/a"
+      :
+       Number(
+        fq.spread
+       ).toFixed(3)
+       +
+       "%"
+    )
+    +
+    " • Kalshi: "
+    +
+    (
+     d.kalshi_quality
+     &&
+     d.kalshi_quality.grade
+      ?
+       d.kalshi_quality.grade
+      :
+       "OFFLINE"
+    )
+    +
+    " • History: "
+    +
+    (
+     d.history_points
+     ||
+     0
+    )
+    +
+    " candles";
+
+
+   /* FEEDS */
+
    document.getElementById(
     "feeds"
    ).textContent =
 
     Object.entries(
-     data.feeds || {}
+     d.feeds
+     ||
+     {}
     )
     .map(
      ([name,value]) =>
@@ -2723,9 +3564,10 @@ function refresh(){
       +
       (
        value==null
-        ? "OFFLINE"
+        ?
+         "OFFLINE"
         :
-        money(value)
+         money(value)
       )
     )
     .join(
@@ -2734,7 +3576,11 @@ function refresh(){
     +
     "  •  History: "
     +
-    data.history_points
+    (
+     d.history_points
+     ||
+     0
+    )
     +
     " candles";
 
@@ -2748,6 +3594,7 @@ function refresh(){
     "status"
    ).textContent =
     "API ERROR";
+
 
    document.getElementById(
     "warning"
@@ -2775,6 +3622,10 @@ setInterval(
 """
 
 
+# =========================================================
+# LOCAL RUN
+# =========================================================
+
 if __name__ == "__main__":
 
     app.run(
@@ -2785,5 +3636,5 @@ if __name__ == "__main__":
                 "5000"
             )
         ),
-        threaded=True,
+        threaded=True
     )
