@@ -1,4 +1,4 @@
 Flask
 requests
-websocket-client
+websocket-client==1.8.0
 gunicorn
