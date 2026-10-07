@@ -11,6 +11,7 @@ app = Flask(__name__)
 TIMEOUT = 5
 CACHE_SECONDS = 2
 HISTORY_REFRESH = 15
+MARKET_HISTORY_MAX = 120
 
 KALSHI_BASE = os.getenv(
     "KALSHI_BASE_URL",
@@ -19,7 +20,7 @@ KALSHI_BASE = os.getenv(
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "BTC-Strike-AI/4.0"
+    "User-Agent": "BTC-Strike-AI/6.0"
 })
 
 cache = {
@@ -32,12 +33,14 @@ history_cache = {
     "candles": [],
 }
 
+market_history = []
+
 
 # =========================================================
-# HELPERS
+# BASIC HELPERS
 # =========================================================
 
-def f(value):
+def num(value):
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -45,53 +48,37 @@ def f(value):
 
 
 def get_json(url, params=None):
-
     try:
-
         response = session.get(
             url,
             params=params,
             timeout=TIMEOUT,
         )
-
         response.raise_for_status()
-
         return response.json()
-
     except Exception:
-
         return None
 
 
 def parse_time(value):
-
     if not value:
         return None
 
     try:
-
         dt = datetime.fromisoformat(
-            str(value).replace(
-                "Z",
-                "+00:00",
-            )
+            str(value).replace("Z", "+00:00")
         )
 
         if dt.tzinfo is None:
-
-            dt = dt.replace(
-                tzinfo=timezone.utc
-            )
+            dt = dt.replace(tzinfo=timezone.utc)
 
         return dt
 
     except Exception:
-
         return None
 
 
 def seconds_left(value):
-
     dt = parse_time(value)
 
     if not dt:
@@ -99,18 +86,15 @@ def seconds_left(value):
 
     return max(
         0,
-        int(
-            dt.timestamp()
-            - time.time()
-        ),
+        int(dt.timestamp() - time.time())
     )
 
 
 # =========================================================
-# BTC SPOT
+# BTC LIVE PRICE
 # =========================================================
 
-def spot_feeds():
+def get_spot_feeds():
 
     feeds = {}
 
@@ -121,10 +105,11 @@ def spot_feeds():
     )
 
     if isinstance(data, dict):
-
-        feeds["Binance"] = f(
+        feeds["Binance"] = num(
             data.get("price")
         )
+    else:
+        feeds["Binance"] = None
 
     # Coinbase
     data = get_json(
@@ -132,17 +117,10 @@ def spot_feeds():
     )
 
     try:
-
-        feeds["Coinbase"] = f(
+        feeds["Coinbase"] = num(
             data["data"]["amount"]
         )
-
-    except (
-        TypeError,
-        KeyError,
-        IndexError,
-    ):
-
+    except Exception:
         feeds["Coinbase"] = None
 
     # Kraken
@@ -152,24 +130,13 @@ def spot_feeds():
     )
 
     try:
-
         result = data["result"]
+        pair = next(iter(result))
 
-        pair = next(
-            iter(result)
-        )
-
-        feeds["Kraken"] = f(
+        feeds["Kraken"] = num(
             result[pair]["c"][0]
         )
-
-    except (
-        TypeError,
-        KeyError,
-        StopIteration,
-        IndexError,
-    ):
-
+    except Exception:
         feeds["Kraken"] = None
 
     # Bitstamp
@@ -178,58 +145,44 @@ def spot_feeds():
     )
 
     if isinstance(data, dict):
-
-        feeds["Bitstamp"] = f(
+        feeds["Bitstamp"] = num(
             data.get("last")
         )
-
     else:
-
         feeds["Bitstamp"] = None
 
     valid = [
         value
         for value in feeds.values()
-        if value is not None
-        and value > 0
+        if value is not None and value > 0
     ]
 
     if not valid:
-
         return None, feeds
 
-    median = statistics.median(
-        valid
-    )
+    median = statistics.median(valid)
 
     filtered = [
         value
         for value in valid
-        if abs(value - median) / median
-        <= 0.0035
+        if abs(value - median) / median <= 0.0035
     ]
 
-    return (
-        statistics.median(
-            filtered or valid
-        ),
-        feeds,
+    reference = statistics.median(
+        filtered or valid
     )
+
+    return reference, feeds
 
 
 # =========================================================
-# HISTORICAL CANDLES
+# 1-MINUTE HISTORY
 # =========================================================
 
 def coinbase_candles():
 
-    end = datetime.now(
-        timezone.utc
-    )
-
-    start = (
-        end - timedelta(minutes=21)
-    )
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(minutes=21)
 
     data = get_json(
         "https://api.exchange.coinbase.com/products/BTC-USD/candles",
@@ -247,29 +200,15 @@ def coinbase_candles():
         for row in data:
 
             try:
+                timestamp = float(row[0])
+                close = num(row[4])
 
-                timestamp = float(
-                    row[0]
-                )
-
-                close = f(
-                    row[4]
-                )
-
-                if close:
-
+                if close is not None:
                     candles.append(
-                        (
-                            timestamp,
-                            close,
-                        )
+                        (timestamp, close)
                     )
 
-            except (
-                TypeError,
-                IndexError,
-            ):
-
+            except Exception:
                 pass
 
     candles.sort()
@@ -290,7 +229,6 @@ def kraken_candles():
     candles = []
 
     try:
-
         result = data["result"]
 
         pair = next(
@@ -301,30 +239,15 @@ def kraken_candles():
 
         for row in result[pair][-21:]:
 
-            timestamp = float(
-                row[0]
-            )
+            timestamp = float(row[0])
+            close = num(row[4])
 
-            close = f(
-                row[4]
-            )
-
-            if close:
-
+            if close is not None:
                 candles.append(
-                    (
-                        timestamp,
-                        close,
-                    )
+                    (timestamp, close)
                 )
 
-    except (
-        TypeError,
-        KeyError,
-        StopIteration,
-        IndexError,
-    ):
-
+    except Exception:
         pass
 
     candles.sort()
@@ -350,30 +273,18 @@ def binance_candles():
         for row in data:
 
             try:
-
                 timestamp = (
-                    float(row[0])
-                    / 1000
+                    float(row[0]) / 1000
                 )
 
-                close = f(
-                    row[4]
-                )
+                close = num(row[4])
 
-                if close:
-
+                if close is not None:
                     candles.append(
-                        (
-                            timestamp,
-                            close,
-                        )
+                        (timestamp, close)
                     )
 
-            except (
-                TypeError,
-                IndexError,
-            ):
-
+            except Exception:
                 pass
 
     candles.sort()
@@ -386,10 +297,11 @@ def get_history():
     now = time.time()
 
     if (
+        history_cache["candles"]
+        and
         now - history_cache["time"]
         < HISTORY_REFRESH
     ):
-
         return history_cache["candles"]
 
     sources = [
@@ -405,9 +317,7 @@ def get_history():
         candles = source()
 
         if len(candles) >= 16:
-
             best = candles
-
             break
 
     history_cache["candles"] = best
@@ -416,22 +326,15 @@ def get_history():
     return best
 
 
-def momentum(
-    candles,
-    minutes,
-):
+def momentum(candles, minutes):
 
     if len(candles) < 2:
-
         return None
 
-    current_time, current = (
-        candles[-1]
-    )
+    current_time, current = candles[-1]
 
     target_time = (
-        current_time
-        - minutes * 60
+        current_time - minutes * 60
     )
 
     previous = None
@@ -439,18 +342,11 @@ def momentum(
     for timestamp, close in candles:
 
         if timestamp <= target_time:
-
             previous = close
-
         else:
-
             break
 
-    if previous in (
-        None,
-        0,
-    ):
-
+    if previous in (None, 0):
         return None
 
     return (
@@ -459,16 +355,14 @@ def momentum(
     ) * 100
 
 
-def get_structure(candles):
+def price_structure(candles):
 
     if len(candles) < 8:
-
         return "WAIT"
 
     values = [
         close
-        for _, close
-        in candles[-8:]
+        for _, close in candles[-8:]
     ]
 
     first = values[:4]
@@ -479,22 +373,14 @@ def get_structure(candles):
         and
         min(second) > min(first)
     ):
-
-        return (
-            "HIGHER HIGHS / "
-            "HIGHER LOWS"
-        )
+        return "HIGHER HIGHS / HIGHER LOWS"
 
     if (
         max(second) < max(first)
         and
         min(second) < min(first)
     ):
-
-        return (
-            "LOWER HIGHS / "
-            "LOWER LOWS"
-        )
+        return "LOWER HIGHS / LOWER LOWS"
 
     return "MIXED"
 
@@ -503,21 +389,17 @@ def get_structure(candles):
 # KALSHI
 # =========================================================
 
-def probability(
-    market,
-    *keys,
-):
+def probability(market, *keys):
 
     for key in keys:
 
-        value = f(
+        value = num(
             market.get(key)
         )
 
         if value is not None:
 
             if value > 1:
-
                 return value / 100
 
             return value
@@ -528,86 +410,64 @@ def probability(
 def normalize_market(market):
 
     if (
-        not isinstance(
-            market,
-            dict,
-        )
-        or not market.get("ticker")
+        not isinstance(market, dict)
+        or
+        not market.get("ticker")
     ):
-
         return None
 
     return {
+        "ticker": market.get("ticker"),
 
-        "ticker":
-            market.get("ticker"),
+        "title": (
+            market.get("title")
+            or
+            market.get("subtitle")
+            or
+            ""
+        ),
 
-        "title":
-            (
-                market.get("title")
-                or market.get("subtitle")
-                or ""
-            ),
-
-        "yes_bid":
-            probability(
-                market,
-                "yes_bid_dollars",
-                "yes_bid",
-            ),
-
-        "yes_ask":
-            probability(
-                market,
-                "yes_ask_dollars",
-                "yes_ask",
-            ),
-
-        "last":
-            probability(
-                market,
-                "last_price_dollars",
-                "last_price",
-            ),
-
-        "floor_strike":
-            f(
-                market.get(
-                    "floor_strike"
-                )
-            ),
-
-        "cap_strike":
-            f(
-                market.get(
-                    "cap_strike"
-                )
-            ),
-
-        "close_time":
-            (
-                market.get(
-                    "close_time"
-                )
-                or market.get(
-                    "expiration_time"
-                )
-            ),
-
-        "status":
-            market.get(
-                "status"
-            ),
-
-        "raw":
+        "yes_bid": probability(
             market,
+            "yes_bid_dollars",
+            "yes_bid",
+        ),
+
+        "yes_ask": probability(
+            market,
+            "yes_ask_dollars",
+            "yes_ask",
+        ),
+
+        "last": probability(
+            market,
+            "last_price_dollars",
+            "last_price",
+        ),
+
+        "floor_strike": num(
+            market.get("floor_strike")
+        ),
+
+        "cap_strike": num(
+            market.get("cap_strike")
+        ),
+
+        "close_time": (
+            market.get("close_time")
+            or
+            market.get("expiration_time")
+        ),
+
+        "status": market.get("status"),
+
+        "raw": market,
     }
 
 
 def get_target(market):
 
     if not market:
-
         return None
 
     for key in (
@@ -619,9 +479,9 @@ def get_target(market):
 
         if (
             value is not None
-            and value > 1000
+            and
+            value > 1000
         ):
-
             return value
 
     raw = market.get(
@@ -641,14 +501,14 @@ def get_target(market):
             "target" in key_text
         ):
 
-            number = f(value)
+            value = num(value)
 
             if (
-                number is not None
-                and number > 1000
+                value is not None
+                and
+                value > 1000
             ):
-
-                return number
+                return value
 
     return None
 
@@ -666,10 +526,7 @@ def get_kalshi():
             f"{KALSHI_BASE}/markets/{manual}"
         )
 
-        if isinstance(
-            data,
-            dict,
-        ):
+        if isinstance(data, dict):
 
             market = normalize_market(
                 data.get(
@@ -681,9 +538,7 @@ def get_kalshi():
             if market:
 
                 market["target"] = (
-                    get_target(
-                        market
-                    )
+                    get_target(market)
                 )
 
                 return market
@@ -691,26 +546,15 @@ def get_kalshi():
     data = get_json(
         f"{KALSHI_BASE}/markets",
         {
-            "series_ticker":
-                "KXBTC15M",
-
-            "status":
-                "open",
-
-            "limit":
-                100,
+            "series_ticker": "KXBTC15M",
+            "status": "open",
+            "limit": 100,
         },
     )
 
     markets = (
-        data.get(
-            "markets",
-            []
-        )
-        if isinstance(
-            data,
-            dict,
-        )
+        data.get("markets", [])
+        if isinstance(data, dict)
         else []
     )
 
@@ -719,23 +563,14 @@ def get_kalshi():
         data = get_json(
             f"{KALSHI_BASE}/markets",
             {
-                "status":
-                    "open",
-
-                "limit":
-                    200,
+                "status": "open",
+                "limit": 200,
             },
         )
 
         all_markets = (
-            data.get(
-                "markets",
-                []
-            )
-            if isinstance(
-                data,
-                dict,
-            )
+            data.get("markets", [])
+            if isinstance(data, dict)
             else []
         )
 
@@ -753,7 +588,6 @@ def get_kalshi():
         ]
 
     now = time.time()
-
     candidates = []
 
     for raw in markets:
@@ -768,48 +602,33 @@ def get_kalshi():
         if not ticker.startswith(
             "KXBTC15M"
         ):
-
             continue
 
         close = parse_time(
-            raw.get(
-                "close_time"
-            )
-            or raw.get(
-                "expiration_time"
-            )
+            raw.get("close_time")
+            or
+            raw.get("expiration_time")
         )
 
         if (
             close
             and
-            close.timestamp()
-            > now
+            close.timestamp() > now
         ):
-
-            candidates.append(
-                raw
-            )
+            candidates.append(raw)
 
     if not candidates:
-
         return None
 
-    def close_timestamp(
-        market,
-    ):
+    def close_timestamp(market):
 
         dt = parse_time(
-            market.get(
-                "close_time"
-            )
-            or market.get(
-                "expiration_time"
-            )
+            market.get("close_time")
+            or
+            market.get("expiration_time")
         )
 
         if dt:
-
             return dt.timestamp()
 
         return float("inf")
@@ -825,17 +644,221 @@ def get_kalshi():
     if market:
 
         market["target"] = (
-            get_target(
-                market
-            )
+            get_target(market)
         )
 
     return market
 
 
 # =========================================================
-# CONFIRMATION ENGINE
+# KALSHI HISTORY
 # =========================================================
+
+def yes_mid(market):
+
+    if not market:
+        return None
+
+    bid = market.get("yes_bid")
+    ask = market.get("yes_ask")
+
+    if (
+        bid is not None
+        and
+        ask is not None
+    ):
+        return (bid + ask) / 2
+
+    return market.get("last")
+
+
+def record_market(market):
+
+    mid = yes_mid(market)
+
+    if mid is None:
+        return
+
+    ticker = market.get("ticker")
+    now = time.time()
+
+    market_history.append(
+        (
+            now,
+            ticker,
+            mid,
+        )
+    )
+
+    cutoff = now - 20 * 60
+
+    while (
+        market_history
+        and
+        market_history[0][0] < cutoff
+    ):
+        market_history.pop(0)
+
+    if len(market_history) > MARKET_HISTORY_MAX:
+
+        del market_history[
+            :-MARKET_HISTORY_MAX
+        ]
+
+
+def kalshi_change(
+    ticker,
+    seconds=60,
+):
+
+    if not ticker:
+        return None
+
+    if not market_history:
+        return None
+
+    now = time.time()
+
+    current = None
+    previous = None
+
+    for (
+        timestamp,
+        saved_ticker,
+        mid,
+    ) in reversed(market_history):
+
+        if saved_ticker != ticker:
+            continue
+
+        if current is None:
+            current = mid
+            continue
+
+        if timestamp <= now - seconds:
+
+            previous = mid
+            break
+
+    if (
+        current is None
+        or
+        previous is None
+    ):
+        return None
+
+    return (
+        current - previous
+    ) * 100
+
+
+# =========================================================
+# SMART BRAIN
+# =========================================================
+
+def acceleration_state(
+    m1,
+    m5,
+    m15,
+):
+
+    if None in (
+        m1,
+        m5,
+        m15,
+    ):
+        return "UNKNOWN"
+
+    if (
+        m15 < -0.04
+        and
+        m5 < -0.02
+        and
+        m1 < -0.01
+    ):
+        return "ACCELERATING DOWN"
+
+    if (
+        m15 > 0.04
+        and
+        m5 > 0.02
+        and
+        m1 > 0.01
+    ):
+        return "ACCELERATING UP"
+
+    if (
+        m15 < -0.04
+        and
+        m5 < -0.02
+        and
+        m1 > 0.02
+    ):
+        return "SHORT-TERM REVERSAL UP"
+
+    if (
+        m15 > 0.04
+        and
+        m5 > 0.02
+        and
+        m1 < -0.02
+    ):
+        return "SHORT-TERM REVERSAL DOWN"
+
+    return "STABLE / MIXED"
+
+
+def reversal_state(
+    m1,
+    m5,
+    m15,
+):
+
+    if None in (
+        m1,
+        m5,
+        m15,
+    ):
+        return "UNKNOWN"
+
+    if (
+        m15 < -0.04
+        and
+        m5 < -0.02
+        and
+        m1 > 0.02
+    ):
+        return "HIGH — BULLISH REVERSAL"
+
+    if (
+        m15 > 0.04
+        and
+        m5 > 0.02
+        and
+        m1 < -0.02
+    ):
+        return "HIGH — BEARISH REVERSAL"
+
+    if (
+        m15 < -0.04
+        and
+        m5 < 0
+        and
+        m1 > 0
+    ):
+        return "MEDIUM — POSSIBLE BULLISH TURN"
+
+    if (
+        m15 > 0.04
+        and
+        m5 > 0
+        and
+        m1 < 0
+    ):
+        return "MEDIUM — POSSIBLE BEARISH TURN"
+
+    return "LOW"
+
 
 def build_signal(
     price,
@@ -858,96 +881,63 @@ def build_signal(
         15,
     )
 
-    structure = get_structure(
+    structure = price_structure(
         candles
     )
 
-    bullish = 0
-    bearish = 0
+    acceleration = acceleration_state(
+        m1,
+        m5,
+        m15,
+    )
 
-    bullish_items = []
-    bearish_items = []
-    neutral_items = []
+    reversal = reversal_state(
+        m1,
+        m5,
+        m15,
+    )
 
-    # -----------------------------------------------------
-    # DATA GATES
-    # -----------------------------------------------------
+    result = {
+        "verdict": "WAIT",
+        "label": "WAIT",
+        "confidence": 0,
+        "score": 0,
+        "bullish": 0,
+        "bearish": 0,
+        "agreement": "NO DATA",
+        "ready": False,
+        "structure": structure,
+        "acceleration": acceleration,
+        "reversal": reversal,
+        "pressure": None,
+        "kalshi_change": None,
+        "warning": None,
+        "reasons": [],
+    }
 
     if price is None:
 
-        return {
-            "verdict":
-                "WAIT",
+        result["label"] = (
+            "WAIT — NO BTC DATA"
+        )
 
-            "label":
-                "WAIT — NO BTC DATA",
+        result["reasons"] = [
+            "BTC reference price unavailable."
+        ]
 
-            "confidence":
-                0,
-
-            "score":
-                0,
-
-            "bullish":
-                0,
-
-            "bearish":
-                0,
-
-            "agreement":
-                "NO DATA",
-
-            "ready":
-                False,
-
-            "structure":
-                structure,
-
-            "pressure":
-                None,
-
-            "reasons": [
-                "BTC reference price unavailable."
-            ],
-        }
+        return result
 
     if market is None:
 
-        return {
-            "verdict":
-                "WAIT",
+        result["label"] = (
+            "WAIT — NO KALSHI DATA"
+        )
 
-            "label":
-                "WAIT — NO KALSHI DATA",
+        result["reasons"] = [
+            "KXBTC15M market unavailable."
+        ]
 
-            "confidence":
-                0,
-
-            "score":
-                0,
-
-            "bullish":
-                0,
-
-            "bearish":
-                0,
-
-            "agreement":
-                "NO DATA",
-
-            "ready":
-                False,
-
-            "structure":
-                structure,
-
-            "pressure":
-                None,
-
-            "reasons": [
-                "KXBTC15M market unavailable."
-            ],
-        }
+        return result
 
     target = market.get(
         "target"
@@ -955,90 +945,43 @@ def build_signal(
 
     if target is None:
 
-        return {
-            "verdict":
-                "WAIT",
+        result["label"] = (
+            "WAIT — NO STRIKE"
+        )
 
-            "label":
-                "WAIT — NO STRIKE",
+        result["reasons"] = [
+            "Kalshi target unavailable."
+        ]
 
-            "confidence":
-                0,
+        return result
 
-            "score":
-                0,
-
-            "bullish":
-                0,
-
-            "bearish":
-                0,
-
-            "agreement":
-                "NO DATA",
-
-            "ready":
-                False,
-
-            "structure":
-                structure,
-
-            "pressure":
-                None,
-
-            "reasons": [
-                "Kalshi target unavailable."
-            ],
-        }
-
-    # -----------------------------------------------------
-    # HISTORY GATE
-    # -----------------------------------------------------
-
-    if (
-        m1 is None
-        or m5 is None
-        or m15 is None
+    if None in (
+        m1,
+        m5,
+        m15,
     ):
 
-        return {
-            "verdict":
-                "WAIT",
+        result["label"] = (
+            "WAIT — BUILDING HISTORY"
+        )
 
-            "label":
-                "WAIT — BUILDING HISTORY",
+        result["confidence"] = 25
 
-            "confidence":
-                25,
+        result["reasons"] = [
+            "Building complete 1m/5m/15m history."
+        ]
 
-            "score":
-                0,
+        return result
 
-            "bullish":
-                0,
+    bullish = 0
+    bearish = 0
 
-            "bearish":
-                0,
-
-            "agreement":
-                "BUILDING",
-
-            "ready":
-                False,
-
-            "structure":
-                structure,
-
-            "pressure":
-                None,
-
-            "reasons": [
-                "Building complete 1m/5m/15m candle history."
-            ],
-        }
+    bullish_reasons = []
+    bearish_reasons = []
+    neutral_reasons = []
 
     # -----------------------------------------------------
-    # 1. BTC VS STRIKE
+    # BTC VS TARGET
     # -----------------------------------------------------
 
     distance_pct = (
@@ -1050,7 +993,7 @@ def build_signal(
 
         bullish += 1
 
-        bullish_items.append(
+        bullish_reasons.append(
             "BTC is above the Kalshi target."
         )
 
@@ -1058,25 +1001,25 @@ def build_signal(
 
         bearish += 1
 
-        bearish_items.append(
+        bearish_reasons.append(
             "BTC is below the Kalshi target."
         )
 
     else:
 
-        neutral_items.append(
+        neutral_reasons.append(
             "BTC is very close to the Kalshi target."
         )
 
     # -----------------------------------------------------
-    # 2. 1 MINUTE
+    # 1M
     # -----------------------------------------------------
 
     if m1 > 0.01:
 
         bullish += 1
 
-        bullish_items.append(
+        bullish_reasons.append(
             "1m momentum is positive."
         )
 
@@ -1084,25 +1027,25 @@ def build_signal(
 
         bearish += 1
 
-        bearish_items.append(
+        bearish_reasons.append(
             "1m momentum is negative."
         )
 
     else:
 
-        neutral_items.append(
+        neutral_reasons.append(
             "1m momentum is neutral."
         )
 
     # -----------------------------------------------------
-    # 3. 5 MINUTE
+    # 5M
     # -----------------------------------------------------
 
     if m5 > 0.02:
 
         bullish += 1
 
-        bullish_items.append(
+        bullish_reasons.append(
             "5m momentum is positive."
         )
 
@@ -1110,25 +1053,25 @@ def build_signal(
 
         bearish += 1
 
-        bearish_items.append(
+        bearish_reasons.append(
             "5m momentum is negative."
         )
 
     else:
 
-        neutral_items.append(
+        neutral_reasons.append(
             "5m momentum is neutral."
         )
 
     # -----------------------------------------------------
-    # 4. 15 MINUTE
+    # 15M
     # -----------------------------------------------------
 
     if m15 > 0.04:
 
         bullish += 1
 
-        bullish_items.append(
+        bullish_reasons.append(
             "15m momentum is positive."
         )
 
@@ -1136,343 +1079,385 @@ def build_signal(
 
         bearish += 1
 
-        bearish_items.append(
+        bearish_reasons.append(
             "15m momentum is negative."
         )
 
     else:
 
-        neutral_items.append(
+        neutral_reasons.append(
             "15m momentum is neutral."
         )
 
     # -----------------------------------------------------
-    # 5. STRUCTURE
+    # STRUCTURE
     # -----------------------------------------------------
 
-    if (
-        structure
-        == "HIGHER HIGHS / "
-           "HIGHER LOWS"
+    if structure == (
+        "HIGHER HIGHS / HIGHER LOWS"
     ):
 
         bullish += 1
 
-        bullish_items.append(
+        bullish_reasons.append(
             "Price structure is bullish."
         )
 
-    elif (
-        structure
-        == "LOWER HIGHS / "
-           "LOWER LOWS"
+    elif structure == (
+        "LOWER HIGHS / LOWER LOWS"
     ):
 
         bearish += 1
 
-        bearish_items.append(
+        bearish_reasons.append(
             "Price structure is bearish."
         )
 
     else:
 
-        neutral_items.append(
+        neutral_reasons.append(
             "Price structure is mixed."
         )
 
     # -----------------------------------------------------
-    # 6. KALSHI YES
+    # KALSHI YES
     # -----------------------------------------------------
 
-    yes_bid = market.get(
-        "yes_bid"
-    )
-
-    yes_ask = market.get(
-        "yes_ask"
-    )
-
-    if (
-        yes_bid is not None
-        and yes_ask is not None
-    ):
-
-        yes_mid = (
-            yes_bid
-            + yes_ask
-        ) / 2
-
-    else:
-
-        yes_mid = market.get(
-            "last"
-        )
+    mid = yes_mid(market)
 
     pressure = None
 
-    if yes_mid is not None:
+    if mid is not None:
 
         pressure = (
-            yes_mid
-            - 0.50
+            mid - 0.50
         ) * 200
 
-        if yes_mid >= 0.60:
+        if mid >= 0.60:
 
             bullish += 1
 
-            bullish_items.append(
+            bullish_reasons.append(
                 "Kalshi YES pricing favors UP."
             )
 
-        elif yes_mid <= 0.40:
+        elif mid <= 0.40:
 
             bearish += 1
 
-            bearish_items.append(
+            bearish_reasons.append(
                 "Kalshi YES pricing favors DOWN."
             )
 
         else:
 
-            neutral_items.append(
-                "Kalshi YES pricing is not strongly directional."
+            neutral_reasons.append(
+                "Kalshi YES pricing is near neutral."
             )
 
     # -----------------------------------------------------
-    # CONFIRMATION
+    # RECORD KALSHI MOVEMENT
     # -----------------------------------------------------
 
-    total = (
-        bullish
-        + bearish
+    ticker = market.get(
+        "ticker"
     )
 
-    if total == 0:
-
-        return {
-            "verdict":
-                "WAIT",
-
-            "label":
-                "WAIT — NEUTRAL",
-
-            "confidence":
-                35,
-
-            "score":
-                0,
-
-            "bullish":
-                bullish,
-
-            "bearish":
-                bearish,
-
-            "agreement":
-                "NEUTRAL",
-
-            "ready":
-                False,
-
-            "structure":
-                structure,
-
-            "pressure":
-                pressure,
-
-            "reasons": [
-                "No directional signals are strong enough."
-            ],
-        }
-
-    difference = (
-        abs(
-            bullish
-            - bearish
-        )
+    record_market(
+        market
     )
 
-    # Strong confirmation:
-    # At least 5 directional signals
-    # and at least 3-signal advantage.
+    k_change = kalshi_change(
+        ticker,
+        60,
+    )
 
-    if (
-        bullish >= 5
-        and
-        bullish - bearish >= 3
+    # -----------------------------------------------------
+    # ACCELERATION
+    # -----------------------------------------------------
+
+    if acceleration == (
+        "ACCELERATING UP"
     ):
 
-        verdict = "UP"
+        bullish += 1
 
-        label = (
-            "UP — STRONG CONFIRMATION"
+        bullish_reasons.append(
+            "Short-term momentum is accelerating upward."
         )
 
-        confidence = 90 + min(
-            5,
+    elif acceleration == (
+        "ACCELERATING DOWN"
+    ):
+
+        bearish += 1
+
+        bearish_reasons.append(
+            "Short-term momentum is accelerating downward."
+        )
+
+    # -----------------------------------------------------
+    # TIME
+    # -----------------------------------------------------
+
+    remaining = seconds_left(
+        market.get("close_time")
+    )
+
+    final_minute = (
+        remaining is not None
+        and
+        remaining <= 60
+    )
+
+    final_three = (
+        remaining is not None
+        and
+        remaining <= 180
+    )
+
+    # -----------------------------------------------------
+    # REVERSAL SAFETY
+    # -----------------------------------------------------
+
+    if reversal.startswith("HIGH"):
+
+        result["verdict"] = "WAIT"
+
+        result["label"] = (
+            "WAIT — REVERSAL RISK"
+        )
+
+        result["confidence"] = 58
+
+        result["warning"] = reversal
+
+    else:
+
+        difference = abs(
             bullish - bearish
         )
 
-        agreement = (
-            f"{bullish} BULLISH / "
-            f"{bearish} BEARISH"
-        )
+        if (
+            bullish >= 5
+            and
+            bullish - bearish >= 3
+        ):
 
-    elif (
-        bearish >= 5
+            result["verdict"] = "UP"
+
+            result["label"] = (
+                "UP — STRONG CONFIRMATION"
+            )
+
+            result["confidence"] = 90
+
+        elif (
+            bearish >= 5
+            and
+            bearish - bullish >= 3
+        ):
+
+            result["verdict"] = "DOWN"
+
+            result["label"] = (
+                "DOWN — STRONG CONFIRMATION"
+            )
+
+            result["confidence"] = 90
+
+        elif (
+            bullish >= 4
+            and
+            bullish > bearish
+            and
+            difference >= 2
+        ):
+
+            result["verdict"] = "UP"
+
+            result["label"] = (
+                "UP — CONFIRMED"
+            )
+
+            result["confidence"] = 72
+
+        elif (
+            bearish >= 4
+            and
+            bearish > bullish
+            and
+            difference >= 2
+        ):
+
+            result["verdict"] = "DOWN"
+
+            result["label"] = (
+                "DOWN — CONFIRMED"
+            )
+
+            result["confidence"] = 72
+
+        else:
+
+            result["verdict"] = "WAIT"
+
+            result["label"] = (
+                "WAIT — CONFLICT"
+            )
+
+            result["confidence"] = 50
+
+            result["warning"] = (
+                "Signals are not aligned enough."
+            )
+
+        # Extra caution in final minute.
+        if (
+            final_minute
+            and
+            difference < 4
+            and
+            result["verdict"] != "WAIT"
+        ):
+
+            result["verdict"] = "WAIT"
+
+            result["label"] = (
+                "WAIT — FINAL MINUTE"
+            )
+
+            result["confidence"] = 55
+
+            result["warning"] = (
+                "Final 60 seconds require stronger confirmation."
+            )
+
+        elif (
+            final_three
+            and
+            difference < 3
+        ):
+
+            result["warning"] = (
+                "Final 3 minutes — reversal risk is elevated."
+            )
+
+    # -----------------------------------------------------
+    # CONFIDENCE BOOST FOR ACCELERATION
+    # -----------------------------------------------------
+
+    if (
+        result["verdict"] == "UP"
         and
-        bearish - bullish >= 3
+        acceleration == "ACCELERATING UP"
     ):
 
-        verdict = "DOWN"
+        result["confidence"] += 3
 
-        label = (
-            "DOWN — STRONG CONFIRMATION"
-        )
-
-        confidence = 90 + min(
-            5,
-            bearish - bullish
-        )
-
-        agreement = (
-            f"{bullish} BULLISH / "
-            f"{bearish} BEARISH"
-        )
-
-    # Confirmed but not overwhelming.
-
-    elif (
-        bullish >= 4
+    if (
+        result["verdict"] == "DOWN"
         and
-        bullish > bearish
-        and
-        difference >= 2
+        acceleration == "ACCELERATING DOWN"
     ):
 
-        verdict = "UP"
+        result["confidence"] += 3
 
-        label = (
-            "UP — CONFIRMED"
+    result["confidence"] = min(
+        95,
+        result["confidence"]
+    )
+
+    result["bullish"] = bullish
+    result["bearish"] = bearish
+
+    result["score"] = (
+        bullish - bearish
+    )
+
+    result["agreement"] = (
+        f"{bullish} BULLISH / "
+        f"{bearish} BEARISH"
+    )
+
+    result["ready"] = (
+        result["verdict"] != "WAIT"
+    )
+
+    result["pressure"] = (
+        round(
+            pressure,
+            2,
         )
+        if pressure is not None
+        else None
+    )
 
-        confidence = 72
-
-        agreement = (
-            f"{bullish} BULLISH / "
-            f"{bearish} BEARISH"
+    result["kalshi_change"] = (
+        round(
+            k_change,
+            2,
         )
+        if k_change is not None
+        else None
+    )
 
-    elif (
-        bearish >= 4
-        and
-        bearish > bullish
-        and
-        difference >= 2
-    ):
+    # -----------------------------------------------------
+    # EXPLANATION
+    # -----------------------------------------------------
 
-        verdict = "DOWN"
+    if result["verdict"] == "UP":
 
-        label = (
-            "DOWN — CONFIRMED"
-        )
+        reasons = bullish_reasons[:]
 
-        confidence = 72
+    elif result["verdict"] == "DOWN":
 
-        agreement = (
-            f"{bullish} BULLISH / "
-            f"{bearish} BEARISH"
-        )
+        reasons = bearish_reasons[:]
 
     else:
 
-        verdict = "WAIT"
-
-        label = (
-            "WAIT — CONFLICT"
-        )
-
-        confidence = 50
-
-        agreement = (
-            f"{bullish} BULLISH / "
-            f"{bearish} BEARISH"
-        )
-
-    reasons = []
-
-    if verdict == "UP":
-
-        reasons.extend(
-            bullish_items
-        )
-
-    elif verdict == "DOWN":
-
-        reasons.extend(
-            bearish_items
-        )
-
-    else:
-
-        reasons.extend(
-            bullish_items[:3]
-        )
-
-        reasons.extend(
-            bearish_items[:3]
+        reasons = (
+            bullish_reasons[:3]
+            +
+            bearish_reasons[:3]
         )
 
         if not reasons:
+            reasons = neutral_reasons[:3]
 
-            reasons.extend(
-                neutral_items[:3]
+    reasons.append(
+        f"Momentum state: {acceleration}."
+    )
+
+    reasons.append(
+        f"Reversal risk: {reversal}."
+    )
+
+    if k_change is not None:
+
+        if abs(k_change) >= 2:
+
+            reasons.append(
+                "Kalshi YES moved "
+                f"{k_change:+.1f}¢ "
+                "over the last minute."
             )
 
-    return {
+    if final_minute:
 
-        "verdict":
-            verdict,
+        reasons.append(
+            "Final 60 seconds: extra confirmation required."
+        )
 
-        "label":
-            label,
+    elif final_three:
 
-        "confidence":
-            min(
-                confidence,
-                95,
-            ),
+        reasons.append(
+            "Final 3 minutes: time pressure is elevated."
+        )
 
-        "score":
-            bullish - bearish,
+    result["reasons"] = reasons[:8]
 
-        "bullish":
-            bullish,
-
-        "bearish":
-            bearish,
-
-        "agreement":
-            agreement,
-
-        "ready":
-            verdict != "WAIT",
-
-        "structure":
-            structure,
-
-        "pressure":
-            round(
-                pressure,
-                2,
-            )
-            if pressure is not None
-            else None,
-
-        "reasons":
-            reasons[:6],
-    }
+    return result
 
 
 # =========================================================
@@ -1481,20 +1466,14 @@ def build_signal(
 
 def collect_state():
 
-    price, feeds = (
-        spot_feeds()
-    )
+    btc, feeds = get_spot_feeds()
 
-    candles = (
-        get_history()
-    )
+    candles = get_history()
 
-    market = (
-        get_kalshi()
-    )
+    market = get_kalshi()
 
     signal = build_signal(
-        price,
+        btc,
         market,
         candles,
     )
@@ -1515,9 +1494,7 @@ def collect_state():
     )
 
     target = (
-        market.get(
-            "target"
-        )
+        market.get("target")
         if market
         else None
     )
@@ -1526,61 +1503,23 @@ def collect_state():
     distance_pct = None
 
     if (
-        price is not None
-        and target is not None
+        btc is not None
+        and
+        target is not None
     ):
 
         distance = (
-            price
-            - target
+            btc - target
         )
 
         distance_pct = (
-            distance
-            / target
+            distance / target
         ) * 100
-
-    yes_bid = (
-        market.get(
-            "yes_bid"
-        )
-        if market
-        else None
-    )
-
-    yes_ask = (
-        market.get(
-            "yes_ask"
-        )
-        if market
-        else None
-    )
-
-    yes_mid = (
-
-        (
-            yes_bid
-            + yes_ask
-        ) / 2
-
-        if (
-            yes_bid is not None
-            and yes_ask is not None
-        )
-
-        else (
-            market.get(
-                "last"
-            )
-            if market
-            else None
-        )
-    )
 
     return {
 
         "ok":
-            price is not None,
+            btc is not None,
 
         "updated":
             datetime.now(
@@ -1588,22 +1527,18 @@ def collect_state():
             ).isoformat(),
 
         "btc":
-            round(
-                price,
-                2,
-            )
-            if price is not None
-            else None,
+            (
+                round(btc, 2)
+                if btc is not None
+                else None
+            ),
 
         "feeds": {
-            key:
-                round(
-                    value,
-                    2,
-                )
+            key: (
+                round(value, 2)
                 if value is not None
                 else None
-
+            )
             for key, value
             in feeds.items()
         },
@@ -1621,42 +1556,49 @@ def collect_state():
         "kalshi": {
 
             "ticker":
-                market.get(
-                    "ticker"
-                )
-                if market
-                else None,
+                (
+                    market.get("ticker")
+                    if market
+                    else None
+                ),
 
             "target":
-                round(
-                    target,
-                    2,
-                )
-                if target
-                else None,
+                (
+                    round(target, 2)
+                    if target
+                    else None
+                ),
 
             "yes_bid":
-                yes_bid,
+                (
+                    market.get("yes_bid")
+                    if market
+                    else None
+                ),
 
             "yes_ask":
-                yes_ask,
+                (
+                    market.get("yes_ask")
+                    if market
+                    else None
+                ),
 
             "yes_mid":
-                yes_mid,
+                yes_mid(market),
 
             "last":
-                market.get(
-                    "last"
-                )
-                if market
-                else None,
+                (
+                    market.get("last")
+                    if market
+                    else None
+                ),
 
             "close_time":
-                market.get(
-                    "close_time"
-                )
-                if market
-                else None,
+                (
+                    market.get("close_time")
+                    if market
+                    else None
+                ),
 
             "countdown":
                 (
@@ -1673,47 +1615,57 @@ def collect_state():
         "distance": {
 
             "dollars":
-                round(
-                    distance,
-                    2,
-                )
-                if distance is not None
-                else None,
+                (
+                    round(
+                        distance,
+                        2,
+                    )
+                    if distance is not None
+                    else None
+                ),
 
             "percent":
-                round(
-                    distance_pct,
-                    4,
-                )
-                if distance_pct is not None
-                else None,
+                (
+                    round(
+                        distance_pct,
+                        4,
+                    )
+                    if distance_pct is not None
+                    else None
+                ),
         },
 
         "momentum": {
 
             "m1":
-                round(
-                    m1,
-                    4,
-                )
-                if m1 is not None
-                else None,
+                (
+                    round(
+                        m1,
+                        4,
+                    )
+                    if m1 is not None
+                    else None
+                ),
 
             "m5":
-                round(
-                    m5,
-                    4,
-                )
-                if m5 is not None
-                else None,
+                (
+                    round(
+                        m5,
+                        4,
+                    )
+                    if m5 is not None
+                    else None
+                ),
 
             "m15":
-                round(
-                    m15,
-                    4,
-                )
-                if m15 is not None
-                else None,
+                (
+                    round(
+                        m15,
+                        4,
+                    )
+                    if m15 is not None
+                    else None
+                ),
         },
 
         "signal":
@@ -1727,7 +1679,6 @@ def collect_state():
 
 @app.route("/")
 def home():
-
     return render_template_string(
         PAGE
     )
@@ -1754,9 +1705,7 @@ def api_state():
     cache["state"] = state
     cache["time"] = now
 
-    return jsonify(
-        state
-    )
+    return jsonify(state)
 
 
 # =========================================================
@@ -1765,7 +1714,6 @@ def api_state():
 
 PAGE = r"""
 <!doctype html>
-
 <html>
 
 <head>
@@ -1804,14 +1752,14 @@ body{
 }
 
 h1{
- font-size:25px;
  margin:0;
+ font-size:25px;
 }
 
 .sub{
+ margin-top:4px;
  color:#8994a5;
  font-size:12px;
- margin-top:4px;
 }
 
 .status{
@@ -1831,37 +1779,50 @@ h1{
 }
 
 .verdict{
- border-radius:18px;
- padding:25px;
+ margin-bottom:14px;
+ padding:24px;
  text-align:center;
+ border-radius:18px;
  background:#111822;
  border:1px solid #202a38;
- margin-bottom:14px;
 }
 
 .verdict.up{
- border-color:#18d77a;
  background:#092018;
+ border-color:#18d77a;
 }
 
 .verdict.down{
- border-color:#ff4d5d;
  background:#250c11;
+ border-color:#ff4d5d;
 }
 
 .verdict.wait{
- border-color:#e8b84d;
  background:#211b0b;
+ border-color:#e8b84d;
 }
 
 .verdict-label{
- font-size:40px;
+ font-size:39px;
  font-weight:900;
 }
 
 .conf{
  margin-top:7px;
  color:#aeb8c8;
+}
+
+.agreement{
+ margin-top:6px;
+ font-size:16px;
+ font-weight:800;
+}
+
+.warning{
+ margin-top:7px;
+ color:#ffcf5a;
+ font-size:12px;
+ font-weight:700;
 }
 
 .grid{
@@ -1871,16 +1832,16 @@ h1{
 }
 
 .card{
+ padding:15px;
+ border-radius:14px;
  background:#10151e;
  border:1px solid #202a38;
- border-radius:14px;
- padding:15px;
 }
 
 .card h3{
- font-size:12px;
- color:#8994a5;
  margin:0 0 8px;
+ color:#8994a5;
+ font-size:12px;
  text-transform:uppercase;
 }
 
@@ -1890,7 +1851,7 @@ h1{
 }
 
 .value{
- font-size:18px;
+ font-size:17px;
  font-weight:700;
 }
 
@@ -1907,9 +1868,9 @@ h1{
 }
 
 .small{
- font-size:11px;
- color:#7f8998;
  margin-top:5px;
+ color:#7f8998;
+ font-size:11px;
 }
 
 .wide{
@@ -1924,16 +1885,10 @@ h1{
  line-height:1.7;
 }
 
-.agreement{
- font-size:17px;
- font-weight:800;
- margin-top:3px;
-}
-
 .note{
- font-size:10px;
- color:#697585;
  margin-top:6px;
+ color:#697585;
+ font-size:10px;
 }
 
 @media(max-width:800px){
@@ -1955,7 +1910,7 @@ h1{
  }
 
  .verdict-label{
-  font-size:31px;
+  font-size:28px;
  }
 
  .big{
@@ -1979,7 +1934,7 @@ h1{
 <h1>₿ BTC STRIKE AI</h1>
 
 <div class="sub">
-15-minute BTC confirmation engine
+15-minute adaptive confirmation engine
 </div>
 
 </div>
@@ -2012,18 +1967,21 @@ CONNECTING
 <div class="conf">
 
 Confidence:
-
-<b id="confidence">
-0%
-</b>
+<b id="confidence">0%</b>
 
 </div>
 
 <div
- class="agreement"
  id="agreement"
+ class="agreement"
 >
 --
+</div>
+
+<div
+ id="warning"
+ class="warning"
+>
 </div>
 
 </div>
@@ -2037,15 +1995,15 @@ Confidence:
 <h3>BTC Reference</h3>
 
 <div
- class="big"
  id="btc"
+ class="big"
 >
 --
 </div>
 
 <div
- class="small"
  id="feedCount"
+ class="small"
 >
 -- feeds
 </div>
@@ -2058,15 +2016,15 @@ Confidence:
 <h3>Kalshi Target</h3>
 
 <div
- class="big"
  id="target"
+ class="big"
 >
 --
 </div>
 
 <div
- class="small"
  id="ticker"
+ class="small"
 >
 --
 </div>
@@ -2079,15 +2037,15 @@ Confidence:
 <h3>BTC vs Target</h3>
 
 <div
- class="big"
  id="distance"
+ class="big"
 >
 --
 </div>
 
 <div
- class="small"
  id="distancePct"
+ class="small"
 >
 --
 </div>
@@ -2100,8 +2058,8 @@ Confidence:
 <h3>Countdown</h3>
 
 <div
- class="big"
  id="countdown"
+ class="big"
 >
 --
 </div>
@@ -2118,8 +2076,8 @@ until market close
 <h3>1 Minute</h3>
 
 <div
- class="value"
  id="m1"
+ class="value"
 >
 --
 </div>
@@ -2132,8 +2090,8 @@ until market close
 <h3>5 Minutes</h3>
 
 <div
- class="value"
  id="m5"
+ class="value"
 >
 --
 </div>
@@ -2146,8 +2104,8 @@ until market close
 <h3>15 Minutes</h3>
 
 <div
- class="value"
  id="m15"
+ class="value"
 >
 --
 </div>
@@ -2160,8 +2118,8 @@ until market close
 <h3>Structure</h3>
 
 <div
- class="value"
  id="structure"
+ class="value"
 >
 --
 </div>
@@ -2171,11 +2129,11 @@ until market close
 
 <div class="card">
 
-<h3>Kalshi YES Bid</h3>
+<h3>Momentum State</h3>
 
 <div
+ id="acceleration"
  class="value"
- id="yesBid"
 >
 --
 </div>
@@ -2185,11 +2143,11 @@ until market close
 
 <div class="card">
 
-<h3>Kalshi YES Ask</h3>
+<h3>Reversal Risk</h3>
 
 <div
+ id="reversal"
  class="value"
- id="yesAsk"
 >
 --
 </div>
@@ -2199,17 +2157,20 @@ until market close
 
 <div class="card">
 
-<h3>YES Mid / Lean</h3>
+<h3>Kalshi YES</h3>
 
 <div
- class="value"
  id="yesMid"
+ class="value"
 >
 --
 </div>
 
-<div class="small">
-50% = neutral
+<div
+ id="kalshiChange"
+ class="small"
+>
+--
 </div>
 
 </div>
@@ -2220,8 +2181,8 @@ until market close
 <h3>Signal Score</h3>
 
 <div
- class="value"
  id="score"
+ class="value"
 >
 --
 </div>
@@ -2232,12 +2193,12 @@ until market close
 <div class="card wide">
 
 <h3>
-Why the engine chose this
+Why The Engine Chose This
 </h3>
 
 <ul
- class="reasons"
  id="reasons"
+ class="reasons"
 >
 
 <li>
@@ -2256,8 +2217,8 @@ Feed Health
 </h3>
 
 <div
- class="small"
  id="feeds"
+ class="small"
 >
 --
 </div>
@@ -2282,14 +2243,14 @@ function money(v){
   return "--";
 
  return "$"
- +
- Number(v).toLocaleString(
-  undefined,
-  {
-   minimumFractionDigits:2,
-   maximumFractionDigits:2
-  }
- );
+  +
+  Number(v).toLocaleString(
+   undefined,
+   {
+    minimumFractionDigits:2,
+    maximumFractionDigits:2
+   }
+  );
 
 }
 
@@ -2310,21 +2271,7 @@ function pct(v){
 }
 
 
-function cents(v){
-
- if(v==null)
-  return "--";
-
- return (
-  Number(v)*100
- ).toFixed(1)
- +
- "¢";
-
-}
-
-
-function cls(v){
+function color(v){
 
  if(v==null)
   return "";
@@ -2340,24 +2287,22 @@ function cls(v){
 }
 
 
-function setVal(
+function setValue(
  id,
  text,
- color
+ cls
 ){
 
- const e =
-  document.getElementById(
-   id
-  );
+ const element =
+  document.getElementById(id);
 
- e.textContent =
+ element.textContent =
   text;
 
- e.className =
+ element.className =
   "value "
   +
-  (color || "");
+  (cls || "");
 
 }
 
@@ -2375,9 +2320,7 @@ function clock(seconds){
 
  return (
   String(
-   Math.floor(
-    seconds / 60
-   )
+   Math.floor(seconds / 60)
   ).padStart(2,"0")
   +
   ":"
@@ -2394,23 +2337,35 @@ function refresh(){
 
  fetch(
   "/api/state?t="
-  + Date.now(),
+  +
+  Date.now(),
   {
    cache:"no-store"
   }
  )
 
  .then(
-  r => r.json()
+  response => {
+
+   if(!response.ok)
+    throw new Error(
+     "API "
+     +
+     response.status
+    );
+
+   return response.json();
+
+  }
  )
 
  .then(
-  d => {
+  data => {
 
    document.getElementById(
     "status"
    ).textContent =
-    d.ok
+    data.ok
      ? "LIVE"
      : "DATA ERROR";
 
@@ -2418,21 +2373,21 @@ function refresh(){
    document.getElementById(
     "btc"
    ).textContent =
-    money(d.btc);
+    money(data.btc);
 
 
    document.getElementById(
     "target"
    ).textContent =
     money(
-     d.kalshi.target
+     data.kalshi.target
     );
 
 
    document.getElementById(
     "ticker"
    ).textContent =
-    d.kalshi.ticker
+    data.kalshi.ticker
     || "--";
 
 
@@ -2440,7 +2395,7 @@ function refresh(){
     "feedCount"
    ).textContent =
     (
-     d.feed_count
+     data.feed_count
      || 0
     )
     +
@@ -2452,18 +2407,16 @@ function refresh(){
      "distance"
     );
 
-
    distance.textContent =
     money(
-     d.distance.dollars
+     data.distance.dollars
     );
-
 
    distance.className =
     "big "
     +
-    cls(
-     d.distance.dollars
+    color(
+     data.distance.dollars
     );
 
 
@@ -2471,7 +2424,7 @@ function refresh(){
     "distancePct"
    ).textContent =
     pct(
-     d.distance.percent
+     data.distance.percent
     );
 
 
@@ -2479,112 +2432,185 @@ function refresh(){
     "countdown"
    ).textContent =
     clock(
-     d.kalshi.countdown
+     data.kalshi.countdown
     );
 
 
-   setVal(
+   setValue(
     "m1",
     pct(
-     d.momentum.m1
+     data.momentum.m1
     ),
-    cls(
-     d.momentum.m1
+    color(
+     data.momentum.m1
     )
    );
 
 
-   setVal(
+   setValue(
     "m5",
     pct(
-     d.momentum.m5
+     data.momentum.m5
     ),
-    cls(
-     d.momentum.m5
+    color(
+     data.momentum.m5
     )
    );
 
 
-   setVal(
+   setValue(
     "m15",
     pct(
-     d.momentum.m15
+     data.momentum.m15
     ),
-    cls(
-     d.momentum.m15
+    color(
+     data.momentum.m15
     )
    );
 
 
-   setVal(
+   setValue(
     "structure",
-    d.signal.structure
+    data.signal.structure
     || "--",
     ""
    );
 
 
-   document.getElementById(
-    "yesBid"
-   ).textContent =
-    cents(
-     d.kalshi.yes_bid
-    );
+   let accelerationClass =
+    "yellow";
+
+   if(
+    data.signal.acceleration
+    &&
+    data.signal.acceleration.includes(
+     "UP"
+    )
+   ){
+    accelerationClass =
+     "green";
+   }
+
+   if(
+    data.signal.acceleration
+    &&
+    data.signal.acceleration.includes(
+     "DOWN"
+    )
+   ){
+    accelerationClass =
+     "red";
+   }
 
 
-   document.getElementById(
-    "yesAsk"
-   ).textContent =
-    cents(
-     d.kalshi.yes_ask
-    );
-
-
-   const mid =
-    d.kalshi.yes_mid;
-
-
-   setVal(
-    "yesMid",
-
-    mid == null
-     ? "--"
-     :
-     (
-      Number(mid)
-      * 100
-     ).toFixed(1)
-     + "%",
-
-    mid == null
-     ? ""
-     :
-     (
-      mid >= 0.50
-       ? "green"
-       : "red"
-     )
+   setValue(
+    "acceleration",
+    data.signal.acceleration
+    || "--",
+    accelerationClass
    );
 
 
-   setVal(
+   let reversalClass =
+    "yellow";
+
+   if(
+    data.signal.reversal
+    &&
+    data.signal.reversal.includes(
+     "BULLISH"
+    )
+   ){
+    reversalClass =
+     "green";
+   }
+
+   if(
+    data.signal.reversal
+    &&
+    data.signal.reversal.includes(
+     "BEARISH"
+    )
+   ){
+    reversalClass =
+     "red";
+   }
+
+
+   setValue(
+    "reversal",
+    data.signal.reversal
+    || "--",
+    reversalClass
+   );
+
+
+   const mid =
+    data.kalshi.yes_mid;
+
+
+   setValue(
+    "yesMid",
+
+    mid==null
+     ? "--"
+     :
+     (
+      Number(mid)*100
+     ).toFixed(1)
+     +
+     "%",
+
+    mid==null
+     ? ""
+     :
+     mid>=0.50
+      ? "green"
+      : "red"
+   );
+
+
+   document.getElementById(
+    "kalshiChange"
+   ).textContent =
+
+    data.signal.kalshi_change==null
+     ?
+     "Building Kalshi history..."
+     :
+     "1m YES move: "
+     +
+     (
+      data.signal.kalshi_change>=0
+       ? "+"
+       : ""
+     )
+     +
+     Number(
+      data.signal.kalshi_change
+     ).toFixed(1)
+     +
+     "¢";
+
+
+   setValue(
     "score",
 
-    d.signal.score == null
+    data.signal.score==null
      ? "--"
      :
      Number(
-      d.signal.score
+      data.signal.score
      ).toFixed(0),
 
-    cls(
-     d.signal.score
+    color(
+     data.signal.score
     )
    );
 
 
    const verdict =
-    d.signal.verdict
+    data.signal.verdict
     || "WAIT";
 
 
@@ -2598,29 +2624,29 @@ function refresh(){
     "verdict "
     +
     (
-     verdict === "UP"
+     verdict==="UP"
       ? "up"
       :
-     verdict === "DOWN"
+     verdict==="DOWN"
       ? "down"
       :
-       "wait"
+      "wait"
     );
 
 
    document.getElementById(
     "verdictLabel"
    ).textContent =
-    d.signal.label
+    data.signal.label
     ||
     (
-     verdict === "UP"
+     verdict==="UP"
       ? "🟢 UP"
       :
-     verdict === "DOWN"
+     verdict==="DOWN"
       ? "🔴 DOWN"
       :
-       "🟡 WAIT"
+      "🟡 WAIT"
     );
 
 
@@ -2628,7 +2654,7 @@ function refresh(){
     "confidence"
    ).textContent =
     (
-     d.signal.confidence
+     data.signal.confidence
      || 0
     )
     +
@@ -2638,22 +2664,27 @@ function refresh(){
    document.getElementById(
     "agreement"
    ).textContent =
-    d.signal.agreement
+    data.signal.agreement
     || "--";
 
 
-   const list =
+   document.getElementById(
+    "warning"
+   ).textContent =
+    data.signal.warning
+    || "";
+
+
+   const reasons =
     document.getElementById(
      "reasons"
     );
 
-
-   list.innerHTML =
-    "";
+   reasons.innerHTML = "";
 
 
    (
-    d.signal.reasons
+    data.signal.reasons
     ||
     [
      "Waiting for live data..."
@@ -2669,7 +2700,7 @@ function refresh(){
      li.textContent =
       reason;
 
-     list.appendChild(
+     reasons.appendChild(
       li
      );
 
@@ -2682,7 +2713,7 @@ function refresh(){
    ).textContent =
 
     Object.entries(
-     d.feeds || {}
+     data.feeds || {}
     )
     .map(
      ([name,value]) =>
@@ -2691,7 +2722,7 @@ function refresh(){
       ": "
       +
       (
-       value == null
+       value==null
         ? "OFFLINE"
         :
         money(value)
@@ -2703,7 +2734,7 @@ function refresh(){
     +
     "  •  History: "
     +
-    d.history_points
+    data.history_points
     +
     " candles";
 
@@ -2711,12 +2742,17 @@ function refresh(){
  )
 
  .catch(
-  () => {
+  error => {
 
    document.getElementById(
     "status"
    ).textContent =
-    "CONNECTION ERROR";
+    "API ERROR";
+
+   document.getElementById(
+    "warning"
+   ).textContent =
+    error.message;
 
   }
  );
