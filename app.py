@@ -1,58 +1,741 @@
-def get_kalshi():
+import os, time, json, statistics
+from datetime import datetime, timezone, timedelta
+import requests
+from flask import Flask, jsonify, render_template_string
+
+app = Flask(__name__)
+
+TIMEOUT = 5
+CACHE_SECONDS = 2
+MEMORY_FILE = "signal_memory.json"
+
+KALSHI_BASES = [
+    os.getenv(
+        "KALSHI_BASE_URL",
+        "https://external-api.kalshi.com/trade-api/v2"
+    ).rstrip("/"),
+    "https://api.elections.kalshi.com/trade-api/v2",
+]
+
+KALSHI_TICKER = os.getenv(
+    "KALSHI_TICKER",
+    ""
+).strip()
+
+KALSHI_SERIES = "KXBTC15M"
+
+session = requests.Session()
+session.headers["User-Agent"] = "BTC-Strike-AI/9.0"
+
+cache = {
+    "time": 0,
+    "state": None
+}
+
+history_cache = {
+    "time": 0,
+    "candles": []
+}
+
+feed_health = {}
+market_history = []
+signal_memory = []
+active_market = None
+memory_loaded = False
+
+
+# =========================================================
+# BASIC HELPERS
+# =========================================================
+
+def number(value):
+    try:
+        return float(value)
+    except:
+        return None
+
+
+def get_json(url, params=None):
+    try:
+        response = session.get(
+            url,
+            params=params,
+            timeout=TIMEOUT
+        )
+        response.raise_for_status()
+        return response.json()
+    except:
+        return None
+
+
+def parse_time(value):
+    if not value:
+        return None
+
+    try:
+        dt = datetime.fromisoformat(
+            str(value).replace(
+                "Z",
+                "+00:00"
+            )
+        )
+
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        return dt
+
+    except:
+        return None
+
+
+def seconds_left(value):
+    dt = parse_time(value)
+
+    if not dt:
+        return None
+
+    return max(
+        0,
+        int(
+            dt.timestamp()
+            - time.time()
+        )
+    )
+
+
+def record_feed(name, value):
+    item = feed_health.setdefault(
+        name,
+        {}
+    )
+
+    if value is not None:
+        item["online"] = True
+        item["last_success"] = time.time()
+    else:
+        item["online"] = False
+
+    return value
+
+
+# =========================================================
+# SIGNAL MEMORY
+# =========================================================
+
+def load_memory():
+    global signal_memory
+    global memory_loaded
+
+    if memory_loaded:
+        return
+
+    memory_loaded = True
+
+    try:
+        with open(
+            MEMORY_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(file)
+
+        if isinstance(data, list):
+            signal_memory = data[-500:]
+        else:
+            signal_memory = []
+
+    except:
+        signal_memory = []
+
+
+def save_memory():
+    try:
+        temp_file = MEMORY_FILE + ".tmp"
+
+        with open(
+            temp_file,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                signal_memory[-500:],
+                file
+            )
+
+        os.replace(
+            temp_file,
+            MEMORY_FILE
+        )
+
+    except:
+        pass
+
+
+# =========================================================
+# BINANCE
+# =========================================================
+
+def get_binance_price():
+
+    sources = [
+
+        (
+            "Binance",
+            "https://api.binance.com/api/v3/ticker/price",
+            {
+                "symbol": "BTCUSDT"
+            }
+        ),
+
+        (
+            "Binance",
+            "https://data-api.binance.vision/api/v3/ticker/price",
+            {
+                "symbol": "BTCUSDT"
+            }
+        ),
+
+        (
+            "Binance.US",
+            "https://api.binance.us/api/v3/ticker/price",
+            {
+                "symbol": "BTCUSD"
+            }
+        ),
+
+        (
+            "Binance.US",
+            "https://api.binance.us/api/v3/ticker/price",
+            {
+                "symbol": "BTCUSDT"
+            }
+        )
+    ]
+
+    for name, url, params in sources:
+
+        data = get_json(
+            url,
+            params
+        )
+
+        if isinstance(data, dict):
+
+            price = number(
+                data.get("price")
+            )
+
+            if price and price > 0:
+                return price, name
+
+    return None, "Binance"
+
+
+# =========================================================
+# BTC SPOT FEEDS
+# =========================================================
+
+def get_spot_feeds():
+
+    binance_price, binance_name = (
+        get_binance_price()
+    )
+
+    feeds = {}
+
+    feeds[binance_name] = record_feed(
+        binance_name,
+        binance_price
+    )
+
+    if binance_name != "Binance":
+
+        feeds["Binance"] = record_feed(
+            "Binance",
+            binance_price
+        )
+
+    # Coinbase
+
+    data = get_json(
+        "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+    )
+
+    try:
+        coinbase = number(
+            data["data"]["amount"]
+        )
+    except:
+        coinbase = None
+
+    feeds["Coinbase"] = record_feed(
+        "Coinbase",
+        coinbase
+    )
+
+    # Kraken
+
+    data = get_json(
+        "https://api.kraken.com/0/public/Ticker",
+        {
+            "pair": "XBTUSD"
+        }
+    )
+
+    try:
+        pair = next(
+            iter(
+                data["result"]
+            )
+        )
+
+        kraken = number(
+            data["result"][pair]["c"][0]
+        )
+
+    except:
+        kraken = None
+
+    feeds["Kraken"] = record_feed(
+        "Kraken",
+        kraken
+    )
+
+    # Bitstamp
+
+    data = get_json(
+        "https://www.bitstamp.net/api/v2/ticker/btcusd/"
+    )
+
+    if isinstance(data, dict):
+        bitstamp = number(
+            data.get("last")
+        )
+    else:
+        bitstamp = None
+
+    feeds["Bitstamp"] = record_feed(
+        "Bitstamp",
+        bitstamp
+    )
+
+    # Composite
+
+    values = [
+        value
+        for value in feeds.values()
+        if value is not None
+        and value > 0
+    ]
+
+    if not values:
+        return None, feeds
+
+    median = statistics.median(
+        values
+    )
+
+    filtered = [
+        value
+        for value in values
+        if abs(
+            value - median
+        ) / median <= 0.0035
+    ]
+
+    reference = statistics.median(
+        filtered or values
+    )
+
+    return reference, feeds
+
+
+# =========================================================
+# BTC HISTORY
+# =========================================================
+
+def get_history():
+
     now = time.time()
 
-    # Use cached result briefly to avoid unnecessary API calls.
-    if now - kalshi_cache["time"] < KALSHI_REFRESH_SECONDS:
-        return kalshi_cache["market"]
+    if (
+        history_cache["candles"]
+        and
+        now - history_cache["time"] < 15
+    ):
+        return history_cache["candles"]
 
-    # ---------------------------------------------------------
-    # 1. If a specific ticker was manually supplied, use it.
-    # ---------------------------------------------------------
+    end = datetime.now(
+        timezone.utc
+    )
+
+    start = (
+        end -
+        timedelta(
+            minutes=21
+        )
+    )
+
+    sources = [
+
+        (
+            "Coinbase",
+            "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+            {
+                "granularity": 60,
+                "start": start.isoformat(),
+                "end": end.isoformat()
+            }
+        ),
+
+        (
+            "Kraken",
+            "https://api.kraken.com/0/public/OHLC",
+            {
+                "pair": "XBTUSD",
+                "interval": 1
+            }
+        ),
+
+        (
+            "Binance",
+            "https://api.binance.com/api/v3/klines",
+            {
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "limit": 21
+            }
+        ),
+
+        (
+            "Binance",
+            "https://data-api.binance.vision/api/v3/klines",
+            {
+                "symbol": "BTCUSDT",
+                "interval": "1m",
+                "limit": 21
+            }
+        ),
+
+        (
+            "Binance.US",
+            "https://api.binance.us/api/v3/klines",
+            {
+                "symbol": "BTCUSD",
+                "interval": "1m",
+                "limit": 21
+            }
+        )
+    ]
+
+    for mode, url, params in sources:
+
+        data = get_json(
+            url,
+            params
+        )
+
+        candles = []
+
+        try:
+
+            if mode == "Coinbase":
+
+                for row in (
+                    data
+                    if isinstance(data, list)
+                    else []
+                ):
+
+                    close = number(
+                        row[4]
+                    )
+
+                    if close is not None:
+
+                        candles.append(
+                            (
+                                float(row[0]),
+                                close
+                            )
+                        )
+
+            elif mode == "Kraken":
+
+                result = data["result"]
+
+                pair = next(
+                    key
+                    for key in result
+                    if key != "last"
+                )
+
+                for row in result[pair][-21:]:
+
+                    close = number(
+                        row[4]
+                    )
+
+                    if close is not None:
+
+                        candles.append(
+                            (
+                                float(row[0]),
+                                close
+                            )
+                        )
+
+            else:
+
+                for row in (
+                    data
+                    if isinstance(data, list)
+                    else []
+                ):
+
+                    close = number(
+                        row[4]
+                    )
+
+                    if close is not None:
+
+                        candles.append(
+                            (
+                                float(row[0]) / 1000,
+                                close
+                            )
+                        )
+
+        except:
+            candles = []
+
+        candles.sort()
+
+        if len(candles) >= 16:
+
+            history_cache["time"] = now
+            history_cache["candles"] = candles
+
+            record_feed(
+                mode + " Candles",
+                candles[-1][1]
+            )
+
+            return candles
+
+    history_cache["time"] = now
+    history_cache["candles"] = []
+
+    return []
+
+
+# =========================================================
+# MOMENTUM
+# =========================================================
+
+def momentum(
+    candles,
+    minutes
+):
+
+    if len(candles) < 2:
+        return None
+
+    current_time, current = candles[-1]
+
+    target_time = (
+        current_time
+        - minutes * 60
+    )
+
+    previous = None
+
+    for timestamp, close in reversed(
+        candles[:-1]
+    ):
+
+        if timestamp <= target_time:
+
+            previous = close
+            break
+
+    if not previous:
+        return None
+
+    return (
+        (current - previous)
+        / previous
+    ) * 100
+
+
+# =========================================================
+# STRUCTURE
+# =========================================================
+
+def price_structure(candles):
+
+    if len(candles) < 8:
+        return "WAIT"
+
+    values = [
+        close
+        for _, close in candles[-8:]
+    ]
+
+    first = values[:4]
+    second = values[4:]
+
+    if (
+        max(second) > max(first)
+        and
+        min(second) > min(first)
+    ):
+        return "HIGHER HIGHS / HIGHER LOWS"
+
+    if (
+        max(second) < max(first)
+        and
+        min(second) < min(first)
+    ):
+        return "LOWER HIGHS / LOWER LOWS"
+
+    return "MIXED"
+
+
+# =========================================================
+# KALSHI NORMALIZATION
+# =========================================================
+
+def normalize_market(market):
+
+    if (
+        not isinstance(
+            market,
+            dict
+        )
+        or
+        not market.get("ticker")
+    ):
+        return None
+
+    def probability(*keys):
+
+        for key in keys:
+
+            value = number(
+                market.get(key)
+            )
+
+            if value is not None:
+
+                if value > 1:
+                    return value / 100
+
+                return value
+
+        return None
+
+    target = None
+
+    for key in (
+        "floor_strike",
+        "strike_price",
+        "strike",
+        "target",
+        "cap_strike"
+    ):
+
+        value = number(
+            market.get(key)
+        )
+
+        if value is not None:
+
+            target = value
+            break
+
+    return {
+        "ticker": market.get("ticker"),
+
+        "target": target,
+
+        "yes_bid": probability(
+            "yes_bid_dollars",
+            "yes_bid"
+        ),
+
+        "yes_ask": probability(
+            "yes_ask_dollars",
+            "yes_ask"
+        ),
+
+        "last": probability(
+            "last_price_dollars",
+            "last_price"
+        ),
+
+        "close_time": (
+            market.get("close_time")
+            or
+            market.get("expiration_time")
+        )
+    }
+
+
+# =========================================================
+# KALSHI
+# =========================================================
+
+def get_kalshi():
+
     if KALSHI_TICKER:
+
         for base in KALSHI_BASES:
+
             data = get_json(
                 f"{base}/markets/{KALSHI_TICKER}"
             )
 
             if isinstance(data, dict):
+
                 market = normalize_market(
-                    data.get("market", data)
+                    data.get(
+                        "market",
+                        data
+                    )
                 )
 
                 if market:
-                    kalshi_cache["time"] = now
-                    kalshi_cache["market"] = market
                     return market
-
-    # ---------------------------------------------------------
-    # 2. IMPORTANT:
-    # Ask Kalshi directly for the BTC 15-minute series.
-    #
-    # KXBTC15M = BTC 15-minute markets
-    # ---------------------------------------------------------
-    params = {
-        "series_ticker": "KXBTC15M",
-        "status": "open",
-        "limit": 100,
-        "mve_filter": "exclude",
-    }
 
     for base in KALSHI_BASES:
 
         data = get_json(
             f"{base}/markets",
-            params
+            {
+                "series_ticker": KALSHI_SERIES,
+                "status": "open",
+                "limit": 100
+            }
         )
 
-        if not isinstance(data, dict):
-            continue
-
-        markets = data.get(
-            "markets",
-            []
+        markets = (
+            data.get(
+                "markets",
+                []
+            )
+            if isinstance(data, dict)
+            else []
         )
 
         candidates = []
+
+        now = time.time()
 
         for market in markets:
 
@@ -63,61 +746,1853 @@ def get_kalshi():
                 )
             ).upper()
 
-            # Only accept the actual BTC 15-minute series.
-            if not ticker.startswith("KXBTC15M"):
+            if not ticker.startswith(
+                KALSHI_SERIES
+            ):
                 continue
-
-            close_time = (
-                market.get("close_time")
-                or
-                market.get("expiration_time")
-            )
 
             close = parse_time(
-                close_time
-            )
-
-            if not close:
-                continue
-
-            # Ignore markets that have already closed.
-            if close.timestamp() <= now:
-                continue
-
-            candidates.append(
-                market
-            )
-
-        # -----------------------------------------------------
-        # 3. Choose the nearest upcoming KXBTC15M market.
-        # -----------------------------------------------------
-        if candidates:
-
-            candidates.sort(
-                key=lambda market: (
-                    parse_time(
-                        market.get("close_time")
-                        or
-                        market.get("expiration_time")
-                    ).timestamp()
+                market.get(
+                    "close_time"
+                )
+                or
+                market.get(
+                    "expiration_time"
                 )
             )
 
-            selected = normalize_market(
+            if (
+                close
+                and
+                close.timestamp() > now
+            ):
+
+                candidates.append(
+                    market
+                )
+
+        candidates.sort(
+            key=lambda market:
+            parse_time(
+                market.get("close_time")
+                or
+                market.get("expiration_time")
+            ).timestamp()
+        )
+
+        if candidates:
+
+            return normalize_market(
                 candidates[0]
             )
 
-            if selected:
-
-                kalshi_cache["time"] = now
-                kalshi_cache["market"] = selected
-
-                return selected
-
-    # ---------------------------------------------------------
-    # Nothing found.
-    # ---------------------------------------------------------
-    kalshi_cache["time"] = now
-    kalshi_cache["market"] = None
-
     return None
+
+
+def yes_mid(market):
+
+    if not market:
+        return None
+
+    bid = market.get(
+        "yes_bid"
+    )
+
+    ask = market.get(
+        "yes_ask"
+    )
+
+    if (
+        bid is not None
+        and
+        ask is not None
+    ):
+
+        return (
+            bid + ask
+        ) / 2
+
+    return market.get(
+        "last"
+    )
+
+
+# =========================================================
+# QUALITY
+# =========================================================
+
+def calculate_quality(
+    feeds,
+    market,
+    candles
+):
+
+    values = [
+        value
+        for value in feeds.values()
+        if value is not None
+    ]
+
+    live = len(values)
+
+    score = 0
+
+    if live >= 4:
+        score += 35
+    elif live == 3:
+        score += 30
+    elif live == 2:
+        score += 20
+    elif live == 1:
+        score += 8
+
+    score += 25
+
+    spread = 0
+
+    if len(values) >= 2:
+
+        med = statistics.median(
+            values
+        )
+
+        if med:
+            spread = (
+                max(values)
+                - min(values)
+            ) / med * 100
+
+    if spread <= 0.03:
+        score += 30
+    elif spread <= 0.08:
+        score += 25
+    elif spread <= 0.20:
+        score += 15
+    elif spread <= 0.35:
+        score += 5
+
+    kalshi_score = 0
+
+    if market:
+        if market.get("ticker"):
+            kalshi_score += 30
+
+        if market.get("target") is not None:
+            kalshi_score += 25
+
+        if yes_mid(market) is not None:
+            kalshi_score += 25
+
+        if market.get("close_time"):
+            kalshi_score += 20
+
+    score = (
+        score * 0.60
+        +
+        kalshi_score * 0.25
+    )
+
+    if len(candles) >= 20:
+        score += 15
+    elif len(candles) >= 16:
+        score += 10
+    elif len(candles) >= 10:
+        score += 5
+
+    score = round(
+        min(100, score)
+    )
+
+    grade = (
+        "HIGH"
+        if score >= 85
+        else "GOOD"
+        if score >= 70
+        else "FAIR"
+        if score >= 50
+        else "LOW"
+    )
+
+    return score, grade
+
+
+# =========================================================
+# SIGNAL ENGINE
+# =========================================================
+
+def build_signal(
+    price,
+    market,
+    candles,
+    quality
+):
+
+    m1 = momentum(
+        candles,
+        1
+    )
+
+    m5 = momentum(
+        candles,
+        5
+    )
+
+    m15 = momentum(
+        candles,
+        15
+    )
+
+    structure = price_structure(
+        candles
+    )
+
+    signal = {
+        "verdict": "WAIT",
+        "label": "🟡 WAIT",
+        "confidence": 0,
+        "score": 0,
+        "bullish": 0,
+        "bearish": 0,
+        "m1": m1,
+        "m5": m5,
+        "m15": m15,
+        "structure": structure,
+        "acceleration": "STABLE / MIXED",
+        "reversal": "LOW",
+        "quality_score": quality,
+        "reasons": []
+    }
+
+    if (
+        price is None
+        or
+        not market
+        or
+        market.get("target") is None
+        or
+        len(candles) < 16
+    ):
+
+        signal["reasons"] = [
+            "Waiting for live BTC history and Kalshi target."
+        ]
+
+        return signal
+
+    target = market["target"]
+
+    bullish = 0
+    bearish = 0
+
+    if price > target:
+
+        bullish += 2
+
+        signal["reasons"].append(
+            "BTC is above the Kalshi target."
+        )
+
+    else:
+
+        bearish += 2
+
+        signal["reasons"].append(
+            "BTC is below the Kalshi target."
+        )
+
+    for value in (
+        m1,
+        m5,
+        m15
+    ):
+
+        if value is None:
+            continue
+
+        if value > 0:
+            bullish += 2
+
+        elif value < 0:
+            bearish += 2
+
+    if structure.startswith(
+        "HIGHER"
+    ):
+
+        bullish += 2
+
+        signal["reasons"].append(
+            "Price structure is bullish."
+        )
+
+    elif structure.startswith(
+        "LOWER"
+    ):
+
+        bearish += 2
+
+        signal["reasons"].append(
+            "Price structure is bearish."
+        )
+
+    if (
+        m1 is not None
+        and
+        m5 is not None
+        and
+        m15 is not None
+    ):
+
+        if (
+            m1 < -0.01
+            and
+            m5 < -0.02
+            and
+            m15 < -0.04
+        ):
+
+            signal["acceleration"] = (
+                "ACCELERATING DOWN"
+            )
+
+            bearish += 2
+
+        elif (
+            m1 > 0.01
+            and
+            m5 > 0.02
+            and
+            m15 > 0.04
+        ):
+
+            signal["acceleration"] = (
+                "ACCELERATING UP"
+            )
+
+            bullish += 2
+
+        if (
+            m15 < 0
+            and
+            m5 < 0
+            and
+            m1 > 0
+        ) or (
+            m15 > 0
+            and
+            m5 > 0
+            and
+            m1 < 0
+        ):
+
+            signal["reversal"] = "HIGH"
+
+    yes = yes_mid(
+        market
+    )
+
+    if yes is not None:
+
+        if yes >= 0.60:
+
+            bullish += 1
+
+            signal["reasons"].append(
+                "Kalshi YES is favoring UP."
+            )
+
+        elif yes <= 0.40:
+
+            bearish += 1
+
+            signal["reasons"].append(
+                "Kalshi YES is favoring DOWN."
+            )
+
+    total = (
+        bullish
+        +
+        bearish
+    )
+
+    difference = abs(
+        bullish
+        -
+        bearish
+    )
+
+    if (
+        total >= 7
+        and
+        difference >= 3
+    ):
+
+        if bullish > bearish:
+
+            signal["verdict"] = "UP"
+
+            signal["label"] = (
+                "🟢 UP — STRONG CONFIRMATION"
+            )
+
+        else:
+
+            signal["verdict"] = "DOWN"
+
+            signal["label"] = (
+                "🔴 DOWN — STRONG CONFIRMATION"
+            )
+
+        signal["confidence"] = min(
+            96,
+            60
+            +
+            difference * 5
+            +
+            min(
+                quality * 0.10,
+                8
+            )
+        )
+
+    elif (
+        total >= 5
+        and
+        difference >= 2
+    ):
+
+        if bullish > bearish:
+
+            signal["verdict"] = "UP"
+
+            signal["label"] = (
+                "🟢 UP — CONFIRMING"
+            )
+
+        else:
+
+            signal["verdict"] = "DOWN"
+
+            signal["label"] = (
+                "🔴 DOWN — CONFIRMING"
+            )
+
+        signal["confidence"] = min(
+            88,
+            55
+            +
+            difference * 5
+            +
+            min(
+                quality * 0.10,
+                8
+            )
+        )
+
+    else:
+
+        signal["reasons"].append(
+            "Signals are not aligned strongly enough."
+        )
+
+    # Reversal protection
+
+    if (
+        signal["reversal"]
+        ==
+        "HIGH"
+    ):
+
+        signal["verdict"] = "WAIT"
+
+        signal["label"] = (
+            "🟡 WAIT — REVERSAL RISK"
+        )
+
+        signal["confidence"] = 0
+
+    # Final-minute protection
+
+    countdown = seconds_left(
+        market.get("close_time")
+    )
+
+    if (
+        countdown is not None
+        and
+        countdown <= 60
+    ):
+
+        signal["verdict"] = "WAIT"
+
+        signal["label"] = (
+            "🟡 WAIT — FINAL-MINUTE BRAKE"
+        )
+
+        signal["confidence"] = 0
+
+    signal["bullish"] = bullish
+    signal["bearish"] = bearish
+
+    signal["score"] = (
+        bullish
+        -
+        bearish
+    )
+
+    return signal
+
+
+# =========================================================
+# SIGNAL MEMORY TRACKING
+# =========================================================
+
+def update_memory(
+    market,
+    price,
+    signal,
+    distance_pct
+):
+
+    global active_market
+
+    load_memory()
+
+    close = parse_time(
+        market.get("close_time")
+    )
+
+    close_ts = (
+        close.timestamp()
+        if close
+        else
+        time.time() + 900
+    )
+
+    ticker = market.get(
+        "ticker"
+    )
+
+    if (
+        active_market is None
+        or
+        active_market.get("ticker")
+        != ticker
+    ):
+
+        active_market = {
+
+            "ticker": ticker,
+
+            "close_ts": close_ts,
+
+            "target": market.get(
+                "target"
+            ),
+
+            "direction": (
+                signal["verdict"]
+                if signal["verdict"]
+                in ("UP", "DOWN")
+                else
+                "WAIT"
+            ),
+
+            "m1": signal.get("m1"),
+            "m5": signal.get("m5"),
+            "m15": signal.get("m15"),
+
+            "distance": distance_pct,
+
+            "structure":
+                signal.get(
+                    "structure"
+                ),
+
+            "last_price": price
+        }
+
+    else:
+
+        active_market[
+            "last_price"
+        ] = price
+
+        active_market[
+            "m1"
+        ] = signal.get("m1")
+
+        active_market[
+            "m5"
+        ] = signal.get("m5")
+
+        active_market[
+            "m15"
+        ] = signal.get("m15")
+
+        active_market[
+            "distance"
+        ] = distance_pct
+
+        active_market[
+            "structure"
+        ] = signal.get(
+            "structure"
+        )
+
+        if (
+            signal["verdict"]
+            in ("UP", "DOWN")
+            and
+            active_market[
+                "direction"
+            ]
+            == "WAIT"
+        ):
+
+            active_market[
+                "direction"
+            ] = signal[
+                "verdict"
+            ]
+
+    # Resolve market
+
+    if (
+        time.time()
+        >=
+        active_market.get(
+            "close_ts",
+            0
+        )
+    ):
+
+        record = active_market
+
+        target = record.get(
+            "target"
+        )
+
+        final_price = record.get(
+            "last_price"
+        )
+
+        if (
+            target is not None
+            and
+            final_price is not None
+        ):
+
+            if final_price > target:
+                outcome = "UP"
+
+            elif final_price < target:
+                outcome = "DOWN"
+
+            else:
+                outcome = "PUSH"
+
+            signal_memory.append(
+                {
+                    **record,
+                    "outcome": outcome,
+                    "resolved":
+                        datetime.now(
+                            timezone.utc
+                        ).isoformat()
+                }
+            )
+
+            signal_memory[:] = (
+                signal_memory[-500:]
+            )
+
+            save_memory()
+
+        active_market = None
+
+
+# =========================================================
+# SIGNAL MEMORY MATCHING
+# =========================================================
+
+def memory_match(
+    signal,
+    distance_pct
+):
+
+    load_memory()
+
+    if signal.get(
+        "verdict"
+    ) not in (
+        "UP",
+        "DOWN"
+    ):
+
+        return 0, None
+
+    current = {
+
+        "direction":
+            signal["verdict"],
+
+        "m1":
+            signal.get("m1"),
+
+        "m5":
+            signal.get("m5"),
+
+        "m15":
+            signal.get("m15"),
+
+        "distance":
+            distance_pct,
+
+        "structure":
+            signal.get("structure")
+    }
+
+    matches = []
+
+    for record in signal_memory:
+
+        if (
+            record.get(
+                "direction"
+            )
+            not in ("UP", "DOWN")
+        ):
+            continue
+
+        if (
+            record.get(
+                "outcome"
+            )
+            not in ("UP", "DOWN")
+        ):
+            continue
+
+        points = 0
+        total = 0
+
+        for key, tolerance in (
+            ("m1", 0.025),
+            ("m5", 0.05),
+            ("m15", 0.08),
+            ("distance", 0.10)
+        ):
+
+            a = current.get(
+                key
+            )
+
+            b = record.get(
+                key
+            )
+
+            if (
+                a is not None
+                and
+                b is not None
+            ):
+
+                total += 1
+
+                if abs(a - b) <= tolerance:
+                    points += 1
+
+        if (
+            current.get(
+                "structure"
+            )
+            ==
+            record.get(
+                "structure"
+            )
+        ):
+
+            total += 1
+            points += 1
+
+        if (
+            total
+            and
+            points / total >= 0.67
+        ):
+
+            matches.append(
+                record
+            )
+
+    matches = matches[-25:]
+
+    if not matches:
+        return 0, None
+
+    wins = sum(
+        1
+        for record in matches
+        if record.get(
+            "outcome"
+        )
+        ==
+        current[
+            "direction"
+        ]
+    )
+
+    rate = (
+        wins
+        /
+        len(matches)
+    ) * 100
+
+    return len(matches), rate
+
+
+# =========================================================
+# COLLECT STATE
+# =========================================================
+
+def collect_state():
+
+    load_memory()
+
+    price, feeds = (
+        get_spot_feeds()
+    )
+
+    candles = (
+        get_history()
+    )
+
+    market = (
+        get_kalshi()
+    )
+
+    quality_score, quality_grade = (
+        calculate_quality(
+            feeds,
+            market,
+            candles
+        )
+    )
+
+    signal = build_signal(
+        price,
+        market,
+        candles,
+        quality_score
+    )
+
+    target = (
+        market.get(
+            "target"
+        )
+        if market
+        else
+        None
+    )
+
+    distance_pct = None
+
+    if (
+        price is not None
+        and
+        target is not None
+    ):
+
+        distance_pct = (
+            (
+                price
+                -
+                target
+            )
+            /
+            target
+        ) * 100
+
+    # Memory tracking
+
+    if (
+        market
+        and
+        price is not None
+    ):
+
+        update_memory(
+            market,
+            price,
+            signal,
+            distance_pct
+        )
+
+    # Memory comparison
+
+    matches = 0
+    rate = None
+
+    if (
+        market
+        and
+        signal["verdict"]
+        in ("UP", "DOWN")
+    ):
+
+        matches, rate = (
+            memory_match(
+                signal,
+                distance_pct
+            )
+        )
+
+        if (
+            matches >= 3
+            and
+            rate is not None
+        ):
+
+            if rate >= 70:
+
+                signal["confidence"] = min(
+                    98,
+                    signal["confidence"]
+                    + 5
+                )
+
+                signal[
+                    "reasons"
+                ].append(
+                    "Memory: "
+                    +
+                    str(matches)
+                    +
+                    " similar setups, "
+                    +
+                    f"{rate:.0f}% favored this direction."
+                )
+
+            elif rate <= 40:
+
+                signal["confidence"] = max(
+                    0,
+                    signal["confidence"]
+                    - 8
+                )
+
+                signal[
+                    "reasons"
+                ].append(
+                    "Memory warning: similar setups favored against this direction."
+                )
+
+    return {
+
+        "updated":
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+
+        "btc":
+            price,
+
+        "feeds":
+            feeds,
+
+        "market":
+            market,
+
+        "countdown":
+            (
+                seconds_left(
+                    market.get(
+                        "close_time"
+                    )
+                )
+                if market
+                else
+                None
+            ),
+
+        "candles":
+            len(candles),
+
+        "signal":
+            signal,
+
+        "data_quality":
+            {
+                "score":
+                    quality_score,
+
+                "grade":
+                    quality_grade
+            },
+
+        "memory":
+            {
+                "records":
+                    len(signal_memory),
+
+                "matches":
+                    matches,
+
+                "rate":
+                    rate,
+
+                "up":
+                    sum(
+                        r.get(
+                            "outcome"
+                        )
+                        == "UP"
+                        for r in signal_memory
+                    ),
+
+                "down":
+                    sum(
+                        r.get(
+                            "outcome"
+                        )
+                        == "DOWN"
+                        for r in signal_memory
+                    )
+            }
+    }
+
+
+# =========================================================
+# DASHBOARD
+# =========================================================
+
+PAGE = r"""
+<!doctype html>
+
+<html>
+
+<head>
+
+<meta name="viewport"
+content="width=device-width,initial-scale=1">
+
+<title>BTC Strike AI</title>
+
+<style>
+
+body{
+margin:0;
+background:#071019;
+color:#eef4f8;
+font-family:Arial,sans-serif
+}
+
+.wrap{
+max-width:1150px;
+margin:auto;
+padding:18px
+}
+
+.grid{
+display:grid;
+grid-template-columns:repeat(4,1fr);
+gap:12px
+}
+
+.card{
+background:#0d1822;
+border:1px solid #1c2c38;
+border-radius:14px;
+padding:16px
+}
+
+.wide{
+grid-column:1/-1
+}
+
+.verdict{
+text-align:center;
+padding:25px;
+border-radius:16px;
+margin-bottom:14px
+}
+
+.up{
+background:#092b1a;
+border:1px solid #1b9b5c
+}
+
+.down{
+background:#321014;
+border:1px solid #d44754
+}
+
+.wait{
+background:#30280b;
+border:1px solid #c4a63a
+}
+
+.label{
+font-size:30px;
+font-weight:900
+}
+
+.big{
+font-size:27px;
+font-weight:800;
+margin-top:8px
+}
+
+.value{
+font-size:20px;
+font-weight:700;
+margin-top:8px
+}
+
+.small{
+color:#91a3b0;
+font-size:13px;
+margin-top:5px
+}
+
+.ok{
+color:#43d184
+}
+
+.bad{
+color:#ff6570
+}
+
+@media(max-width:800px){
+
+.grid{
+grid-template-columns:repeat(2,1fr)
+}
+
+}
+
+@media(max-width:520px){
+
+.grid{
+grid-template-columns:1fr
+}
+
+.wide{
+grid-column:auto
+}
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="wrap">
+
+<h1>BTC Strike AI</h1>
+
+<div class="small">
+KXBTC15M • Binance Protected • Signal Memory 🧠
+</div>
+
+<div id="verdict"
+class="verdict wait">
+
+<div id="label"
+class="label">
+🟡 WAIT
+</div>
+
+<div id="confidence">
+0%
+</div>
+
+<div id="agreement">
+</div>
+
+</div>
+
+<div class="grid">
+
+<div class="card">
+<div class="small">
+BTC REFERENCE
+</div>
+
+<div id="btc"
+class="big">
+--
+</div>
+
+<div id="feeds"
+class="small">
+--
+</div>
+</div>
+
+<div class="card">
+<div class="small">
+KALSHI TARGET
+</div>
+
+<div id="target"
+class="big">
+--
+</div>
+
+<div id="ticker"
+class="small">
+--
+</div>
+</div>
+
+<div class="card">
+<div class="small">
+BTC VS TARGET
+</div>
+
+<div id="distance"
+class="big">
+--
+</div>
+
+<div id="distancePct"
+class="small">
+--
+</div>
+</div>
+
+<div class="card">
+<div class="small">
+COUNTDOWN
+</div>
+
+<div id="countdown"
+class="big">
+--
+</div>
+
+<div class="small">
+until market close
+</div>
+</div>
+
+<div class="card">
+<div class="small">
+1 MIN
+</div>
+
+<div id="m1"
+class="value">
+--
+</div>
+</div>
+
+<div class="card">
+<div class="small">
+5 MIN
+</div>
+
+<div id="m5"
+class="value">
+--
+</div>
+</div>
+
+<div class="card">
+<div class="small">
+15 MIN
+</div>
+
+<div id="m15"
+class="value">
+--
+</div>
+</div>
+
+<div class="card">
+<div class="small">
+STRUCTURE
+</div>
+
+<div id="structure"
+class="value">
+--
+</div>
+</div>
+
+<div class="card">
+<div class="small">
+MOMENTUM
+</div>
+
+<div id="acceleration"
+class="value">
+--
+</div>
+</div>
+
+<div class="card">
+<div class="small">
+REVERSAL RISK
+</div>
+
+<div id="reversal"
+class="value">
+--
+</div>
+</div>
+
+<div class="card">
+<div class="small">
+KALSHI YES
+</div>
+
+<div id="yes"
+class="value">
+--
+</div>
+</div>
+
+<div class="card">
+<div class="small">
+SIGNAL SCORE
+</div>
+
+<div id="score"
+class="value">
+--
+</div>
+</div>
+
+<div class="card wide">
+
+<div class="small">
+DATA QUALITY BRAIN
+</div>
+
+<div id="quality"
+class="big">
+--
+</div>
+
+<div id="qualityText"
+class="small">
+--
+</div>
+
+</div>
+
+<div class="card wide">
+
+<div class="small">
+SIGNAL MEMORY 🧠
+</div>
+
+<div id="memory"
+class="value">
+0 resolved setups stored
+</div>
+
+<div id="memoryMatch"
+class="small">
+Building pattern history...
+</div>
+
+<div id="memoryStats"
+class="small">
+</div>
+
+</div>
+
+<div class="card wide">
+
+<div class="small">
+WHY THE ENGINE CHOSE THIS
+</div>
+
+<div id="reasons"
+class="small">
+Waiting...
+</div>
+
+</div>
+
+<div class="card wide">
+
+<div class="small">
+FEED HEALTH
+</div>
+
+<div id="health"
+class="small">
+--
+</div>
+
+</div>
+
+</div>
+
+</div>
+
+<script>
+
+function money(value){
+
+if(value==null)
+return "--";
+
+return "$"
++
+Number(value).toLocaleString(
+undefined,
+{
+minimumFractionDigits:2,
+maximumFractionDigits:2
+}
+);
+
+}
+
+function percent(value){
+
+if(value==null)
+return "--";
+
+return (
+value>=0 ? "+" : ""
+)
++
+Number(value).toFixed(3)
++
+"%";
+
+}
+
+function clock(seconds){
+
+if(seconds==null)
+return "--";
+
+return String(
+Math.floor(seconds/60)
+).padStart(2,"0")
++
+":"
++
+String(
+seconds%60
+).padStart(2,"0");
+
+}
+
+function setText(id,value){
+
+document.getElementById(
+id
+).textContent =
+value;
+
+}
+
+async function refresh(){
+
+try{
+
+const response =
+await fetch(
+"/api/state?x="
++
+Date.now()
+);
+
+const data =
+await response.json();
+
+const signal =
+data.signal || {};
+
+const market =
+data.market || {};
+
+const quality =
+data.data_quality || {};
+
+const memory =
+data.memory || {};
+
+const verdict =
+document.getElementById(
+"verdict"
+);
+
+verdict.className =
+"verdict "
++
+(
+signal.verdict === "UP"
+?
+"up"
+:
+signal.verdict === "DOWN"
+?
+"down"
+:
+"wait"
+);
+
+setText(
+"label",
+signal.label || "🟡 WAIT"
+);
+
+setText(
+"confidence",
+(signal.confidence || 0)
++
+"%"
+);
+
+setText(
+"agreement",
+(signal.bullish || 0)
++
+" BULLISH / "
++
+(signal.bearish || 0)
++
+" BEARISH"
+);
+
+setText(
+"btc",
+money(data.btc)
+);
+
+setText(
+"feeds",
+Object.values(
+data.feeds || {}
+).filter(
+x => x != null
+).length
++
+" live feeds"
+);
+
+setText(
+"target",
+money(
+market.target
+)
+);
+
+setText(
+"ticker",
+market.ticker || "--"
+);
+
+if(
+data.btc != null
+&&
+market.target != null
+){
+
+const difference =
+data.btc
+-
+market.target;
+
+setText(
+"distance",
+(
+difference >= 0
+?
+"+"
+:
+"-"
+)
++
+money(
+Math.abs(
+difference
+)
+)
+);
+
+setText(
+"distancePct",
+percent(
+difference
+/
+market.target
+*
+100
+)
+);
+
+}
+
+setText(
+"countdown",
+clock(
+data.countdown
+)
+);
+
+setText(
+"m1",
+percent(
+signal.m1
+)
+);
+
+setText(
+"m5",
+percent(
+signal.m5
+)
+);
+
+setText(
+"m15",
+percent(
+signal.m15
+)
+);
+
+setText(
+"structure",
+signal.structure || "--"
+);
+
+setText(
+"acceleration",
+signal.acceleration || "--"
+);
+
+setText(
+"reversal",
+signal.reversal || "--"
+);
+
+if(
+market.yes_bid != null
+&&
+market.yes_ask != null
+){
+
+setText(
+"yes",
+(
+(
+market.yes_bid
++
+market.yes_ask
+)
+/
+2
+*
+100
+).toFixed(1)
++
+"%"
+);
+
+}else{
+
+setText(
+"yes",
+"--"
+);
+
+}
+
+setText(
+"score",
+signal.score == null
+?
+"--"
+:
+signal.score
+);
+
+setText(
+"quality",
+(
+quality.score || 0
+)
++
+"/100 "
++
+(
+quality.grade || "--"
+)
+);
+
+setText(
+"qualityText",
+data.candles
++
+" history candles"
+);
+
+setText(
+"memory",
+(
+memory.records || 0
+)
++
+" resolved setups stored"
+);
+
+if(
+memory.matches
+){
+
+setText(
+"memoryMatch",
+memory.matches
++
+" similar setups • "
++
+Number(
+memory.rate
+).toFixed(0)
++
+"% historical support"
+);
+
+}else{
+
+setText(
+"memoryMatch",
+"Building pattern history..."
+);
+
+}
+
+setText(
+"memoryStats",
+"Stored outcomes: "
++
+(memory.up || 0)
++
+" UP • "
++
+(memory.down || 0)
++
+" DOWN"
+);
+
+setText(
+"reasons",
+(
+signal.reasons || []
+).map(
+reason => "• " + reason
+).join("\n")
+);
+
+setText(
+"health",
+Object.entries(
+data.feeds || {}
+).map(
+([name,value]) =>
+name
++
+": "
++
+(
+value != null
+?
+"LIVE"
+:
+"OFFLINE"
+)
+).join(" • ")
+);
+
+}catch(error){
+
+setText(
+"health",
+"Dashboard reconnecting..."
+);
+
+}
+
+}
+
+refresh();
+
+setInterval(
+refresh,
+2000
+);
+
+</script>
+
+</body>
+
+</html>
+"""
+
+
+# =========================================================
+# ROUTES
+# =========================================================
+
+@app.get("/")
+def index():
+
+    return render_template_string(
+        PAGE
+    )
+
+
+@app.get("/api/state")
+def api_state():
+
+    now = time.time()
+
+    if (
+        cache["state"] is not None
+        and
+        now - cache["time"]
+        <
+        CACHE_SECONDS
+    ):
+
+        return jsonify(
+            cache["state"]
+        )
+
+    state = collect_state()
+
+    cache["time"] = now
+    cache["state"] = state
+
+    return jsonify(
+        state
+    )
+
+
+# =========================================================
+# LOCAL DEVELOPMENT
+# =========================================================
+
+if __name__ == "__main__":
+
+    app.run(
+        host="0.0.0.0",
+        port=int(
+            os.getenv(
+                "PORT",
+                "5000"
+            )
+        )
+    )
