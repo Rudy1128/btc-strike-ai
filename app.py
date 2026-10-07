@@ -19,7 +19,7 @@ KALSHI_BASE = os.getenv(
 
 session = requests.Session()
 session.headers.update({
-    "User-Agent": "BTC-Strike-AI/3.0"
+    "User-Agent": "BTC-Strike-AI/4.0"
 })
 
 cache = {
@@ -33,6 +33,10 @@ history_cache = {
 }
 
 
+# =========================================================
+# HELPERS
+# =========================================================
+
 def f(value):
     try:
         return float(value)
@@ -41,372 +45,23 @@ def f(value):
 
 
 def get_json(url, params=None):
+
     try:
+
         response = session.get(
             url,
             params=params,
             timeout=TIMEOUT,
         )
+
         response.raise_for_status()
+
         return response.json()
+
     except Exception:
+
         return None
 
-
-# =========================================================
-# BTC SPOT FEEDS
-# =========================================================
-
-def spot_feeds():
-
-    feeds = {}
-
-    data = get_json(
-        "https://api.binance.com/api/v3/ticker/price",
-        {"symbol": "BTCUSDT"},
-    )
-
-    if isinstance(data, dict):
-        feeds["Binance"] = f(
-            data.get("price")
-        )
-
-    data = get_json(
-        "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-    )
-
-    try:
-        feeds["Coinbase"] = f(
-            data["data"]["amount"]
-        )
-    except (
-        TypeError,
-        KeyError,
-        IndexError,
-    ):
-        feeds["Coinbase"] = None
-
-    data = get_json(
-        "https://api.kraken.com/0/public/Ticker",
-        {"pair": "XBTUSD"},
-    )
-
-    try:
-        result = data["result"]
-        pair = next(iter(result))
-
-        feeds["Kraken"] = f(
-            result[pair]["c"][0]
-        )
-
-    except (
-        TypeError,
-        KeyError,
-        StopIteration,
-        IndexError,
-    ):
-        feeds["Kraken"] = None
-
-    data = get_json(
-        "https://www.bitstamp.net/api/v2/ticker/btcusd/"
-    )
-
-    feeds["Bitstamp"] = (
-        f(data.get("last"))
-        if isinstance(data, dict)
-        else None
-    )
-
-    valid = [
-        value
-        for value in feeds.values()
-        if value and value > 0
-    ]
-
-    if not valid:
-        return None, feeds
-
-    median = statistics.median(valid)
-
-    filtered = [
-        value
-        for value in valid
-        if abs(value - median) / median <= 0.0035
-    ]
-
-    return (
-        statistics.median(
-            filtered or valid
-        ),
-        feeds,
-    )
-
-
-# =========================================================
-# HISTORICAL 1-MINUTE CANDLES
-# =========================================================
-
-def coinbase_candles():
-
-    end = datetime.now(
-        timezone.utc
-    )
-
-    start = (
-        end - timedelta(minutes=21)
-    )
-
-    data = get_json(
-        "https://api.exchange.coinbase.com/products/BTC-USD/candles",
-        {
-            "granularity": 60,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-        },
-    )
-
-    candles = []
-
-    if isinstance(data, list):
-
-        for row in data:
-
-            try:
-                timestamp = float(row[0])
-                close = f(row[4])
-
-                if close:
-                    candles.append(
-                        (
-                            timestamp,
-                            close,
-                        )
-                    )
-
-            except (
-                TypeError,
-                IndexError,
-            ):
-                pass
-
-    candles.sort()
-
-    return candles
-
-
-def kraken_candles():
-
-    data = get_json(
-        "https://api.kraken.com/0/public/OHLC",
-        {
-            "pair": "XBTUSD",
-            "interval": 1,
-        },
-    )
-
-    candles = []
-
-    try:
-
-        result = data["result"]
-
-        pair = next(
-            key
-            for key in result
-            if key != "last"
-        )
-
-        for row in result[pair][-21:]:
-
-            timestamp = float(row[0])
-            close = f(row[4])
-
-            if close:
-
-                candles.append(
-                    (
-                        timestamp,
-                        close,
-                    )
-                )
-
-    except (
-        TypeError,
-        KeyError,
-        StopIteration,
-        IndexError,
-    ):
-        pass
-
-    candles.sort()
-
-    return candles
-
-
-def binance_candles():
-
-    data = get_json(
-        "https://api.binance.com/api/v3/klines",
-        {
-            "symbol": "BTCUSDT",
-            "interval": "1m",
-            "limit": 21,
-        },
-    )
-
-    candles = []
-
-    if isinstance(data, list):
-
-        for row in data:
-
-            try:
-
-                timestamp = (
-                    float(row[0])
-                    / 1000
-                )
-
-                close = f(row[4])
-
-                if close:
-
-                    candles.append(
-                        (
-                            timestamp,
-                            close,
-                        )
-                    )
-
-            except (
-                TypeError,
-                IndexError,
-            ):
-                pass
-
-    candles.sort()
-
-    return candles
-
-
-def get_history():
-
-    now = time.time()
-
-    if (
-        now - history_cache["time"]
-        < HISTORY_REFRESH
-    ):
-        return history_cache["candles"]
-
-    # Coinbase first because Binance
-    # may be unavailable from some
-    # hosting regions.
-
-    sources = [
-        coinbase_candles,
-        kraken_candles,
-        binance_candles,
-    ]
-
-    best = []
-
-    for source in sources:
-
-        candles = source()
-
-        if len(candles) >= 16:
-
-            best = candles
-            break
-
-    history_cache["candles"] = best
-    history_cache["time"] = now
-
-    return best
-
-
-def momentum(
-    candles,
-    minutes,
-):
-
-    if len(candles) < 2:
-        return None
-
-    current_timestamp, current = (
-        candles[-1]
-    )
-
-    target_timestamp = (
-        current_timestamp
-        - minutes * 60
-    )
-
-    previous = None
-
-    for timestamp, close in candles:
-
-        if timestamp <= target_timestamp:
-
-            previous = close
-
-        else:
-
-            break
-
-    if previous in (
-        None,
-        0,
-    ):
-        return None
-
-    return (
-        (current - previous)
-        / previous
-    ) * 100
-
-
-def structure(candles):
-
-    if len(candles) < 8:
-        return "WAIT"
-
-    values = [
-        close
-        for _, close
-        in candles[-8:]
-    ]
-
-    first = values[:4]
-    second = values[4:]
-
-    if (
-        max(second) > max(first)
-        and
-        min(second) > min(first)
-    ):
-        return (
-            "HIGHER HIGHS / "
-            "HIGHER LOWS"
-        )
-
-    if (
-        max(second) < max(first)
-        and
-        min(second) < min(first)
-    ):
-        return (
-            "LOWER HIGHS / "
-            "LOWER LOWS"
-        )
-
-    return "MIXED"
-
-
-# =========================================================
-# TIME
-# =========================================================
 
 def parse_time(value):
 
@@ -452,10 +107,403 @@ def seconds_left(value):
 
 
 # =========================================================
+# BTC SPOT
+# =========================================================
+
+def spot_feeds():
+
+    feeds = {}
+
+    # Binance
+    data = get_json(
+        "https://api.binance.com/api/v3/ticker/price",
+        {"symbol": "BTCUSDT"},
+    )
+
+    if isinstance(data, dict):
+
+        feeds["Binance"] = f(
+            data.get("price")
+        )
+
+    # Coinbase
+    data = get_json(
+        "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+    )
+
+    try:
+
+        feeds["Coinbase"] = f(
+            data["data"]["amount"]
+        )
+
+    except (
+        TypeError,
+        KeyError,
+        IndexError,
+    ):
+
+        feeds["Coinbase"] = None
+
+    # Kraken
+    data = get_json(
+        "https://api.kraken.com/0/public/Ticker",
+        {"pair": "XBTUSD"},
+    )
+
+    try:
+
+        result = data["result"]
+
+        pair = next(
+            iter(result)
+        )
+
+        feeds["Kraken"] = f(
+            result[pair]["c"][0]
+        )
+
+    except (
+        TypeError,
+        KeyError,
+        StopIteration,
+        IndexError,
+    ):
+
+        feeds["Kraken"] = None
+
+    # Bitstamp
+    data = get_json(
+        "https://www.bitstamp.net/api/v2/ticker/btcusd/"
+    )
+
+    if isinstance(data, dict):
+
+        feeds["Bitstamp"] = f(
+            data.get("last")
+        )
+
+    else:
+
+        feeds["Bitstamp"] = None
+
+    valid = [
+        value
+        for value in feeds.values()
+        if value is not None
+        and value > 0
+    ]
+
+    if not valid:
+
+        return None, feeds
+
+    median = statistics.median(
+        valid
+    )
+
+    filtered = [
+        value
+        for value in valid
+        if abs(value - median) / median
+        <= 0.0035
+    ]
+
+    return (
+        statistics.median(
+            filtered or valid
+        ),
+        feeds,
+    )
+
+
+# =========================================================
+# HISTORICAL CANDLES
+# =========================================================
+
+def coinbase_candles():
+
+    end = datetime.now(
+        timezone.utc
+    )
+
+    start = (
+        end - timedelta(minutes=21)
+    )
+
+    data = get_json(
+        "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+        {
+            "granularity": 60,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        },
+    )
+
+    candles = []
+
+    if isinstance(data, list):
+
+        for row in data:
+
+            try:
+
+                timestamp = float(
+                    row[0]
+                )
+
+                close = f(
+                    row[4]
+                )
+
+                if close:
+
+                    candles.append(
+                        (
+                            timestamp,
+                            close,
+                        )
+                    )
+
+            except (
+                TypeError,
+                IndexError,
+            ):
+
+                pass
+
+    candles.sort()
+
+    return candles
+
+
+def kraken_candles():
+
+    data = get_json(
+        "https://api.kraken.com/0/public/OHLC",
+        {
+            "pair": "XBTUSD",
+            "interval": 1,
+        },
+    )
+
+    candles = []
+
+    try:
+
+        result = data["result"]
+
+        pair = next(
+            key
+            for key in result
+            if key != "last"
+        )
+
+        for row in result[pair][-21:]:
+
+            timestamp = float(
+                row[0]
+            )
+
+            close = f(
+                row[4]
+            )
+
+            if close:
+
+                candles.append(
+                    (
+                        timestamp,
+                        close,
+                    )
+                )
+
+    except (
+        TypeError,
+        KeyError,
+        StopIteration,
+        IndexError,
+    ):
+
+        pass
+
+    candles.sort()
+
+    return candles
+
+
+def binance_candles():
+
+    data = get_json(
+        "https://api.binance.com/api/v3/klines",
+        {
+            "symbol": "BTCUSDT",
+            "interval": "1m",
+            "limit": 21,
+        },
+    )
+
+    candles = []
+
+    if isinstance(data, list):
+
+        for row in data:
+
+            try:
+
+                timestamp = (
+                    float(row[0])
+                    / 1000
+                )
+
+                close = f(
+                    row[4]
+                )
+
+                if close:
+
+                    candles.append(
+                        (
+                            timestamp,
+                            close,
+                        )
+                    )
+
+            except (
+                TypeError,
+                IndexError,
+            ):
+
+                pass
+
+    candles.sort()
+
+    return candles
+
+
+def get_history():
+
+    now = time.time()
+
+    if (
+        now - history_cache["time"]
+        < HISTORY_REFRESH
+    ):
+
+        return history_cache["candles"]
+
+    sources = [
+        coinbase_candles,
+        kraken_candles,
+        binance_candles,
+    ]
+
+    best = []
+
+    for source in sources:
+
+        candles = source()
+
+        if len(candles) >= 16:
+
+            best = candles
+
+            break
+
+    history_cache["candles"] = best
+    history_cache["time"] = now
+
+    return best
+
+
+def momentum(
+    candles,
+    minutes,
+):
+
+    if len(candles) < 2:
+
+        return None
+
+    current_time, current = (
+        candles[-1]
+    )
+
+    target_time = (
+        current_time
+        - minutes * 60
+    )
+
+    previous = None
+
+    for timestamp, close in candles:
+
+        if timestamp <= target_time:
+
+            previous = close
+
+        else:
+
+            break
+
+    if previous in (
+        None,
+        0,
+    ):
+
+        return None
+
+    return (
+        (current - previous)
+        / previous
+    ) * 100
+
+
+def get_structure(candles):
+
+    if len(candles) < 8:
+
+        return "WAIT"
+
+    values = [
+        close
+        for _, close
+        in candles[-8:]
+    ]
+
+    first = values[:4]
+    second = values[4:]
+
+    if (
+        max(second) > max(first)
+        and
+        min(second) > min(first)
+    ):
+
+        return (
+            "HIGHER HIGHS / "
+            "HIGHER LOWS"
+        )
+
+    if (
+        max(second) < max(first)
+        and
+        min(second) < min(first)
+    ):
+
+        return (
+            "LOWER HIGHS / "
+            "LOWER LOWS"
+        )
+
+    return "MIXED"
+
+
+# =========================================================
 # KALSHI
 # =========================================================
 
-def price_probability(
+def probability(
     market,
     *keys,
 ):
@@ -469,6 +517,7 @@ def price_probability(
         if value is not None:
 
             if value > 1:
+
                 return value / 100
 
             return value
@@ -485,6 +534,7 @@ def normalize_market(market):
         )
         or not market.get("ticker")
     ):
+
         return None
 
     return {
@@ -500,21 +550,21 @@ def normalize_market(market):
             ),
 
         "yes_bid":
-            price_probability(
+            probability(
                 market,
                 "yes_bid_dollars",
                 "yes_bid",
             ),
 
         "yes_ask":
-            price_probability(
+            probability(
                 market,
                 "yes_ask_dollars",
                 "yes_ask",
             ),
 
         "last":
-            price_probability(
+            probability(
                 market,
                 "last_price_dollars",
                 "last_price",
@@ -557,6 +607,7 @@ def normalize_market(market):
 def get_target(market):
 
     if not market:
+
         return None
 
     for key in (
@@ -567,14 +618,15 @@ def get_target(market):
         value = market.get(key)
 
         if (
-            value
+            value is not None
             and value > 1000
         ):
+
             return value
 
     raw = market.get(
         "raw",
-        {},
+        {}
     )
 
     for key, value in raw.items():
@@ -592,9 +644,10 @@ def get_target(market):
             number = f(value)
 
             if (
-                number
+                number is not None
                 and number > 1000
             ):
+
                 return number
 
     return None
@@ -661,7 +714,6 @@ def get_kalshi():
         else []
     )
 
-    # Fallback search.
     if not markets:
 
         data = get_json(
@@ -716,6 +768,7 @@ def get_kalshi():
         if not ticker.startswith(
             "KXBTC15M"
         ):
+
             continue
 
         close = parse_time(
@@ -730,7 +783,8 @@ def get_kalshi():
         if (
             close
             and
-            close.timestamp() > now
+            close.timestamp()
+            > now
         ):
 
             candidates.append(
@@ -738,6 +792,7 @@ def get_kalshi():
             )
 
     if not candidates:
+
         return None
 
     def close_timestamp(
@@ -754,6 +809,7 @@ def get_kalshi():
         )
 
         if dt:
+
             return dt.timestamp()
 
         return float("inf")
@@ -778,7 +834,7 @@ def get_kalshi():
 
 
 # =========================================================
-# DECISION ENGINE
+# CONFIRMATION ENGINE
 # =========================================================
 
 def build_signal(
@@ -802,9 +858,20 @@ def build_signal(
         15,
     )
 
-    struct = structure(
+    structure = get_structure(
         candles
     )
+
+    bullish = 0
+    bearish = 0
+
+    bullish_items = []
+    bearish_items = []
+    neutral_items = []
+
+    # -----------------------------------------------------
+    # DATA GATES
+    # -----------------------------------------------------
 
     if price is None:
 
@@ -812,23 +879,35 @@ def build_signal(
             "verdict":
                 "WAIT",
 
+            "label":
+                "WAIT — NO BTC DATA",
+
             "confidence":
                 0,
 
             "score":
                 0,
 
+            "bullish":
+                0,
+
+            "bearish":
+                0,
+
+            "agreement":
+                "NO DATA",
+
             "ready":
                 False,
 
             "structure":
-                struct,
+                structure,
 
             "pressure":
                 None,
 
             "reasons": [
-                "BTC price unavailable."
+                "BTC reference price unavailable."
             ],
         }
 
@@ -838,17 +917,29 @@ def build_signal(
             "verdict":
                 "WAIT",
 
+            "label":
+                "WAIT — NO KALSHI DATA",
+
             "confidence":
                 0,
 
             "score":
                 0,
 
+            "bullish":
+                0,
+
+            "bearish":
+                0,
+
+            "agreement":
+                "NO DATA",
+
             "ready":
                 False,
 
             "structure":
-                struct,
+                structure,
 
             "pressure":
                 None,
@@ -868,17 +959,29 @@ def build_signal(
             "verdict":
                 "WAIT",
 
+            "label":
+                "WAIT — NO STRIKE",
+
             "confidence":
                 0,
 
             "score":
                 0,
 
+            "bullish":
+                0,
+
+            "bearish":
+                0,
+
+            "agreement":
+                "NO DATA",
+
             "ready":
                 False,
 
             "structure":
-                struct,
+                structure,
 
             "pressure":
                 None,
@@ -888,20 +991,22 @@ def build_signal(
             ],
         }
 
-    # All three timeframes are required
-    # before a directional call.
+    # -----------------------------------------------------
+    # HISTORY GATE
+    # -----------------------------------------------------
 
     if (
         m1 is None
-        or
-        m5 is None
-        or
-        m15 is None
+        or m5 is None
+        or m15 is None
     ):
 
         return {
             "verdict":
                 "WAIT",
+
+            "label":
+                "WAIT — BUILDING HISTORY",
 
             "confidence":
                 25,
@@ -909,22 +1014,32 @@ def build_signal(
             "score":
                 0,
 
+            "bullish":
+                0,
+
+            "bearish":
+                0,
+
+            "agreement":
+                "BUILDING",
+
             "ready":
                 False,
 
             "structure":
-                struct,
+                structure,
 
             "pressure":
                 None,
 
             "reasons": [
-                "Building 1m/5m/15m candle history."
+                "Building complete 1m/5m/15m candle history."
             ],
         }
 
-    score = 0.0
-    reasons = []
+    # -----------------------------------------------------
+    # 1. BTC VS STRIKE
+    # -----------------------------------------------------
 
     distance_pct = (
         (price - target)
@@ -933,107 +1048,141 @@ def build_signal(
 
     if distance_pct > 0.03:
 
-        score += 2
+        bullish += 1
 
-        reasons.append(
+        bullish_items.append(
             "BTC is above the Kalshi target."
         )
 
     elif distance_pct < -0.03:
 
-        score -= 2
+        bearish += 1
 
-        reasons.append(
+        bearish_items.append(
             "BTC is below the Kalshi target."
         )
 
     else:
 
-        reasons.append(
+        neutral_items.append(
             "BTC is very close to the Kalshi target."
         )
 
-    # 1-minute
+    # -----------------------------------------------------
+    # 2. 1 MINUTE
+    # -----------------------------------------------------
 
     if m1 > 0.01:
 
-        score += 0.75
+        bullish += 1
 
-        reasons.append(
+        bullish_items.append(
             "1m momentum is positive."
         )
 
     elif m1 < -0.01:
 
-        score -= 0.75
+        bearish += 1
 
-        reasons.append(
+        bearish_items.append(
             "1m momentum is negative."
         )
 
-    # 5-minute
+    else:
+
+        neutral_items.append(
+            "1m momentum is neutral."
+        )
+
+    # -----------------------------------------------------
+    # 3. 5 MINUTE
+    # -----------------------------------------------------
 
     if m5 > 0.02:
 
-        score += 1.25
+        bullish += 1
 
-        reasons.append(
+        bullish_items.append(
             "5m momentum is positive."
         )
 
     elif m5 < -0.02:
 
-        score -= 1.25
+        bearish += 1
 
-        reasons.append(
+        bearish_items.append(
             "5m momentum is negative."
         )
 
-    # 15-minute
+    else:
+
+        neutral_items.append(
+            "5m momentum is neutral."
+        )
+
+    # -----------------------------------------------------
+    # 4. 15 MINUTE
+    # -----------------------------------------------------
 
     if m15 > 0.04:
 
-        score += 1.5
+        bullish += 1
 
-        reasons.append(
+        bullish_items.append(
             "15m momentum is positive."
         )
 
     elif m15 < -0.04:
 
-        score -= 1.5
+        bearish += 1
 
-        reasons.append(
+        bearish_items.append(
             "15m momentum is negative."
         )
 
-    # Structure
+    else:
+
+        neutral_items.append(
+            "15m momentum is neutral."
+        )
+
+    # -----------------------------------------------------
+    # 5. STRUCTURE
+    # -----------------------------------------------------
 
     if (
-        struct
+        structure
         == "HIGHER HIGHS / "
            "HIGHER LOWS"
     ):
 
-        score += 1.25
+        bullish += 1
 
-        reasons.append(
+        bullish_items.append(
             "Price structure is bullish."
         )
 
     elif (
-        struct
+        structure
         == "LOWER HIGHS / "
            "LOWER LOWS"
     ):
 
-        score -= 1.25
+        bearish += 1
 
-        reasons.append(
+        bearish_items.append(
             "Price structure is bearish."
         )
 
-    # Kalshi YES
+    else:
+
+        neutral_items.append(
+            "Price structure is mixed."
+        )
+
+    # -----------------------------------------------------
+    # 6. KALSHI YES
+    # -----------------------------------------------------
 
     yes_bid = market.get(
         "yes_bid"
@@ -1045,8 +1194,7 @@ def build_signal(
 
     if (
         yes_bid is not None
-        and
-        yes_ask is not None
+        and yes_ask is not None
     ):
 
         yes_mid = (
@@ -1071,72 +1219,248 @@ def build_signal(
 
         if yes_mid >= 0.60:
 
-            score += 1.25
+            bullish += 1
 
-            reasons.append(
-                "Kalshi YES pricing favors the upside."
+            bullish_items.append(
+                "Kalshi YES pricing favors UP."
             )
 
         elif yes_mid <= 0.40:
 
-            score -= 1.25
+            bearish += 1
 
-            reasons.append(
-                "Kalshi YES pricing favors the downside."
+            bearish_items.append(
+                "Kalshi YES pricing favors DOWN."
             )
 
-    # Final verdict.
+        else:
 
-    if score >= 4:
+            neutral_items.append(
+                "Kalshi YES pricing is not strongly directional."
+            )
+
+    # -----------------------------------------------------
+    # CONFIRMATION
+    # -----------------------------------------------------
+
+    total = (
+        bullish
+        + bearish
+    )
+
+    if total == 0:
+
+        return {
+            "verdict":
+                "WAIT",
+
+            "label":
+                "WAIT — NEUTRAL",
+
+            "confidence":
+                35,
+
+            "score":
+                0,
+
+            "bullish":
+                bullish,
+
+            "bearish":
+                bearish,
+
+            "agreement":
+                "NEUTRAL",
+
+            "ready":
+                False,
+
+            "structure":
+                structure,
+
+            "pressure":
+                pressure,
+
+            "reasons": [
+                "No directional signals are strong enough."
+            ],
+        }
+
+    difference = (
+        abs(
+            bullish
+            - bearish
+        )
+    )
+
+    # Strong confirmation:
+    # At least 5 directional signals
+    # and at least 3-signal advantage.
+
+    if (
+        bullish >= 5
+        and
+        bullish - bearish >= 3
+    ):
 
         verdict = "UP"
 
-    elif score <= -4:
+        label = (
+            "UP — STRONG CONFIRMATION"
+        )
+
+        confidence = 90 + min(
+            5,
+            bullish - bearish
+        )
+
+        agreement = (
+            f"{bullish} BULLISH / "
+            f"{bearish} BEARISH"
+        )
+
+    elif (
+        bearish >= 5
+        and
+        bearish - bullish >= 3
+    ):
 
         verdict = "DOWN"
+
+        label = (
+            "DOWN — STRONG CONFIRMATION"
+        )
+
+        confidence = 90 + min(
+            5,
+            bearish - bullish
+        )
+
+        agreement = (
+            f"{bullish} BULLISH / "
+            f"{bearish} BEARISH"
+        )
+
+    # Confirmed but not overwhelming.
+
+    elif (
+        bullish >= 4
+        and
+        bullish > bearish
+        and
+        difference >= 2
+    ):
+
+        verdict = "UP"
+
+        label = (
+            "UP — CONFIRMED"
+        )
+
+        confidence = 72
+
+        agreement = (
+            f"{bullish} BULLISH / "
+            f"{bearish} BEARISH"
+        )
+
+    elif (
+        bearish >= 4
+        and
+        bearish > bullish
+        and
+        difference >= 2
+    ):
+
+        verdict = "DOWN"
+
+        label = (
+            "DOWN — CONFIRMED"
+        )
+
+        confidence = 72
+
+        agreement = (
+            f"{bullish} BULLISH / "
+            f"{bearish} BEARISH"
+        )
 
     else:
 
         verdict = "WAIT"
 
-    confidence = min(
-        92,
-        max(
-            35,
-            int(
-                50
-                + abs(score)
-                * 7
-            ),
-        ),
-    )
-
-    if verdict == "WAIT":
-
-        confidence = min(
-            confidence,
-            60,
+        label = (
+            "WAIT — CONFLICT"
         )
+
+        confidence = 50
+
+        agreement = (
+            f"{bullish} BULLISH / "
+            f"{bearish} BEARISH"
+        )
+
+    reasons = []
+
+    if verdict == "UP":
+
+        reasons.extend(
+            bullish_items
+        )
+
+    elif verdict == "DOWN":
+
+        reasons.extend(
+            bearish_items
+        )
+
+    else:
+
+        reasons.extend(
+            bullish_items[:3]
+        )
+
+        reasons.extend(
+            bearish_items[:3]
+        )
+
+        if not reasons:
+
+            reasons.extend(
+                neutral_items[:3]
+            )
 
     return {
 
         "verdict":
             verdict,
 
+        "label":
+            label,
+
         "confidence":
-            confidence,
+            min(
+                confidence,
+                95,
+            ),
 
         "score":
-            round(
-                score,
-                2,
-            ),
+            bullish - bearish,
+
+        "bullish":
+            bullish,
+
+        "bearish":
+            bearish,
+
+        "agreement":
+            agreement,
 
         "ready":
             verdict != "WAIT",
 
         "structure":
-            struct,
+            structure,
 
         "pressure":
             round(
@@ -1169,7 +1493,7 @@ def collect_state():
         get_kalshi()
     )
 
-    sig = build_signal(
+    signal = build_signal(
         price,
         market,
         candles,
@@ -1203,8 +1527,7 @@ def collect_state():
 
     if (
         price is not None
-        and
-        target is not None
+        and target is not None
     ):
 
         distance = (
@@ -1242,8 +1565,7 @@ def collect_state():
 
         if (
             yes_bid is not None
-            and
-            yes_ask is not None
+            and yes_ask is not None
         )
 
         else (
@@ -1291,13 +1613,6 @@ def collect_state():
                 value is not None
                 for value
                 in feeds.values()
-            ),
-
-        "history_source":
-            (
-                "loaded"
-                if len(candles) >= 16
-                else "unavailable"
             ),
 
         "history_points":
@@ -1402,7 +1717,7 @@ def collect_state():
         },
 
         "signal":
-            sig,
+            signal,
     }
 
 
@@ -1540,7 +1855,7 @@ h1{
 }
 
 .verdict-label{
- font-size:46px;
+ font-size:40px;
  font-weight:900;
 }
 
@@ -1609,6 +1924,12 @@ h1{
  line-height:1.7;
 }
 
+.agreement{
+ font-size:17px;
+ font-weight:800;
+ margin-top:3px;
+}
+
 .note{
  font-size:10px;
  color:#697585;
@@ -1634,7 +1955,7 @@ h1{
  }
 
  .verdict-label{
-  font-size:38px;
+  font-size:31px;
  }
 
  .big{
@@ -1658,7 +1979,7 @@ h1{
 <h1>₿ BTC STRIKE AI</h1>
 
 <div class="sub">
-15-minute BTC decision engine
+15-minute BTC confirmation engine
 </div>
 
 </div>
@@ -1696,6 +2017,13 @@ Confidence:
 0%
 </b>
 
+</div>
+
+<div
+ class="agreement"
+ id="agreement"
+>
+--
 </div>
 
 </div>
@@ -1935,7 +2263,7 @@ Feed Health
 </div>
 
 <div class="note">
-Historical candles use exchange data; BTC Reference is not official BRTI.
+BTC Reference is an exchange composite and is not the official CF Benchmarks BRTI.
 </div>
 
 </div>
@@ -1954,14 +2282,14 @@ function money(v){
   return "--";
 
  return "$"
-  +
-  Number(v).toLocaleString(
-   undefined,
-   {
-    minimumFractionDigits:2,
-    maximumFractionDigits:2
-   }
-  );
+ +
+ Number(v).toLocaleString(
+  undefined,
+  {
+   minimumFractionDigits:2,
+   maximumFractionDigits:2
+  }
+ );
 
 }
 
@@ -1974,8 +2302,10 @@ function pct(v){
  return (
   v>=0 ? "+" : ""
  )
- + Number(v).toFixed(3)
- + "%";
+ +
+ Number(v).toFixed(3)
+ +
+ "%";
 
 }
 
@@ -1988,7 +2318,8 @@ function cents(v){
  return (
   Number(v)*100
  ).toFixed(1)
- + "¢";
+ +
+ "¢";
 
 }
 
@@ -2015,15 +2346,15 @@ function setVal(
  color
 ){
 
- const element =
+ const e =
   document.getElementById(
    id
   );
 
- element.textContent =
+ e.textContent =
   text;
 
- element.className =
+ e.className =
   "value "
   +
   (color || "");
@@ -2070,17 +2401,16 @@ function refresh(){
  )
 
  .then(
-  response =>
-   response.json()
+  r => r.json()
  )
 
  .then(
-  data => {
+  d => {
 
    document.getElementById(
     "status"
    ).textContent =
-    data.ok
+    d.ok
      ? "LIVE"
      : "DATA ERROR";
 
@@ -2088,34 +2418,33 @@ function refresh(){
    document.getElementById(
     "btc"
    ).textContent =
-    money(
-     data.btc
-    );
+    money(d.btc);
 
 
    document.getElementById(
     "target"
    ).textContent =
     money(
-     data.kalshi.target
+     d.kalshi.target
     );
 
 
    document.getElementById(
     "ticker"
    ).textContent =
-    data.kalshi.ticker
-     || "--";
+    d.kalshi.ticker
+    || "--";
 
 
    document.getElementById(
     "feedCount"
    ).textContent =
     (
-     data.feed_count
+     d.feed_count
      || 0
     )
-    + " feeds live";
+    +
+    " feeds live";
 
 
    const distance =
@@ -2126,7 +2455,7 @@ function refresh(){
 
    distance.textContent =
     money(
-     data.distance.dollars
+     d.distance.dollars
     );
 
 
@@ -2134,7 +2463,7 @@ function refresh(){
     "big "
     +
     cls(
-     data.distance.dollars
+     d.distance.dollars
     );
 
 
@@ -2142,7 +2471,7 @@ function refresh(){
     "distancePct"
    ).textContent =
     pct(
-     data.distance.percent
+     d.distance.percent
     );
 
 
@@ -2150,17 +2479,17 @@ function refresh(){
     "countdown"
    ).textContent =
     clock(
-     data.kalshi.countdown
+     d.kalshi.countdown
     );
 
 
    setVal(
     "m1",
     pct(
-     data.momentum.m1
+     d.momentum.m1
     ),
     cls(
-     data.momentum.m1
+     d.momentum.m1
     )
    );
 
@@ -2168,10 +2497,10 @@ function refresh(){
    setVal(
     "m5",
     pct(
-     data.momentum.m5
+     d.momentum.m5
     ),
     cls(
-     data.momentum.m5
+     d.momentum.m5
     )
    );
 
@@ -2179,18 +2508,18 @@ function refresh(){
    setVal(
     "m15",
     pct(
-     data.momentum.m15
+     d.momentum.m15
     ),
     cls(
-     data.momentum.m15
+     d.momentum.m15
     )
    );
 
 
    setVal(
     "structure",
-    data.signal.structure
-     || "--",
+    d.signal.structure
+    || "--",
     ""
    );
 
@@ -2199,7 +2528,7 @@ function refresh(){
     "yesBid"
    ).textContent =
     cents(
-     data.kalshi.yes_bid
+     d.kalshi.yes_bid
     );
 
 
@@ -2207,12 +2536,12 @@ function refresh(){
     "yesAsk"
    ).textContent =
     cents(
-     data.kalshi.yes_ask
+     d.kalshi.yes_ask
     );
 
 
    const mid =
-    data.kalshi.yes_mid;
+    d.kalshi.yes_mid;
 
 
    setVal(
@@ -2241,21 +2570,21 @@ function refresh(){
    setVal(
     "score",
 
-    data.signal.score == null
+    d.signal.score == null
      ? "--"
      :
      Number(
-      data.signal.score
-     ).toFixed(2),
+      d.signal.score
+     ).toFixed(0),
 
     cls(
-     data.signal.score
+     d.signal.score
     )
    );
 
 
    const verdict =
-    data.signal.verdict
+    d.signal.verdict
     || "WAIT";
 
 
@@ -2282,24 +2611,35 @@ function refresh(){
    document.getElementById(
     "verdictLabel"
    ).textContent =
-
-    verdict === "UP"
-     ? "🟢 UP"
-     :
-    verdict === "DOWN"
-     ? "🔴 DOWN"
-     :
-      "🟡 WAIT";
+    d.signal.label
+    ||
+    (
+     verdict === "UP"
+      ? "🟢 UP"
+      :
+     verdict === "DOWN"
+      ? "🔴 DOWN"
+      :
+       "🟡 WAIT"
+    );
 
 
    document.getElementById(
     "confidence"
    ).textContent =
     (
-     data.signal.confidence
+     d.signal.confidence
      || 0
     )
-    + "%";
+    +
+    "%";
+
+
+   document.getElementById(
+    "agreement"
+   ).textContent =
+    d.signal.agreement
+    || "--";
 
 
    const list =
@@ -2313,10 +2653,10 @@ function refresh(){
 
 
    (
-    data.signal.reasons
+    d.signal.reasons
     ||
     [
-     "Waiting for stronger alignment..."
+     "Waiting for live data..."
     ]
    ).forEach(
     reason => {
@@ -2342,12 +2682,13 @@ function refresh(){
    ).textContent =
 
     Object.entries(
-     data.feeds || {}
+     d.feeds || {}
     )
     .map(
      ([name,value]) =>
       name
-      + ": "
+      +
+      ": "
       +
       (
        value == null
@@ -2362,13 +2703,9 @@ function refresh(){
     +
     "  •  History: "
     +
-    data.history_source
+    d.history_points
     +
-    " ("
-    +
-    data.history_points
-    +
-    " candles)";
+    " candles";
 
   }
  )
