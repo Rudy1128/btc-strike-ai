@@ -49,7 +49,7 @@ active_market = None
 memory_loaded = False
 
 # =========================================================
-# REAL-TIME BINANCE STREAM
+# REAL-TIME BTC STREAM
 # =========================================================
 
 live_btc = {
@@ -57,65 +57,281 @@ live_btc = {
     "received_at": 0.0,
     "event_at": 0.0,
     "connected": False,
-    "source": "Binance WebSocket"
+    "source": "Coinbase WebSocket"
 }
 
+live_stream_lock = threading.Lock()
+stream_started = False
 kalshi_last_update = 0.0
 
 
-def _binance_stream_loop():
+def safe_event_time(value):
+    try:
+        if value is None:
+            return time.time()
+
+        value = float(value)
+
+        if value > 100000000000:
+            return value / 1000.0
+
+        if value > 1000000000:
+            return value
+
+    except Exception:
+        pass
+
+    return time.time()
+
+
+def _extract_price(obj):
+    if isinstance(obj, dict):
+
+        for key in (
+            "price",
+            "price_usd",
+            "last_trade_price"
+        ):
+            value = number(obj.get(key)) if "number" in globals() else None
+
+            if value is not None and value > 0:
+                return value
+
+        for value in obj.values():
+
+            found = _extract_price(value)
+
+            if found is not None:
+                return found
+
+    elif isinstance(obj, list):
+
+        for value in obj:
+
+            found = _extract_price(value)
+
+            if found is not None:
+                return found
+
+    return None
+
+
+def _set_live_price(
+    price,
+    source,
+    event_at=None
+):
+
+    if price is None or price <= 0:
+        return
+
+    received = time.time()
+
+    if source == "Binance Live":
+
+        coinbase_received = live_btc.get(
+            "received_at",
+            0.0
+        )
+
+        coinbase_source = live_btc.get(
+            "source"
+        )
+
+        if (
+            coinbase_source == "Coinbase Live"
+            and
+            coinbase_received
+            and
+            received - coinbase_received < 3
+        ):
+            return
+
+    with live_stream_lock:
+
+        live_btc["price"] = float(price)
+
+        live_btc["received_at"] = received
+
+        live_btc["event_at"] = (
+            event_at or received
+        )
+
+        live_btc["source"] = source
+
+        live_btc["connected"] = True
+
+    record_feed(
+        source,
+        price
+    )
+
+
+def _coinbase_stream_loop():
+
     if websocket is None:
         return
 
-    url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+    url = "wss://advanced-trade-ws.coinbase.com"
+
+    backoff = 2
 
     while True:
+
         ws = None
 
         try:
-            ws = websocket.create_connection(
+
+            def on_open(sock):
+
+                sock.send(
+                    json.dumps({
+                        "type": "subscribe",
+                        "product_ids": ["BTC-USD"],
+                        "channel": "ticker"
+                    })
+                )
+
+                sock.send(
+                    json.dumps({
+                        "type": "subscribe",
+                        "product_ids": ["BTC-USD"],
+                        "channel": "heartbeats"
+                    })
+                )
+
+
+            def on_message(
+                sock,
+                raw
+            ):
+
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    return
+
+                if not isinstance(
+                    data,
+                    dict
+                ):
+                    return
+
+                price = _extract_price(
+                    data
+                )
+
+                if price is None:
+                    return
+
+                event_at = time.time()
+
+                events = data.get(
+                    "events"
+                )
+
+                if isinstance(
+                    events,
+                    list
+                ):
+
+                    for event in events:
+
+                        if isinstance(
+                            event,
+                            dict
+                        ):
+
+                            ts = (
+                                event.get(
+                                    "timestamp"
+                                )
+                                or
+                                event.get(
+                                    "time"
+                                )
+                            )
+
+                            if ts:
+
+                                try:
+
+                                    event_at = (
+                                        datetime
+                                        .fromisoformat(
+                                            str(ts)
+                                            .replace(
+                                                "Z",
+                                                "+00:00"
+                                            )
+                                        )
+                                        .timestamp()
+                                    )
+
+                                except Exception:
+                                    pass
+
+                                break
+
+                _set_live_price(
+                    price,
+                    "Coinbase Live",
+                    event_at
+                )
+
+
+            def on_error(
+                sock,
+                error
+            ):
+
+                feed_health[
+                    "Coinbase Live"
+                ] = {
+                    "online": False,
+                    "last_error": str(error),
+                    "last_success":
+                        live_btc.get(
+                            "received_at",
+                            0.0
+                        )
+                }
+
+
+            def on_close(
+                sock,
+                code,
+                msg
+            ):
+
+                with live_stream_lock:
+
+                    live_btc[
+                        "connected"
+                    ] = False
+
+
+            ws = websocket.WebSocketApp(
                 url,
-                timeout=10
+                on_open=on_open,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
             )
 
-            live_btc["connected"] = True
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10,
+                skip_utf8_validation=True
+            )
 
-            while True:
-                raw = ws.recv()
-
-                if not raw:
-                    raise RuntimeError(
-                        "Empty Binance stream message"
-                    )
-
-                data = json.loads(raw)
-                price = number(
-                    data.get("p")
-                )
-
-                if price is None or price <= 0:
-                    continue
-
-                received = time.time()
-
-                live_btc["price"] = price
-                live_btc["received_at"] = received
-                live_btc["event_at"] = (
-                    safe_event_time(
-                        data.get("T")
-                    )
-                )
-
-                record_feed(
-                    "Binance Live",
-                    price
-                )
+            backoff = 2
 
         except Exception as exc:
 
-            live_btc["connected"] = False
-
-            feed_health["Binance Live"] = {
+            feed_health[
+                "Coinbase Live"
+            ] = {
                 "online": False,
                 "last_error": str(exc),
                 "last_success":
@@ -125,22 +341,188 @@ def _binance_stream_loop():
                     )
             }
 
-            time.sleep(1)
+            with live_stream_lock:
+
+                live_btc[
+                    "connected"
+                ] = False
 
         finally:
 
             try:
+
                 if ws is not None:
                     ws.close()
+
             except Exception:
                 pass
 
+        time.sleep(
+            backoff
+        )
 
-def safe_event_time(value):
-    try:
-        return float(value) / 1000.0
-    except Exception:
-        return time.time()
+        backoff = min(
+            backoff * 2,
+            30
+        )
+
+
+def _binance_stream_loop():
+
+    if websocket is None:
+        return
+
+    url = (
+        "wss://stream.binance.com:9443/"
+        "ws/btcusdt@trade"
+    )
+
+    backoff = 3
+
+    while True:
+
+        ws = None
+
+        try:
+
+            def on_message(
+                sock,
+                raw
+            ):
+
+                try:
+
+                    data = json.loads(
+                        raw
+                    )
+
+                    price = number(
+                        data.get("p")
+                    )
+
+                    if (
+                        price is not None
+                        and
+                        price > 0
+                    ):
+
+                        _set_live_price(
+                            price,
+                            "Binance Live",
+                            safe_event_time(
+                                data.get("T")
+                                or
+                                data.get("E")
+                            )
+                        )
+
+                except Exception:
+                    pass
+
+
+            def on_error(
+                sock,
+                error
+            ):
+
+                feed_health[
+                    "Binance Live"
+                ] = {
+                    "online": False,
+                    "last_error": str(error),
+                    "last_success":
+                        live_btc.get(
+                            "received_at",
+                            0.0
+                        )
+                }
+
+
+            def on_close(
+                sock,
+                code,
+                msg
+            ):
+                return
+
+
+            ws = websocket.WebSocketApp(
+                url,
+                on_message=on_message,
+                on_error=on_error,
+                on_close=on_close
+            )
+
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10,
+                skip_utf8_validation=True
+            )
+
+            backoff = 3
+
+        except Exception as exc:
+
+            feed_health[
+                "Binance Live"
+            ] = {
+                "online": False,
+                "last_error": str(exc),
+                "last_success":
+                    live_btc.get(
+                        "received_at",
+                        0.0
+                    )
+            }
+
+        finally:
+
+            try:
+
+                if ws is not None:
+                    ws.close()
+
+            except Exception:
+                pass
+
+        time.sleep(
+            backoff
+        )
+
+        backoff = min(
+            backoff * 2,
+            30
+        )
+
+
+def start_live_streams():
+
+    global stream_started
+
+    if websocket is None:
+        return
+
+    with live_stream_lock:
+
+        if stream_started:
+            return
+
+        stream_started = True
+
+    threading.Thread(
+        target=_coinbase_stream_loop,
+        name="coinbase-live-stream",
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=_binance_stream_loop,
+        name="binance-live-stream",
+        daemon=True
+    ).start()
+
+
+start_live_streams()
 
 
 # =========================================================
@@ -148,14 +530,21 @@ def safe_event_time(value):
 # =========================================================
 
 def number(value):
+
     try:
         return float(value)
+
     except:
         return None
 
 
-def get_json(url, params=None):
+def get_json(
+    url,
+    params=None
+):
+
     try:
+
         response = session.get(
             url,
             params=params,
@@ -185,6 +574,7 @@ def parse_time(value):
         )
 
         if dt.tzinfo is None:
+
             dt = dt.replace(
                 tzinfo=timezone.utc
             )
@@ -197,7 +587,9 @@ def parse_time(value):
 
 def seconds_left(value):
 
-    dt = parse_time(value)
+    dt = parse_time(
+        value
+    )
 
     if not dt:
         return None
@@ -206,12 +598,16 @@ def seconds_left(value):
         0,
         int(
             dt.timestamp()
-            - time.time()
+            -
+            time.time()
         )
     )
 
 
-def record_feed(name, value):
+def record_feed(
+    name,
+    value
+):
 
     item = feed_health.setdefault(
         name,
@@ -221,7 +617,10 @@ def record_feed(name, value):
     if value is not None:
 
         item["online"] = True
-        item["last_success"] = time.time()
+
+        item["last_success"] = (
+            time.time()
+        )
 
     else:
 
@@ -252,9 +651,14 @@ def load_memory():
             encoding="utf-8"
         ) as file:
 
-            data = json.load(file)
+            data = json.load(
+                file
+            )
 
-        if isinstance(data, list):
+        if isinstance(
+            data,
+            list
+        ):
 
             signal_memory = data[-500:]
 
@@ -271,7 +675,11 @@ def save_memory():
 
     try:
 
-        temp_file = MEMORY_FILE + ".tmp"
+        temp_file = (
+            MEMORY_FILE
+            +
+            ".tmp"
+        )
 
         with open(
             temp_file,
@@ -294,7 +702,7 @@ def save_memory():
 
 
 # =========================================================
-# BINANCE
+# BINANCE / LIVE PRICE
 # =========================================================
 
 def get_binance_price():
@@ -308,17 +716,28 @@ def get_binance_price():
         0.0
     )
 
+    source = (
+        live_btc.get(
+            "source"
+        )
+        or
+        "Live Stream"
+    )
+
     if (
         live_price is not None
         and
         received_at
         and
-        time.time() - received_at < 3
+        time.time()
+        -
+        received_at
+        < 3
     ):
 
         return (
             live_price,
-            "Binance Live"
+            source
         )
 
     sources = [
@@ -355,13 +774,22 @@ def get_binance_price():
             params
         )
 
-        if isinstance(data, dict):
+        if isinstance(
+            data,
+            dict
+        ):
 
             price = number(
-                data.get("price")
+                data.get(
+                    "price"
+                )
             )
 
-            if price and price > 0:
+            if (
+                price
+                and
+                price > 0
+            ):
 
                 return (
                     price,
@@ -370,7 +798,7 @@ def get_binance_price():
 
     return (
         None,
-        "Binance"
+        "REST fallback"
     )
 
 
@@ -391,10 +819,13 @@ def get_spot_feeds():
         binance_price
     )
 
-    if binance_name == "Binance Live":
+    if binance_name in (
+        "Coinbase Live",
+        "Binance Live"
+    ):
 
         record_feed(
-            "Binance Live",
+            binance_name,
             binance_price
         )
 
@@ -433,7 +864,9 @@ def get_spot_feeds():
         )
 
         kraken = number(
-            data["result"][pair]["c"][0]
+            data["result"][
+                pair
+            ]["c"][0]
         )
 
     except:
@@ -449,10 +882,15 @@ def get_spot_feeds():
         "https://www.bitstamp.net/api/v2/ticker/btcusd/"
     )
 
-    if isinstance(data, dict):
+    if isinstance(
+        data,
+        dict
+    ):
 
         bitstamp = number(
-            data.get("last")
+            data.get(
+                "last"
+            )
         )
 
     else:
@@ -468,7 +906,8 @@ def get_spot_feeds():
         value
         for value in feeds.values()
         if value is not None
-        and value > 0
+        and
+        value > 0
     ]
 
     if not values:
@@ -478,7 +917,7 @@ def get_spot_feeds():
             feeds
         )
 
-    med = statistics.median(
+    median = statistics.median(
         values
     )
 
@@ -486,12 +925,18 @@ def get_spot_feeds():
         value
         for value in values
         if abs(
-            value - med
-        ) / med <= 0.0035
+            value - median
+        )
+        /
+        median
+        <=
+        0.0035
     ]
 
     reference = statistics.median(
-        filtered or values
+        filtered
+        or
+        values
     )
 
     return (
@@ -507,25 +952,15 @@ def get_spot_feeds():
 def get_buy_sell_pressure():
 
     result = {
-
         "available": False,
-
         "buyers": 0.0,
-
         "sellers": 0.0,
-
         "buy_pct": None,
-
         "sell_pct": None,
-
         "delta": None,
-
         "winner": "WAIT",
-
         "strength": "NO DATA",
-
         "trades": 0,
-
         "source": None
     }
 
@@ -566,7 +1001,10 @@ def get_buy_sell_pressure():
             params
         )
 
-        if not isinstance(data, list):
+        if not isinstance(
+            data,
+            list
+        ):
             continue
 
         buyers = 0.0
@@ -599,17 +1037,24 @@ def get_buy_sell_pressure():
                     continue
 
                 notional = (
-                    price *
+                    price
+                    *
                     quantity
                 )
 
-                if trade.get("m") is True:
+                if trade.get(
+                    "m"
+                ) is True:
 
-                    sellers += notional
+                    sellers += (
+                        notional
+                    )
 
                 else:
 
-                    buyers += notional
+                    buyers += (
+                        notional
+                    )
 
                 count += 1
 
@@ -618,7 +1063,8 @@ def get_buy_sell_pressure():
                 continue
 
         total = (
-            buyers +
+            buyers
+            +
             sellers
         )
 
@@ -630,17 +1076,24 @@ def get_buy_sell_pressure():
             continue
 
         buy_pct = (
-            buyers /
+            buyers
+            /
             total
-        ) * 100
+            *
+            100
+        )
 
         sell_pct = (
-            sellers /
+            sellers
+            /
             total
-        ) * 100
+            *
+            100
+        )
 
         delta = (
-            buyers -
+            buyers
+            -
             sellers
         )
 
@@ -709,21 +1162,13 @@ def get_buy_sell_pressure():
 def get_order_book_pressure():
 
     result = {
-
         "available": False,
-
         "bid_qty": 0.0,
-
         "ask_qty": 0.0,
-
         "bid_pct": None,
-
         "ask_pct": None,
-
         "winner": "WAIT",
-
         "strength": "NO DATA",
-
         "source": None
     }
 
@@ -764,7 +1209,10 @@ def get_order_book_pressure():
             params
         )
 
-        if not isinstance(data, dict):
+        if not isinstance(
+            data,
+            dict
+        ):
             continue
 
         bids = data.get(
@@ -796,7 +1244,8 @@ def get_order_book_pressure():
             continue
 
         total = (
-            bid_qty +
+            bid_qty
+            +
             ask_qty
         )
 
@@ -804,14 +1253,20 @@ def get_order_book_pressure():
             continue
 
         bid_pct = (
-            bid_qty /
+            bid_qty
+            /
             total
-        ) * 100
+            *
+            100
+        )
 
         ask_pct = (
-            ask_qty /
+            ask_qty
+            /
             total
-        ) * 100
+            *
+            100
+        )
 
         if bid_pct >= 60:
 
@@ -880,6 +1335,8 @@ def prediction_strength(
     up = 0
     down = 0
 
+    reasons = []
+
     if (
         price is not None
         and
@@ -893,9 +1350,11 @@ def prediction_strength(
         if target is not None:
 
             if price > target:
+
                 up += 1
 
             elif price < target:
+
                 down += 1
 
     for value in (
@@ -968,9 +1427,11 @@ def prediction_strength(
     if yes is not None:
 
         if yes >= 0.60:
+
             up += 1
 
         elif yes <= 0.40:
+
             down += 1
 
     if signal.get(
@@ -978,12 +1439,14 @@ def prediction_strength(
     ) == "HIGH":
 
         if up > down:
+
             up = max(
                 0,
                 up - 2
             )
 
         elif down > up:
+
             down = max(
                 0,
                 down - 2
@@ -1030,7 +1493,8 @@ def prediction_strength(
                 )
 
     total = (
-        up +
+        up
+        +
         down
     )
 
@@ -1049,11 +1513,14 @@ def prediction_strength(
             score = min(
                 10,
                 round(
-                    up /
+                    up
+                    /
                     max(
                         10,
                         total
-                    ) * 10
+                    )
+                    *
+                    10
                 )
             )
 
@@ -1068,11 +1535,14 @@ def prediction_strength(
             score = min(
                 10,
                 round(
-                    down /
+                    down
+                    /
                     max(
                         10,
                         total
-                    ) * 10
+                    )
+                    *
+                    10
                 )
             )
 
@@ -1106,6 +1576,24 @@ def prediction_strength(
 
         direction = "WAIT"
 
+    if direction == "UP":
+
+        reasons.append(
+            f"{up} bullish confirmations"
+        )
+
+    elif direction == "DOWN":
+
+        reasons.append(
+            f"{down} bearish confirmations"
+        )
+
+    else:
+
+        reasons.append(
+            "Evidence is not aligned enough"
+        )
+
     return {
 
         "direction": direction,
@@ -1116,7 +1604,9 @@ def prediction_strength(
 
         "bullish_points": up,
 
-        "bearish_points": down
+        "bearish_points": down,
+
+        "reasons": reasons
     }
 
 
@@ -1131,9 +1621,11 @@ def get_history():
     if (
         history_cache["candles"]
         and
-        now -
+        now
+        -
         history_cache["time"]
-        < 15
+        <
+        15
     ):
 
         return history_cache[
@@ -1145,7 +1637,8 @@ def get_history():
     )
 
     start = (
-        end -
+        end
+        -
         timedelta(
             minutes=21
         )
@@ -1158,10 +1651,8 @@ def get_history():
             "https://api.exchange.coinbase.com/products/BTC-USD/candles",
             {
                 "granularity": 60,
-                "start":
-                    start.isoformat(),
-                "end":
-                    end.isoformat()
+                "start": start.isoformat(),
+                "end": end.isoformat()
             }
         ),
 
@@ -1235,7 +1726,9 @@ def get_history():
 
                         candles.append(
                             (
-                                float(row[0]),
+                                float(
+                                    row[0]
+                                ),
                                 close
                             )
                         )
@@ -1252,9 +1745,9 @@ def get_history():
                     if key != "last"
                 )
 
-                for row in result[
-                    pair
-                ][-21:]:
+                for row in (
+                    result[pair][-21:]
+                ):
 
                     close = number(
                         row[4]
@@ -1264,7 +1757,9 @@ def get_history():
 
                         candles.append(
                             (
-                                float(row[0]),
+                                float(
+                                    row[0]
+                                ),
                                 close
                             )
                         )
@@ -1290,7 +1785,9 @@ def get_history():
                             (
                                 float(
                                     row[0]
-                                ) / 1000,
+                                )
+                                /
+                                1000,
                                 close
                             )
                         )
@@ -1312,7 +1809,8 @@ def get_history():
             ] = candles
 
             record_feed(
-                mode +
+                mode
+                +
                 " Candles",
                 candles[-1][1]
             )
@@ -1347,7 +1845,8 @@ def momentum(
     )
 
     target_time = (
-        current_time -
+        current_time
+        -
         minutes * 60
     )
 
@@ -1360,6 +1859,7 @@ def momentum(
         if timestamp <= target_time:
 
             previous = close
+
             break
 
     if not previous:
@@ -1367,7 +1867,8 @@ def momentum(
 
     return (
         (
-            current -
+            current
+            -
             previous
         )
         /
@@ -1379,7 +1880,9 @@ def momentum(
 # STRUCTURE
 # =========================================================
 
-def price_structure(candles):
+def price_structure(
+    candles
+):
 
     if len(candles) < 8:
         return "WAIT"
@@ -1394,25 +1897,31 @@ def price_structure(candles):
     second = values[4:]
 
     if (
-        max(second) > max(first)
+        max(second)
+        >
+        max(first)
         and
-        min(second) > min(first)
+        min(second)
+        >
+        min(first)
     ):
 
         return (
-            "HIGHER HIGHS / "
-            "HIGHER LOWS"
+            "HIGHER HIGHS / HIGHER LOWS"
         )
 
     if (
-        max(second) < max(first)
+        max(second)
+        <
+        max(first)
         and
-        min(second) < min(first)
+        min(second)
+        <
+        min(first)
     ):
 
         return (
-            "LOWER HIGHS / "
-            "LOWER LOWS"
+            "LOWER HIGHS / LOWER LOWS"
         )
 
     return "MIXED"
@@ -1422,7 +1931,9 @@ def price_structure(candles):
 # KALSHI NORMALIZATION
 # =========================================================
 
-def normalize_market(market):
+def normalize_market(
+    market
+):
 
     if (
         not isinstance(
@@ -1437,7 +1948,9 @@ def normalize_market(market):
 
         return None
 
-    def probability(*keys):
+    def probability(
+        *keys
+    ):
 
         for key in keys:
 
@@ -1450,11 +1963,7 @@ def normalize_market(market):
             if value is not None:
 
                 if value > 1:
-
-                    return (
-                        value /
-                        100
-                    )
+                    return value / 100
 
                 return value
 
@@ -1479,6 +1988,7 @@ def normalize_market(market):
         if value is not None:
 
             target = value
+
             break
 
     return {
@@ -1552,24 +2062,11 @@ def get_kalshi():
 
                 if market:
 
-                    close = parse_time(
-                        market.get(
-                            "close_time"
-                        )
+                    kalshi_last_update = (
+                        time.time()
                     )
 
-                    if (
-                        close is None
-                        or
-                        close.timestamp()
-                        > time.time()
-                    ):
-
-                        kalshi_last_update = (
-                            time.time()
-                        )
-
-                        return market
+                    return market
 
     for base in KALSHI_BASES:
 
@@ -1615,7 +2112,6 @@ def get_kalshi():
             if not ticker.startswith(
                 KALSHI_SERIES
             ):
-
                 continue
 
             close = parse_time(
@@ -1632,7 +2128,8 @@ def get_kalshi():
                 close
                 and
                 close.timestamp()
-                > now
+                >
+                now
             ):
 
                 candidates.append(
@@ -1665,7 +2162,9 @@ def get_kalshi():
     return None
 
 
-def yes_mid(market):
+def yes_mid(
+    market
+):
 
     if not market:
         return None
@@ -1685,7 +2184,8 @@ def yes_mid(market):
     ):
 
         return (
-            bid +
+            bid
+            +
             ask
         ) / 2
 
@@ -1746,7 +2246,11 @@ def calculate_quality(
                 max(values)
                 -
                 min(values)
-            ) / med * 100
+            )
+            /
+            med
+            *
+            100
 
     if spread <= 0.03:
 
@@ -1818,18 +2322,14 @@ def calculate_quality(
     )
 
     grade = (
-
         "HIGH"
         if score >= 85
-
         else
         "GOOD"
         if score >= 70
-
         else
         "FAIR"
         if score >= 50
-
         else
         "LOW"
     )
@@ -1927,7 +2427,9 @@ def build_signal(
         len(candles) < 16
     ):
 
-        signal["reasons"] = [
+        signal[
+            "reasons"
+        ] = [
             "Waiting for live BTC history and Kalshi target."
         ]
 
@@ -2086,12 +2588,14 @@ def build_signal(
             )
 
     total = (
-        bullish +
+        bullish
+        +
         bearish
     )
 
     difference = abs(
-        bullish -
+        bullish
+        -
         bearish
     )
 
@@ -2250,7 +2754,8 @@ def build_signal(
     signal[
         "score"
     ] = (
-        bullish -
+        bullish
+        -
         bearish
     )
 
@@ -2258,7 +2763,7 @@ def build_signal(
 
 
 # =========================================================
-# SIGNAL MEMORY
+# SIGNAL MEMORY TRACKING
 # =========================================================
 
 def update_memory(
@@ -2279,10 +2784,8 @@ def update_memory(
     )
 
     close_ts = (
-
         close.timestamp()
         if close
-
         else
         time.time() + 900
     )
@@ -2297,7 +2800,8 @@ def update_memory(
         active_market.get(
             "ticker"
         )
-        != ticker
+        !=
+        ticker
     ):
 
         active_market = {
@@ -2320,7 +2824,8 @@ def update_memory(
                     ]
                     if signal[
                         "verdict"
-                    ] in (
+                    ]
+                    in (
                         "UP",
                         "DOWN"
                     )
@@ -2392,14 +2897,17 @@ def update_memory(
         if (
             signal[
                 "verdict"
-            ] in (
+            ]
+            in (
                 "UP",
                 "DOWN"
             )
             and
             active_market[
                 "direction"
-            ] == "WAIT"
+            ]
+            ==
+            "WAIT"
         ):
 
             active_market[
@@ -2467,6 +2975,10 @@ def update_memory(
         active_market = None
 
 
+# =========================================================
+# SIGNAL MEMORY MATCHING
+# =========================================================
+
 def memory_match(
     signal,
     distance_pct
@@ -2530,7 +3042,6 @@ def memory_match(
                 "DOWN"
             )
         ):
-
             continue
 
         if (
@@ -2542,33 +3053,16 @@ def memory_match(
                 "DOWN"
             )
         ):
-
             continue
 
         points = 0
         total = 0
 
         for key, tolerance in (
-
-            (
-                "m1",
-                0.025
-            ),
-
-            (
-                "m5",
-                0.05
-            ),
-
-            (
-                "m15",
-                0.08
-            ),
-
-            (
-                "distance",
-                0.10
-            )
+            ("m1", 0.025),
+            ("m5", 0.05),
+            ("m15", 0.08),
+            ("distance", 0.10)
         ):
 
             a = current.get(
@@ -2587,9 +3081,13 @@ def memory_match(
 
                 total += 1
 
-                if abs(
-                    a - b
-                ) <= tolerance:
+                if (
+                    abs(
+                        a - b
+                    )
+                    <=
+                    tolerance
+                ):
 
                     points += 1
 
@@ -2604,12 +3102,15 @@ def memory_match(
         ):
 
             total += 1
+
             points += 1
 
         if (
             total
             and
-            points / total >= 0.67
+            points / total
+            >=
+            0.67
         ):
 
             matches.append(
@@ -2627,7 +3128,8 @@ def memory_match(
 
     wins = sum(
         1
-        for record in matches
+        for record
+        in matches
         if record.get(
             "outcome"
         )
@@ -2638,7 +3140,8 @@ def memory_match(
     )
 
     rate = (
-        wins /
+        wins
+        /
         len(matches)
     ) * 100
 
@@ -2706,7 +3209,8 @@ def collect_state():
 
         distance_pct = (
             (
-                price -
+                price
+                -
                 target
             )
             /
@@ -2734,7 +3238,8 @@ def collect_state():
         and
         signal[
             "verdict"
-        ] in (
+        ]
+        in (
             "UP",
             "DOWN"
         )
@@ -2747,6 +3252,56 @@ def collect_state():
             )
         )
 
+        if (
+            matches >= 3
+            and
+            rate is not None
+        ):
+
+            if rate >= 70:
+
+                signal[
+                    "confidence"
+                ] = min(
+                    98,
+                    signal[
+                        "confidence"
+                    ]
+                    +
+                    5
+                )
+
+                signal[
+                    "reasons"
+                ].append(
+                    "Memory: "
+                    +
+                    str(matches)
+                    +
+                    " similar setups, "
+                    +
+                    f"{rate:.0f}% favored this direction."
+                )
+
+            elif rate <= 40:
+
+                signal[
+                    "confidence"
+                ] = max(
+                    0,
+                    signal[
+                        "confidence"
+                    ]
+                    -
+                    8
+                )
+
+                signal[
+                    "reasons"
+                ].append(
+                    "Memory warning: similar setups favored against this direction."
+                )
+
     strength = prediction_strength(
         signal,
         price,
@@ -2756,17 +3311,6 @@ def collect_state():
         quality_score,
         rate,
         matches
-    )
-
-    close_dt = (
-        parse_time(
-            market.get(
-                "close_time"
-            )
-        )
-        if market
-        else
-        None
     )
 
     return {
@@ -2797,14 +3341,6 @@ def collect_state():
                 None
             ),
 
-        "market_close_ts":
-            (
-                close_dt.timestamp()
-                if close_dt
-                else
-                None
-            ),
-
         "candles":
             len(candles),
 
@@ -2829,53 +3365,87 @@ def collect_state():
         "prediction_strength":
             strength,
 
-        "latency":
-            {
+        "latency": {
 
-                "btc_age_ms":
-                    (
-                        round(
-                            max(
-                                0.0,
-                                time.time()
-                                -
-                                live_btc.get(
-                                    "received_at",
-                                    0.0
-                                )
-                            ) * 1000,
-                            1
+            "btc_age_ms":
+                (
+                    round(
+                        max(
+                            0.0,
+                            time.time()
+                            -
+                            live_btc.get(
+                                "received_at",
+                                0.0
+                            )
                         )
-                        if live_btc.get(
-                            "received_at"
-                        )
-                        else
-                        None
-                    ),
-
-                "btc_stream":
-                    bool(
-                        live_btc.get(
-                            "connected"
-                        )
-                    ),
-
-                "kalshi_age_ms":
-                    (
-                        round(
-                            max(
-                                0.0,
-                                time.time()
-                                -
-                                kalshi_last_update
-                            ) * 1000,
-                            1
-                        )
-                        if kalshi_last_update
-                        else
-                        None
+                        *
+                        1000,
+                        1
                     )
-            },
+                    if
+                    live_btc.get(
+                        "received_at"
+                    )
+                    else
+                    None
+                ),
+
+            "btc_stream":
+                bool(
+                    live_btc.get(
+                        "connected"
+                    )
+                    and
+                    live_btc.get(
+                        "received_at"
+                    )
+                    and
+                    time.time()
+                    -
+                    live_btc.get(
+                        "received_at",
+                        0.0
+                    )
+                    <
+                    3
+                ),
+
+            "kalshi_age_ms":
+                (
+                    round(
+                        max(
+                            0.0,
+                            time.time()
+                            -
+                            kalshi_last_update
+                        )
+                        *
+                        1000,
+                        1
+                    )
+                    if
+                    kalshi_last_update
+                    else
+                    None
+                ),
+
+            "spot_source":
+                (
+                    live_btc.get(
+                        "source"
+                    )
+                    if
+                    live_btc.get(
+                        "received_at"
+                    )
+                    else
+                    None
+                ),
+
+            "state_cache_seconds":
+                CACHE_SECONDS
+        },
 
         "memory":
             {
@@ -2895,7 +3465,9 @@ def collect_state():
                     sum(
                         r.get(
                             "outcome"
-                        ) == "UP"
+                        )
+                        ==
+                        "UP"
                         for r
                         in signal_memory
                     ),
@@ -2904,25 +3476,14 @@ def collect_state():
                     sum(
                         r.get(
                             "outcome"
-                        ) == "DOWN"
+                        )
+                        ==
+                        "DOWN"
                         for r
                         in signal_memory
                     )
             }
     }
-
-
-# =========================================================
-# START BINANCE STREAM
-# =========================================================
-
-if websocket is not None:
-
-    threading.Thread(
-        target=_binance_stream_loop,
-        name="binance-live-stream",
-        daemon=True
-    ).start()
 
 
 # =========================================================
@@ -3048,6 +3609,12 @@ height:100%;
 background:#1b9b5c
 }
 
+.battleSell{
+height:100%;
+background:#d44754;
+float:right
+}
+
 @media(max-width:800px){
 
 .grid{
@@ -3079,7 +3646,7 @@ grid-column:auto
 <h1>BTC Strike AI</h1>
 
 <div class="small">
-KXBTC15M • Binance Live • Signal Memory 🧠
+KXBTC15M • Binance Protected • Signal Memory 🧠
 </div>
 
 <div id="verdict"
@@ -3102,7 +3669,6 @@ class="label">
 <div class="grid">
 
 <div class="card">
-
 <div class="small">
 BTC REFERENCE
 </div>
@@ -3116,29 +3682,23 @@ class="big">
 class="small">
 --
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 ⚡ DATA LATENCY
 </div>
 
-<div id="btcAge"
-class="big">
+<div id="btcAge" class="big">
 --
 </div>
 
-<div id="latencyDetail"
-class="small">
+<div id="latencyDetail" class="small">
 Starting live stream...
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 KALSHI TARGET
 </div>
@@ -3152,11 +3712,9 @@ class="big">
 class="small">
 --
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 BTC VS TARGET
 </div>
@@ -3170,11 +3728,9 @@ class="big">
 class="small">
 --
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 COUNTDOWN
 </div>
@@ -3187,11 +3743,9 @@ class="big">
 <div class="small">
 until market close
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 1 MIN
 </div>
@@ -3200,11 +3754,9 @@ until market close
 class="value">
 --
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 5 MIN
 </div>
@@ -3213,11 +3765,9 @@ class="value">
 class="value">
 --
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 15 MIN
 </div>
@@ -3226,11 +3776,9 @@ class="value">
 class="value">
 --
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 STRUCTURE
 </div>
@@ -3239,11 +3787,9 @@ STRUCTURE
 class="value">
 --
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 MOMENTUM
 </div>
@@ -3252,11 +3798,9 @@ MOMENTUM
 class="value">
 --
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 REVERSAL RISK
 </div>
@@ -3265,11 +3809,9 @@ REVERSAL RISK
 class="value">
 --
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 KALSHI YES
 </div>
@@ -3278,11 +3820,9 @@ KALSHI YES
 class="value">
 --
 </div>
-
 </div>
 
 <div class="card">
-
 <div class="small">
 SIGNAL SCORE
 </div>
@@ -3291,7 +3831,6 @@ SIGNAL SCORE
 class="value">
 --
 </div>
-
 </div>
 
 <div class="card wide">
@@ -3300,39 +3839,24 @@ class="value">
 ⚔️ BUYER / SELLER BATTLE
 </div>
 
-<div id="battleWinner"
-class="value">
+<div id="battleWinner" class="value">
 --
 </div>
 
 <div class="battle">
-
-<span id="buyPct">
-🟢 Buyers --
-</span>
-
-<span id="sellPct">
-🔴 Sellers --
-</span>
-
+<span id="buyPct">🟢 Buyers --</span>
+<span id="sellPct">🔴 Sellers --</span>
 </div>
 
 <div class="battleBar">
-
-<div id="buyBar"
-class="battleBuy"
-style="width:50%">
+<div id="buyBar" class="battleBuy" style="width:50%"></div>
 </div>
 
-</div>
-
-<div id="battleDelta"
-class="small">
+<div id="battleDelta" class="small">
 Delta: --
 </div>
 
-<div id="battleTrades"
-class="small">
+<div id="battleTrades" class="small">
 Trades: --
 </div>
 
@@ -3344,25 +3868,16 @@ Trades: --
 📖 ORDER-BOOK PRESSURE
 </div>
 
-<div id="bookWinner"
-class="value">
+<div id="bookWinner" class="value">
 --
 </div>
 
 <div class="battle">
-
-<span id="bidPct">
-🟢 Bids --
-</span>
-
-<span id="askPct">
-🔴 Asks --
-</span>
-
+<span id="bidPct">🟢 Bids --</span>
+<span id="askPct">🔴 Asks --</span>
 </div>
 
-<div id="bookText"
-class="small">
+<div id="bookText" class="small">
 --
 </div>
 
@@ -3374,13 +3889,11 @@ class="small">
 🧠 PREDICTION STRENGTH
 </div>
 
-<div id="prediction"
-class="big">
+<div id="prediction" class="big">
 --
 </div>
 
-<div id="predictionDetail"
-class="small">
+<div id="predictionDetail" class="small">
 --
 </div>
 
@@ -3475,7 +3988,6 @@ maximumFractionDigits:2
 
 }
 
-
 function percent(value){
 
 if(value==null)
@@ -3490,7 +4002,6 @@ Number(value).toFixed(3)
 "%";
 
 }
-
 
 function clock(seconds){
 
@@ -3509,7 +4020,6 @@ seconds%60
 
 }
 
-
 function setText(id,value){
 
 document.getElementById(
@@ -3520,90 +4030,22 @@ value;
 }
 
 
-let marketCloseMs = null;
-
-let countdownRefreshPending =
-false;
-
-
-function tickCountdown(){
-
-const el =
-document.getElementById(
-"countdown"
-);
-
-if(
-!el
-||
-marketCloseMs == null
-){
-
-return;
-
-}
-
-const remaining =
-Math.max(
-0,
-Math.ceil(
-(
-marketCloseMs -
-Date.now()
-) / 1000
-)
-);
-
-el.textContent =
-clock(
-remaining
-);
-
-if(
-remaining <= 0
-&&
-!countdownRefreshPending
-){
-
-countdownRefreshPending =
-true;
-
-refresh().finally(
-() => {
-
-countdownRefreshPending =
-false;
-
-}
-);
-
-}
-
-}
-
-
 async function refreshLive(){
 
 try{
 
 const response = await fetch(
-"/api/live?x=" +
-Date.now(),
-{
-cache:"no-store"
-}
+"/api/live?x=" + Date.now(),
+{cache:"no-store"}
 );
 
-const live =
-await response.json();
+const live = await response.json();
 
 if(live.price != null){
 
 setText(
 "btc",
-money(
-live.price
-)
+money(live.price)
 );
 
 }
@@ -3626,12 +4068,12 @@ setText(
 (
 live.connected
 ?
-"⚡ Binance live stream"
+"⚡ Live stream"
 :
 "↩ REST fallback"
 )
 +
-" • live BTC feed"
+" • direct browser feed"
 );
 
 }catch(error){}
@@ -3645,11 +4087,9 @@ try{
 
 const response =
 await fetch(
-"/api/state?x=" +
-Date.now(),
-{
-cache:"no-store"
-}
+"/api/state?x="
++
+Date.now()
 );
 
 const data =
@@ -3660,46 +4100,6 @@ data.signal || {};
 
 const market =
 data.market || {};
-
-
-if(
-data.market_close_ts != null
-){
-
-marketCloseMs =
-Number(
-data.market_close_ts
-) * 1000;
-
-}
-
-else if(
-market.close_time
-){
-
-const parsed =
-Date.parse(
-market.close_time
-);
-
-marketCloseMs =
-Number.isFinite(
-parsed
-)
-?
-parsed
-:
-null;
-
-}
-
-else{
-
-marketCloseMs =
-null;
-
-}
-
 
 const quality =
 data.data_quality || {};
@@ -3715,7 +4115,6 @@ data.order_book || {};
 
 const prediction =
 data.prediction_strength || {};
-
 
 const verdict =
 document.getElementById(
@@ -3737,60 +4136,40 @@ signal.verdict === "DOWN"
 "wait"
 );
 
-
 setText(
 "label",
-signal.label ||
-"🟡 WAIT"
+signal.label || "🟡 WAIT"
 );
-
 
 setText(
 "confidence",
-(
-signal.confidence || 0
-)
+(signal.confidence || 0)
 +
 "%"
 );
 
-
 setText(
 "agreement",
-(
-signal.bullish || 0
-)
+(signal.bullish || 0)
 +
 " BULLISH / "
 +
-(
-signal.bearish || 0
-)
+(signal.bearish || 0)
 +
 " BEARISH"
 );
 
-
-if(data.btc != null){
-
 setText(
 "btc",
-money(
-data.btc
-)
+money(data.btc)
 );
-
-}
-
 
 const feedCount =
 Object.values(
 data.feeds || {}
 ).filter(
-x =>
-x != null
+x => x != null
 ).length;
-
 
 setText(
 "feeds",
@@ -3798,10 +4177,8 @@ feedCount +
 " live feeds"
 );
 
-
 const latency =
 data.latency || {};
-
 
 setText(
 "btcAge",
@@ -3816,13 +4193,20 @@ latency.btc_age_ms
 " ms"
 );
 
-
 setText(
 "latencyDetail",
 (
 latency.btc_stream
 ?
-"⚡ Binance live stream"
+(
+"⚡ "
++
+(
+latency.spot_source
+||
+"Live stream"
+)
+)
 :
 "↩ REST fallback"
 )
@@ -3842,7 +4226,6 @@ latency.kalshi_age_ms
 )
 );
 
-
 setText(
 "target",
 money(
@@ -3850,13 +4233,10 @@ market.target
 )
 );
 
-
 setText(
 "ticker",
-market.ticker ||
-"--"
+market.ticker || "--"
 );
-
 
 if(
 data.btc != null
@@ -3865,9 +4245,9 @@ market.target != null
 ){
 
 const difference =
-data.btc -
+data.btc
+-
 market.target;
-
 
 setText(
 "distance",
@@ -3886,21 +4266,25 @@ difference
 )
 );
 
-
 setText(
 "distancePct",
 percent(
-difference /
-market.target *
+difference
+/
+market.target
+*
 100
 )
 );
 
 }
 
-
-tickCountdown();
-
+setText(
+"countdown",
+clock(
+data.countdown
+)
+);
 
 setText(
 "m1",
@@ -3909,14 +4293,12 @@ signal.m1
 )
 );
 
-
 setText(
 "m5",
 percent(
 signal.m5
 )
 );
-
 
 setText(
 "m15",
@@ -3925,27 +4307,20 @@ signal.m15
 )
 );
 
-
 setText(
 "structure",
-signal.structure ||
-"--"
+signal.structure || "--"
 );
-
 
 setText(
 "acceleration",
-signal.acceleration ||
-"--"
+signal.acceleration || "--"
 );
-
 
 setText(
 "reversal",
-signal.reversal ||
-"--"
+signal.reversal || "--"
 );
-
 
 if(
 market.yes_bid != null
@@ -3957,10 +4332,13 @@ setText(
 "yes",
 (
 (
-market.yes_bid +
+market.yes_bid
++
 market.yes_ask
-) /
-2 *
+)
+/
+2
+*
 100
 ).toFixed(1)
 +
@@ -3976,7 +4354,6 @@ setText(
 
 }
 
-
 setText(
 "score",
 signal.score == null
@@ -3986,13 +4363,10 @@ signal.score == null
 signal.score
 );
 
-
 setText(
 "battleWinner",
-buySell.strength ||
-"--"
+buySell.strength || "--"
 );
-
 
 if(
 buySell.buy_pct != null
@@ -4011,7 +4385,6 @@ buySell.buy_pct
 "%"
 );
 
-
 setText(
 "sellPct",
 "🔴 Sellers "
@@ -4023,15 +4396,14 @@ buySell.sell_pct
 "%"
 );
 
-
 document.getElementById(
 "buyBar"
 ).style.width =
 Number(
 buySell.buy_pct
-) +
+)
++
 "%";
-
 
 setText(
 "battleDelta",
@@ -4055,7 +4427,6 @@ maximumFractionDigits:0
 )
 );
 
-
 setText(
 "battleTrades",
 "Trades: "
@@ -4065,15 +4436,24 @@ buySell.trades || 0
 ).toLocaleString()
 );
 
-}
+}else{
 
+setText(
+"battleDelta",
+"Delta: --"
+);
+
+setText(
+"battleTrades",
+"Trades: --"
+);
+
+}
 
 setText(
 "bookWinner",
-orderBook.strength ||
-"--"
+orderBook.strength || "--"
 );
-
 
 if(
 orderBook.bid_pct != null
@@ -4092,7 +4472,6 @@ orderBook.bid_pct
 "%"
 );
 
-
 setText(
 "askPct",
 "🔴 Asks "
@@ -4104,78 +4483,67 @@ orderBook.ask_pct
 "%"
 );
 
-
 setText(
 "bookText",
 "Order-book pressure: "
 +
 (
-orderBook.winner ||
+orderBook.winner
+||
 "BALANCED"
 )
 );
 
 }
 
-
 setText(
 "prediction",
-prediction.label ||
-"--"
+prediction.label || "--"
 );
-
 
 setText(
 "predictionDetail",
 (
-prediction.bullish_points ||
-0
+prediction.bullish_points || 0
 )
 +
 " bullish confirmations • "
 +
 (
-prediction.bearish_points ||
-0
+prediction.bearish_points || 0
 )
 +
 " bearish confirmations"
 );
 
-
 setText(
 "quality",
 (
-quality.score ||
-0
+quality.score || 0
 )
 +
 "/100 "
 +
 (
-quality.grade ||
-"--"
+quality.grade || "--"
 )
 );
 
-
 setText(
 "qualityText",
-data.candles +
+data.candles
++
 " history candles"
 );
-
 
 setText(
 "memory",
 (
-memory.records ||
-0
+memory.records || 0
 )
 +
 " resolved setups stored"
 );
-
 
 if(
 memory.matches
@@ -4203,26 +4571,18 @@ setText(
 
 }
 
-
 setText(
 "memoryStats",
 "Stored outcomes: "
 +
-(
-memory.up ||
-0
-)
+(memory.up || 0)
 +
 " UP • "
 +
-(
-memory.down ||
-0
-)
+(memory.down || 0)
 +
 " DOWN"
 );
-
 
 setText(
 "reasons",
@@ -4230,11 +4590,11 @@ setText(
 signal.reasons || []
 ).map(
 reason =>
-"• " +
+"• "
++
 reason
 ).join("\n")
 );
-
 
 setText(
 "health",
@@ -4242,8 +4602,10 @@ Object.entries(
 data.feeds || {}
 ).map(
 ([name,value]) =>
-name +
-": " +
+name
++
+": "
++
 (
 value != null
 ?
@@ -4251,11 +4613,8 @@ value != null
 :
 "OFFLINE"
 )
-).join(
-" • "
-)
+).join(" • ")
 );
-
 
 }catch(error){
 
@@ -4268,25 +4627,14 @@ setText(
 
 }
 
-
 refresh();
 
 refreshLive();
-
-tickCountdown();
-
-
-setInterval(
-tickCountdown,
-250
-);
-
 
 setInterval(
 refresh,
 1000
 );
-
 
 setInterval(
 refreshLive,
@@ -4339,7 +4687,9 @@ def api_live():
                         time.time()
                         -
                         received
-                    ) * 1000,
+                    )
+                    *
+                    1000,
                     1
                 )
                 if received
@@ -4366,44 +4716,11 @@ def api_state():
 
     now = time.time()
 
-    cached_market = (
-        cache.get(
-            "state",
-            {}
-        ).get(
-            "market"
-        )
-        if isinstance(
-            cache.get("state"),
-            dict
-        )
-        else None
-    )
-
-    cached_close = parse_time(
-        cached_market.get(
-            "close_time"
-        )
-        if isinstance(
-            cached_market,
-            dict
-        )
-        else None
-    )
-
-    cached_market_expired = (
-        cached_close is not None
-        and
-        cached_close.timestamp()
-        <= now
-    )
-
     if (
         cache["state"] is not None
         and
-        not cached_market_expired
-        and
-        now -
+        now
+        -
         cache["time"]
         <
         CACHE_SECONDS
@@ -4431,9 +4748,7 @@ def api_state():
 if __name__ == "__main__":
 
     app.run(
-
         host="0.0.0.0",
-
         port=int(
             os.getenv(
                 "PORT",
