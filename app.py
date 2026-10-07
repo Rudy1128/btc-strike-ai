@@ -299,8 +299,6 @@ def save_memory():
 
 def get_binance_price():
 
-    # Prefer live WebSocket price.
-
     live_price = live_btc.get(
         "price"
     )
@@ -322,8 +320,6 @@ def get_binance_price():
             live_price,
             "Binance Live"
         )
-
-    # REST fallback.
 
     sources = [
 
@@ -402,8 +398,6 @@ def get_spot_feeds():
             binance_price
         )
 
-    # Coinbase
-
     data = get_json(
         "https://api.coinbase.com/v2/prices/BTC-USD/spot"
     )
@@ -422,8 +416,6 @@ def get_spot_feeds():
         "Coinbase",
         coinbase
     )
-
-    # Kraken
 
     data = get_json(
         "https://api.kraken.com/0/public/Ticker",
@@ -452,8 +444,6 @@ def get_spot_feeds():
         "Kraken",
         kraken
     )
-
-    # Bitstamp
 
     data = get_json(
         "https://www.bitstamp.net/api/v2/ticker/btcusd/"
@@ -612,9 +602,6 @@ def get_buy_sell_pressure():
                     price *
                     quantity
                 )
-
-                # m=True = buyer was maker.
-                # Therefore seller was aggressive.
 
                 if trade.get("m") is True:
 
@@ -890,15 +877,8 @@ def prediction_strength(
     memory_matches=0
 ):
 
-    """
-    Alignment score, not probability.
-    Maximum 10 points.
-    """
-
     up = 0
     down = 0
-
-    reasons = []
 
     if (
         price is not None
@@ -1126,24 +1106,6 @@ def prediction_strength(
 
         direction = "WAIT"
 
-    if direction == "UP":
-
-        reasons.append(
-            f"{up} bullish confirmations"
-        )
-
-    elif direction == "DOWN":
-
-        reasons.append(
-            f"{down} bearish confirmations"
-        )
-
-    else:
-
-        reasons.append(
-            "Evidence is not aligned enough"
-        )
-
     return {
 
         "direction": direction,
@@ -1154,9 +1116,7 @@ def prediction_strength(
 
         "bullish_points": up,
 
-        "bearish_points": down,
-
-        "reasons": reasons
+        "bearish_points": down
     }
 
 
@@ -1570,9 +1530,6 @@ def get_kalshi():
 
     global kalshi_last_update
 
-    # If a ticker is manually supplied, use it only while
-    # it is still active.
-
     if KALSHI_TICKER:
 
         for base in KALSHI_BASES:
@@ -1613,11 +1570,6 @@ def get_kalshi():
                         )
 
                         return market
-
-                    # Expired ticker:
-                    # fall through and discover next market.
-
-    # Discover the next active KXBTC15M market.
 
     for base in KALSHI_BASES:
 
@@ -2239,8 +2191,6 @@ def build_signal(
             "Signals are not aligned strongly enough."
         )
 
-    # Reversal protection.
-
     if (
         signal[
             "reversal"
@@ -2262,8 +2212,6 @@ def build_signal(
         signal[
             "confidence"
         ] = 0
-
-    # Final-minute protection.
 
     countdown = seconds_left(
         market.get(
@@ -2310,7 +2258,7 @@ def build_signal(
 
 
 # =========================================================
-# SIGNAL MEMORY TRACKING
+# SIGNAL MEMORY
 # =========================================================
 
 def update_memory(
@@ -2460,8 +2408,6 @@ def update_memory(
                 "verdict"
             ]
 
-    # Resolve market.
-
     if (
         time.time()
         >=
@@ -2520,10 +2466,6 @@ def update_memory(
 
         active_market = None
 
-
-# =========================================================
-# SIGNAL MEMORY MATCHING
-# =========================================================
 
 def memory_match(
     signal,
@@ -2805,52 +2747,6 @@ def collect_state():
             )
         )
 
-        if (
-            matches >= 3
-            and
-            rate is not None
-        ):
-
-            if rate >= 70:
-
-                signal[
-                    "confidence"
-                ] = min(
-                    98,
-                    signal[
-                        "confidence"
-                    ] + 5
-                )
-
-                signal[
-                    "reasons"
-                ].append(
-                    "Memory: "
-                    +
-                    str(matches)
-                    +
-                    " similar setups, "
-                    +
-                    f"{rate:.0f}% favored this direction."
-                )
-
-            elif rate <= 40:
-
-                signal[
-                    "confidence"
-                ] = max(
-                    0,
-                    signal[
-                        "confidence"
-                    ] - 8
-                )
-
-                signal[
-                    "reasons"
-                ].append(
-                    "Memory warning: similar setups favored against this direction."
-                )
-
     strength = prediction_strength(
         signal,
         price,
@@ -2978,10 +2874,7 @@ def collect_state():
                         if kalshi_last_update
                         else
                         None
-                    ),
-
-                "state_cache_seconds":
-                    CACHE_SECONDS
+                    )
             },
 
         "memory":
@@ -3017,6 +2910,19 @@ def collect_state():
                     )
             }
     }
+
+
+# =========================================================
+# START BINANCE STREAM
+# =========================================================
+
+if websocket is not None:
+
+    threading.Thread(
+        target=_binance_stream_loop,
+        name="binance-live-stream",
+        daemon=True
+    ).start()
 
 
 # =========================================================
@@ -3142,12 +3048,6 @@ height:100%;
 background:#1b9b5c
 }
 
-.battleSell{
-height:100%;
-background:#d44754;
-float:right
-}
-
 @media(max-width:800px){
 
 .grid{
@@ -3179,7 +3079,7 @@ grid-column:auto
 <h1>BTC Strike AI</h1>
 
 <div class="small">
-KXBTC15M • Binance Protected • Signal Memory 🧠
+KXBTC15M • Binance Live • Signal Memory 🧠
 </div>
 
 <div id="verdict"
@@ -3575,6 +3475,7 @@ maximumFractionDigits:2
 
 }
 
+
 function percent(value){
 
 if(value==null)
@@ -3589,6 +3490,7 @@ Number(value).toFixed(3)
 "%";
 
 }
+
 
 function clock(seconds){
 
@@ -3607,69 +3509,13 @@ seconds%60
 
 }
 
+
 function setText(id,value){
 
 document.getElementById(
 id
 ).textContent =
 value;
-
-}
-
-
-async function refreshLive(){
-
-try{
-
-const response = await fetch(
-"/api/live?x=" +
-Date.now(),
-{
-cache:"no-store"
-}
-);
-
-const live =
-await response.json();
-
-if(live.price != null){
-
-setText(
-"btc",
-money(
-live.price
-)
-);
-
-}
-
-if(live.age_ms != null){
-
-setText(
-"btcAge",
-Number(
-live.age_ms
-).toFixed(0)
-+
-" ms"
-);
-
-}
-
-setText(
-"latencyDetail",
-(
-live.connected
-?
-"⚡ Binance live stream"
-:
-"↩ REST fallback"
-)
-+
-" • direct browser feed"
-);
-
-}catch(error){}
 
 }
 
@@ -3736,6 +3582,63 @@ false;
 }
 
 
+async function refreshLive(){
+
+try{
+
+const response = await fetch(
+"/api/live?x=" +
+Date.now(),
+{
+cache:"no-store"
+}
+);
+
+const live =
+await response.json();
+
+if(live.price != null){
+
+setText(
+"btc",
+money(
+live.price
+)
+);
+
+}
+
+if(live.age_ms != null){
+
+setText(
+"btcAge",
+Number(
+live.age_ms
+).toFixed(0)
++
+" ms"
+);
+
+}
+
+setText(
+"latencyDetail",
+(
+live.connected
+?
+"⚡ Binance live stream"
+:
+"↩ REST fallback"
+)
++
+" • live BTC feed"
+);
+
+}catch(error){}
+
+}
+
+
 async function refresh(){
 
 try{
@@ -3743,7 +3646,10 @@ try{
 const response =
 await fetch(
 "/api/state?x=" +
-Date.now()
+Date.now(),
+{
+cache:"no-store"
+}
 );
 
 const data =
@@ -3865,12 +3771,16 @@ signal.bearish || 0
 );
 
 
+if(data.btc != null){
+
 setText(
 "btc",
 money(
 data.btc
 )
 );
+
+}
 
 
 const feedCount =
@@ -4155,18 +4065,6 @@ buySell.trades || 0
 ).toLocaleString()
 );
 
-}else{
-
-setText(
-"battleDelta",
-"Delta: --"
-);
-
-setText(
-"battleTrades",
-"Trades: --"
-);
-
 }
 
 
@@ -4418,11 +4316,10 @@ def index():
 @app.get("/api/live")
 def api_live():
 
-    received =
-        live_btc.get(
-            "received_at",
-            0.0
-        )
+    received = live_btc.get(
+        "received_at",
+        0.0
+    )
 
     return jsonify({
 
@@ -4470,40 +4367,31 @@ def api_state():
     now = time.time()
 
     cached_market = (
-
         cache.get(
             "state",
             {}
         ).get(
             "market"
         )
-
         if isinstance(
             cache.get("state"),
             dict
         )
-
-        else
-        None
+        else None
     )
 
     cached_close = parse_time(
-
         cached_market.get(
             "close_time"
         )
-
         if isinstance(
             cached_market,
             dict
         )
-
-        else
-        None
+        else None
     )
 
     cached_market_expired = (
-
         cached_close is not None
         and
         cached_close.timestamp()
