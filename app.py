@@ -1,29 +1,14 @@
+# BTC STRIKE AI — SIMPLE POWERFUL BUILD
+# Live BTC + momentum + Kalshi strike confirmation
+
 import os
 import time
-import math
 import threading
 from collections import deque
 from datetime import datetime, timezone
 
 import requests
 from flask import Flask, jsonify, render_template_string
-
-# ============================================================
-# BTC STRIKE AI — STABLE BUILD
-# ============================================================
-# BRTI-STYLE multi-source reference + Kalshi 15-minute analysis.
-#
-# This is NOT the official CF Benchmarks BRTI calculation.
-# It uses multiple public BTC/USD feeds, filters obvious
-# outliers, and combines the reference price with technical
-# signals. The system is deliberately conservative:
-# conflicting signals -> UNDECIDED.
-#
-# Environment variables:
-#   PORT
-#   KALSHI_BASE_URL
-#   KALSHI_TICKER (recommended if you know the exact market)
-# ============================================================
 
 app = Flask(__name__)
 
@@ -36,109 +21,38 @@ KALSHI_BASE = os.getenv(
 
 KALSHI_TICKER = os.getenv("KALSHI_TICKER", "").strip()
 
-TIMEOUT = 4
+TIMEOUT = 5
 UPDATE_SECONDS = 2
 
-EXCHANGE_URLS = {
-    "Binance":
-        "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT",
-
-    "Coinbase":
-        "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
-
-    "Kraken":
-        "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
-
-    "Bitstamp":
-        "https://www.bitstamp.net/api/v2/ticker/btcusd/",
-}
-
-history = deque(maxlen=1800)
-
+history = deque(maxlen=1200)
 lock = threading.Lock()
 
 STATE = {
-    "reference_price": None,
-    "binance_price": None,
-    "sources": {},
-    "source_count": 0,
-
+    "btc": None,
+    "coinbase": None,
     "kalshi": {},
-
-    "signals": {},
-
-    "score": 0,
-
-    "verdict": "UNDECIDED",
-
-    "confidence": 0,
-
-    "delta": 0.0,
-
-    "cvd": 0.0,
-
+    "m1": None,
+    "m5": None,
+    "m15": None,
+    "trend": "WAIT",
+    "score": 50,
+    "reason": "Waiting for live data...",
+    "status": "STARTING",
     "last_update": None,
-
     "error": None,
 }
 
 
 # ============================================================
-# HELPERS
+# BASIC HELPERS
 # ============================================================
 
-def num(value):
-
-    try:
-
-        x = float(value)
-
-        if math.isfinite(x):
-            return x
-
-        return None
-
-    except (TypeError, ValueError):
-
-        return None
-
-
-def now():
-
-    return time.time()
-
-
-def iso_now():
-
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
-
-
-def pct_change(old, new):
-
-    if (
-        old is None
-        or new is None
-        or old == 0
-    ):
-
-        return 0.0
-
-    return (
-        (new - old)
-        / old
-    ) * 100.0
-
-
 def get_json(url):
-
     response = requests.get(
         url,
         timeout=TIMEOUT,
         headers={
-            "User-Agent":
-                "BTC-Strike-AI/1.0"
+            "User-Agent": "BTC-Strike-Simple/1.0"
         },
     )
 
@@ -147,231 +61,57 @@ def get_json(url):
     return response.json()
 
 
+def number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # ============================================================
-# EXCHANGE FEEDS
+# BTC PRICE
 # ============================================================
 
-def binance():
+def btc_price():
 
     data = get_json(
-        EXCHANGE_URLS["Binance"]
+        "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT"
     )
 
-    bid = num(
+    bid = number(
         data.get("bidPrice")
     )
 
-    ask = num(
+    ask = number(
         data.get("askPrice")
     )
 
     if bid is None or ask is None:
-        return None
-
-    return {
-        "price": (bid + ask) / 2,
-        "bid": bid,
-        "ask": ask,
-    }
-
-
-def coinbase():
-
-    data = get_json(
-        EXCHANGE_URLS["Coinbase"]
-    )
-
-    bid = num(
-        data.get("bid")
-    )
-
-    ask = num(
-        data.get("ask")
-    )
-
-    if bid is None or ask is None:
-        return None
-
-    return {
-        "price": (bid + ask) / 2,
-        "bid": bid,
-        "ask": ask,
-    }
-
-
-def kraken():
-
-    data = get_json(
-        EXCHANGE_URLS["Kraken"]
-    )
-
-    result = data.get(
-        "result",
-        {}
-    )
-
-    if not result:
-        return None
-
-    pair = next(
-        iter(result.values())
-    )
-
-    bid = num(
-        pair.get(
-            "b",
-            [None]
-        )[0]
-    )
-
-    ask = num(
-        pair.get(
-            "a",
-            [None]
-        )[0]
-    )
-
-    if bid is None or ask is None:
-        return None
-
-    return {
-        "price": (bid + ask) / 2,
-        "bid": bid,
-        "ask": ask,
-    }
-
-
-def bitstamp():
-
-    data = get_json(
-        EXCHANGE_URLS["Bitstamp"]
-    )
-
-    bid = num(
-        data.get("bid")
-    )
-
-    ask = num(
-        data.get("ask")
-    )
-
-    if bid is None or ask is None:
-        return None
-
-    return {
-        "price": (bid + ask) / 2,
-        "bid": bid,
-        "ask": ask,
-    }
-
-
-FEEDS = {
-    "Binance": binance,
-    "Coinbase": coinbase,
-    "Kraken": kraken,
-    "Bitstamp": bitstamp,
-}
-
-
-def get_feeds():
-
-    data = {}
-
-    errors = []
-
-    for name, function in FEEDS.items():
-
-        try:
-
-            item = function()
-
-            if (
-                item
-                and item.get("price")
-                is not None
-            ):
-
-                data[name] = item
-
-        except Exception as exc:
-
-            errors.append(
-                f"{name}: {exc}"
-            )
-
-    return data, errors
-
-
-# ============================================================
-# BRTI-STYLE REFERENCE PRICE
-# ============================================================
-
-def reference_price(feeds):
-
-    """
-    Transparent BRTI-style approximation:
-
-    1. Collect exchange midpoint prices.
-    2. Calculate the median.
-    3. Remove obvious outliers.
-    4. Average the remaining sources.
-
-    This is NOT the official CF Benchmarks BRTI formula.
-    """
-
-    prices = [
-        item["price"]
-        for item in feeds.values()
-    ]
-
-    if not prices:
-        return None, {}
-
-    ordered = sorted(prices)
-
-    middle = len(ordered) // 2
-
-    if len(ordered) % 2:
-
-        median = ordered[middle]
-
-    else:
-
-        median = (
-            ordered[middle - 1]
-            + ordered[middle]
-        ) / 2
-
-    valid = {}
-
-    for name, item in feeds.items():
-
-        if (
-            median
-            and
-            abs(
-                item["price"]
-                - median
-            )
-            / median
-            <= 0.0035
-        ):
-
-            valid[name] = item
-
-    if not valid:
-
-        valid = feeds
-
-    price = (
-        sum(
-            item["price"]
-            for item in valid.values()
+        raise RuntimeError(
+            "Binance returned no BTC price."
         )
-        / len(valid)
+
+    return (bid + ask) / 2
+
+
+def coinbase_price():
+
+    data = get_json(
+        "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
     )
 
-    return price, valid
+    bid = number(
+        data.get("bid")
+    )
+
+    ask = number(
+        data.get("ask")
+    )
+
+    if bid is None or ask is None:
+        return None
+
+    return (bid + ask) / 2
 
 
 # ============================================================
@@ -384,7 +124,6 @@ def normalize_market(market):
         market,
         dict
     ):
-
         return {}
 
     strike = None
@@ -397,13 +136,13 @@ def normalize_market(market):
         "cap_strike",
     ):
 
-        candidate = num(
+        value = number(
             market.get(key)
         )
 
-        if candidate is not None:
+        if value is not None:
 
-            strike = candidate
+            strike = value
 
             break
 
@@ -419,50 +158,31 @@ def normalize_market(market):
             strike,
 
         "yes_bid":
-            num(
-                market.get(
-                    "yes_bid"
-                )
+            number(
+                market.get("yes_bid")
             ),
 
         "yes_ask":
-            num(
-                market.get(
-                    "yes_ask"
-                )
-            ),
-
-        "no_bid":
-            num(
-                market.get(
-                    "no_bid"
-                )
-            ),
-
-        "no_ask":
-            num(
-                market.get(
-                    "no_ask"
-                )
+            number(
+                market.get("yes_ask")
             ),
 
         "last_price":
-            num(
-                market.get(
-                    "last_price"
-                )
+            number(
+                market.get("last_price")
             ),
 
         "close_time":
-            market.get(
-                "close_time"
-            ),
+            market.get("close_time"),
     }
 
 
 def get_kalshi():
 
     try:
+
+        # If you know the exact Kalshi ticker,
+        # put it in the KALSHI_TICKER environment variable.
 
         if KALSHI_TICKER:
 
@@ -471,12 +191,16 @@ def get_kalshi():
                 f"{KALSHI_TICKER}"
             )
 
-            return normalize_market(
-                data.get(
-                    "market",
-                    data
-                )
+            market = data.get(
+                "market",
+                data
             )
+
+            return normalize_market(
+                market
+            )
+
+        # Otherwise search open markets.
 
         data = get_json(
             f"{KALSHI_BASE}/markets"
@@ -499,6 +223,7 @@ def get_kalshi():
                         ""
                     )
                 )
+
                 for key in (
                     "ticker",
                     "title",
@@ -508,8 +233,9 @@ def get_kalshi():
             ).lower()
 
             if (
+                "btc" in text
+                or
                 "bitcoin" in text
-                or "btc" in text
             ):
 
                 candidates.append(
@@ -518,7 +244,13 @@ def get_kalshi():
 
         if not candidates:
 
-            return {}
+            return {
+                "error":
+                    "No open BTC market found."
+            }
+
+        # Prefer something that looks like a
+        # 15-minute market.
 
         candidates.sort(
             key=lambda market: (
@@ -529,7 +261,9 @@ def get_kalshi():
                         ""
                     )
                 ).lower()
+
                 and
+
                 "15"
                 not in str(
                     market.get(
@@ -552,98 +286,55 @@ def get_kalshi():
 
 
 # ============================================================
-# TECHNICAL ENGINE
+# MOMENTUM
 # ============================================================
 
-def window_points(seconds):
+def pct(old, new):
 
-    cutoff = now() - seconds
+    if (
+        old is None
+        or new is None
+        or old == 0
+    ):
+        return 0.0
 
-    return [
+    return (
+        (new - old)
+        / old
+    ) * 100.0
+
+
+def momentum(seconds):
+
+    cutoff = (
+        time.time()
+        - seconds
+    )
+
+    points = [
         (timestamp, price)
         for timestamp, price
         in history
         if timestamp >= cutoff
     ]
 
-
-def momentum(seconds):
-
-    points = window_points(
-        seconds
-    )
-
     if len(points) < 2:
-
         return 0.0
 
-    return pct_change(
+    return pct(
         points[0][1],
         points[-1][1]
     )
-
-
-def price_structure():
-
-    if len(history) < 12:
-
-        return "NOT ENOUGH DATA"
-
-    values = [
-        price
-        for _, price
-        in list(history)[-40:]
-    ]
-
-    split = len(values) // 2
-
-    first = values[:split]
-
-    second = values[split:]
-
-    if (
-        max(second) > max(first)
-        and
-        min(second) > min(first)
-    ):
-
-        return (
-            "HIGHER HIGHS / "
-            "HIGHER LOWS"
-        )
-
-    if (
-        max(second) < max(first)
-        and
-        min(second) < min(first)
-    ):
-
-        return (
-            "LOWER HIGHS / "
-            "LOWER LOWS"
-        )
-
-    return "MIXED / CHOP"
 
 
 # ============================================================
 # DECISION ENGINE
 # ============================================================
 
-def calculate_signal(
+def make_decision(
     price,
     market
 ):
-
-    if price is None:
-
-        return {
-            "signals": {},
-            "score": 0,
-            "verdict":
-                "UNDECIDED",
-            "confidence": 0,
-        }
 
     m1 = momentum(60)
 
@@ -651,334 +342,173 @@ def calculate_signal(
 
     m15 = momentum(900)
 
-    structure = price_structure()
-
-    score = 0
-
-    reasons = []
-
     strike = (
         market.get("strike")
         if market
         else None
     )
 
-    distance_pct = None
+    score = 50
+
+    reasons = []
 
     # --------------------------------------------------------
-    # STRIKE LOCATION
+    # 1-MINUTE
     # --------------------------------------------------------
 
-    if (
-        strike is not None
-        and strike != 0
-    ):
+    if m1 > 0.03:
 
-        distance_pct = pct_change(
+        score += 15
+
+        reasons.append(
+            "1m momentum UP"
+        )
+
+    elif m1 < -0.03:
+
+        score -= 15
+
+        reasons.append(
+            "1m momentum DOWN"
+        )
+
+    # --------------------------------------------------------
+    # 5-MINUTE
+    # --------------------------------------------------------
+
+    if m5 > 0.05:
+
+        score += 15
+
+        reasons.append(
+            "5m trend UP"
+        )
+
+    elif m5 < -0.05:
+
+        score -= 15
+
+        reasons.append(
+            "5m trend DOWN"
+        )
+
+    # --------------------------------------------------------
+    # 15-MINUTE
+    # --------------------------------------------------------
+
+    if m15 > 0.08:
+
+        score += 15
+
+        reasons.append(
+            "15m trend UP"
+        )
+
+    elif m15 < -0.08:
+
+        score -= 15
+
+        reasons.append(
+            "15m trend DOWN"
+        )
+
+    # --------------------------------------------------------
+    # KALSHI STRIKE
+    # --------------------------------------------------------
+
+    if strike is not None:
+
+        distance = pct(
             strike,
             price
         )
 
-        if price > strike:
+        if distance > 0:
 
-            score += 2
+            score += 10
 
             reasons.append(
-                "price above strike"
+                "BTC above strike"
             )
 
-        elif price < strike:
+        elif distance < 0:
 
-            score -= 2
-
-            reasons.append(
-                "price below strike"
-            )
-
-    # --------------------------------------------------------
-    # MOMENTUM
-    # --------------------------------------------------------
-
-    for (
-        value,
-        weight,
-        label
-    ) in (
-        (m1, 1, "1m"),
-        (m5, 2, "5m"),
-        (m15, 3, "15m"),
-    ):
-
-        if value > 0.025:
-
-            score += weight
+            score -= 10
 
             reasons.append(
-                f"{label} positive"
-            )
-
-        elif value < -0.025:
-
-            score -= weight
-
-            reasons.append(
-                f"{label} negative"
+                "BTC below strike"
             )
 
     # --------------------------------------------------------
-    # PRICE STRUCTURE
+    # AGREEMENT
+    # --------------------------------------------------------
+
+    bullish = sum(
+        x > 0.03
+        for x in (
+            m1,
+            m5,
+            m15
+        )
+    )
+
+    bearish = sum(
+        x < -0.03
+        for x in (
+            m1,
+            m5,
+            m15
+        )
+    )
+
+    score = max(
+        0,
+        min(
+            100,
+            int(score)
+        )
+    )
+
+    # --------------------------------------------------------
+    # FINAL DECISION
     # --------------------------------------------------------
 
     if (
-        structure
-        ==
-        "HIGHER HIGHS / HIGHER LOWS"
-    ):
-
-        score += 2
-
-        reasons.append(
-            "bullish structure"
-        )
-
-    elif (
-        structure
-        ==
-        "LOWER HIGHS / LOWER LOWS"
-    ):
-
-        score -= 2
-
-        reasons.append(
-            "bearish structure"
-        )
-
-    # --------------------------------------------------------
-    # DELTA / CVD
-    # --------------------------------------------------------
-
-    delta = STATE["delta"]
-
-    cvd = STATE["cvd"]
-
-    if delta > 0:
-
-        score += 1
-
-        reasons.append(
-            "positive delta"
-        )
-
-    elif delta < 0:
-
-        score -= 1
-
-        reasons.append(
-            "negative delta"
-        )
-
-    if cvd > 0:
-
-        score += 1
-
-        reasons.append(
-            "CVD rising"
-        )
-
-    elif cvd < 0:
-
-        score -= 1
-
-        reasons.append(
-            "CVD falling"
-        )
-
-    # --------------------------------------------------------
-    # SIGNAL AGREEMENT
-    # --------------------------------------------------------
-
-    bullish = (
-
-        sum(
-            x > 0.025
-            for x in (
-                m1,
-                m5,
-                m15
-            )
-        )
-
-        +
-
-        int(
-            structure
-            ==
-            "HIGHER HIGHS / HIGHER LOWS"
-        )
-
-        +
-
-        int(
-            delta > 0
-        )
-
-        +
-
-        int(
-            cvd > 0
-        )
-    )
-
-    bearish = (
-
-        sum(
-            x < -0.025
-            for x in (
-                m1,
-                m5,
-                m15
-            )
-        )
-
-        +
-
-        int(
-            structure
-            ==
-            "LOWER HIGHS / LOWER LOWS"
-        )
-
-        +
-
-        int(
-            delta < 0
-        )
-
-        +
-
-        int(
-            cvd < 0
-        )
-    )
-
-    # --------------------------------------------------------
-    # DYNAMIC CONFIDENCE
-    # --------------------------------------------------------
-
-    confidence = (
-        50
-        +
-        min(
-            abs(score) * 4,
-            40
-        )
-    )
-
-    if bullish and bearish:
-
-        confidence -= min(
-            18,
-            min(
-                bullish,
-                bearish
-            ) * 6
-        )
-
-    confidence = max(
-        50,
-        min(
-            90,
-            int(confidence)
-        )
-    )
-
-    # --------------------------------------------------------
-    # CONSERVATIVE VERDICT
-    # --------------------------------------------------------
-
-    if (
-        score >= 7
+        score >= 70
         and
-        bullish >= 4
-        and
-        bearish <= 2
-    ):
-
-        verdict = "STRONG UP"
-
-    elif (
-        score >= 3
-        and
-        bullish >= 3
-        and
-        bullish > bearish
+        bullish >= 2
     ):
 
         verdict = "UP"
 
     elif (
-        score <= -7
+        score <= 30
         and
-        bearish >= 4
-        and
-        bullish <= 2
-    ):
-
-        verdict = "STRONG DOWN"
-
-    elif (
-        score <= -3
-        and
-        bearish >= 3
-        and
-        bearish > bullish
+        bearish >= 2
     ):
 
         verdict = "DOWN"
 
     else:
 
-        verdict = "UNDECIDED"
+        verdict = "WAIT"
 
-        confidence = min(
-            confidence,
-            59
+    if not reasons:
+
+        reasons.append(
+            "Waiting for enough movement."
         )
 
     return {
 
-        "signals": {
+        "m1":
+            m1,
 
-            "m1":
-                m1,
+        "m5":
+            m5,
 
-            "m5":
-                m5,
-
-            "m15":
-                m15,
-
-            "structure":
-                structure,
-
-            "strike_distance_pct":
-                distance_pct,
-
-            "delta":
-                delta,
-
-            "cvd":
-                cvd,
-
-            "bullish_signals":
-                bullish,
-
-            "bearish_signals":
-                bearish,
-
-            "reasons":
-                reasons[-8:],
-        },
+        "m15":
+            m15,
 
         "score":
             score,
@@ -986,126 +516,91 @@ def calculate_signal(
         "verdict":
             verdict,
 
-        "confidence":
-            confidence,
+        "reason":
+            " • ".join(
+                reasons
+            ),
     }
 
 
 # ============================================================
-# BACKGROUND UPDATE LOOP
+# LIVE DATA LOOP
 # ============================================================
 
 def update_loop():
 
     while True:
 
-        errors = []
-
         try:
 
-            feeds, feed_errors = (
-                get_feeds()
-            )
+            # BTC primary feed
+            price = btc_price()
 
-            errors.extend(
-                feed_errors
-            )
+            # Secondary feed
+            try:
 
-            ref, valid = (
-                reference_price(
-                    feeds
+                coinbase = (
+                    coinbase_price()
                 )
-            )
+
+            except Exception:
+
+                coinbase = None
 
             with lock:
 
-                if ref is not None:
-
-                    old = (
-                        STATE[
-                            "reference_price"
-                        ]
-                    )
-
-                    if old is not None:
-
-                        move = (
-                            ref - old
-                        )
-
-                        STATE[
-                            "delta"
-                        ] = move
-
-                        STATE[
-                            "cvd"
-                        ] += move
-
-                    STATE[
-                        "reference_price"
-                    ] = ref
-
-                    history.append(
-                        (
-                            now(),
-                            ref
-                        )
-                    )
-
-                    if (
-                        "Binance"
-                        in feeds
-                    ):
-
-                        STATE[
-                            "binance_price"
-                        ] = feeds[
-                            "Binance"
-                        ][
-                            "price"
-                        ]
-
-                    STATE[
-                        "sources"
-                    ] = {
-
-                        name:
-                        round(
-                            item[
-                                "price"
-                            ],
-                            2
-                        )
-
-                        for name, item
-                        in valid.items()
-                    }
-
-                    STATE[
-                        "source_count"
-                    ] = len(valid)
-
-            market = get_kalshi()
-
-            with lock:
+                STATE["btc"] = price
 
                 STATE[
-                    "kalshi"
-                ] = market
+                    "coinbase"
+                ] = coinbase
+
+                history.append(
+                    (
+                        time.time(),
+                        price
+                    )
+                )
+
+            # Kalshi
+            market = get_kalshi()
+
+            # Decision
+            with lock:
 
                 result = (
-                    calculate_signal(
-                        STATE[
-                            "reference_price"
-                        ],
+                    make_decision(
+                        price,
                         market
                     )
                 )
 
                 STATE[
-                    "signals"
+                    "kalshi"
+                ] = market
+
+                STATE[
+                    "m1"
                 ] = result[
-                    "signals"
+                    "m1"
+                ]
+
+                STATE[
+                    "m5"
+                ] = result[
+                    "m5"
+                ]
+
+                STATE[
+                    "m15"
+                ] = result[
+                    "m15"
+                ]
+
+                STATE[
+                    "trend"
+                ] = result[
+                    "verdict"
                 ]
 
                 STATE[
@@ -1115,32 +610,39 @@ def update_loop():
                 ]
 
                 STATE[
-                    "verdict"
+                    "reason"
                 ] = result[
-                    "verdict"
+                    "reason"
                 ]
 
                 STATE[
-                    "confidence"
-                ] = result[
-                    "confidence"
-                ]
-
-                STATE[
-                    "last_update"
-                ] = iso_now()
+                    "status"
+                ] = "LIVE"
 
                 STATE[
                     "error"
                 ] = (
-                    "; ".join(errors)
-                    if errors
+                    market.get("error")
+                    if isinstance(
+                        market,
+                        dict
+                    )
                     else None
                 )
+
+                STATE[
+                    "last_update"
+                ] = datetime.now(
+                    timezone.utc
+                ).isoformat()
 
         except Exception as exc:
 
             with lock:
+
+                STATE[
+                    "status"
+                ] = "DATA ERROR"
 
                 STATE[
                     "error"
@@ -1160,73 +662,9 @@ def api_state():
 
     with lock:
 
-        return jsonify({
-
-            "reference_price":
-                STATE[
-                    "reference_price"
-                ],
-
-            "binance_price":
-                STATE[
-                    "binance_price"
-                ],
-
-            "sources":
-                STATE[
-                    "sources"
-                ],
-
-            "source_count":
-                STATE[
-                    "source_count"
-                ],
-
-            "kalshi":
-                STATE[
-                    "kalshi"
-                ],
-
-            "signals":
-                STATE[
-                    "signals"
-                ],
-
-            "score":
-                STATE[
-                    "score"
-                ],
-
-            "verdict":
-                STATE[
-                    "verdict"
-                ],
-
-            "confidence":
-                STATE[
-                    "confidence"
-                ],
-
-            "delta":
-                STATE[
-                    "delta"
-                ],
-
-            "cvd":
-                STATE[
-                    "cvd"
-                ],
-
-            "last_update":
-                STATE[
-                    "last_update"
-                ],
-
-            "error":
-                STATE[
-                    "error"
-                ],
-        })
+        return jsonify(
+            dict(STATE)
+        )
 
 
 # ============================================================
@@ -1242,17 +680,17 @@ PAGE = r"""
 
 <meta
     name="viewport"
-    content="width=device-width,initial-scale=1,maximum-scale=1"
+    content="width=device-width,initial-scale=1"
 >
 
 <title>
-    BTC Strike AI
+BTC Strike AI
 </title>
 
 <style>
 
 *{
-    box-sizing:border-box
+    box-sizing:border-box;
 }
 
 body{
@@ -1261,55 +699,140 @@ body{
 
     background:#070a10;
 
-    color:#f5f7fb;
+    color:#fff;
 
     font-family:
-        -apple-system,
-        BlinkMacSystemFont,
-        "Segoe UI",
         Arial,
         sans-serif;
 }
 
 .wrap{
 
-    max-width:1050px;
+    max-width:900px;
 
     margin:auto;
 
-    padding:14px;
+    padding:16px;
 }
 
-.header{
+h1{
 
-    display:flex;
+    text-align:center;
 
-    justify-content:space-between;
+    margin:
+        5px
+        0;
 
-    align-items:center;
-
-    gap:12px;
-
-    padding:
-        8px
-        2px
-        16px;
-}
-
-.brand{
-
-    font-size:24px;
-
-    font-weight:900;
+    font-size:26px;
 }
 
 .sub{
 
-    font-size:11px;
+    text-align:center;
 
-    color:#7f8a9d;
+    color:#8b95a7;
 
-    margin-top:3px;
+    font-size:12px;
+
+    margin-bottom:16px;
+}
+
+.card{
+
+    background:#111722;
+
+    border:
+        1px solid
+        #273142;
+
+    border-radius:16px;
+
+    padding:16px;
+
+    margin-bottom:12px;
+}
+
+.verdict{
+
+    text-align:center;
+
+    padding:
+        25px
+        10px;
+
+    border:
+        2px solid
+        #d1a82f;
+
+    border-radius:15px;
+}
+
+.verdict.up{
+
+    border-color:#16d995;
+
+    background:
+        rgba(
+            22,
+            217,
+            149,
+            .12
+        );
+}
+
+.verdict.down{
+
+    border-color:#ff4e59;
+
+    background:
+        rgba(
+            255,
+            78,
+            89,
+            .12
+        );
+}
+
+.verdict.wait{
+
+    border-color:#e0b63e;
+
+    background:
+        rgba(
+            224,
+            182,
+            62,
+            .12
+        );
+}
+
+#decision{
+
+    font-size:46px;
+
+    font-weight:900;
+}
+
+.upText{
+
+    color:#19e69b;
+}
+
+.downText{
+
+    color:#ff5962;
+}
+
+.waitText{
+
+    color:#f1c94d;
+}
+
+.conf{
+
+    color:#aeb8c7;
+
+    margin-top:8px;
 }
 
 .grid{
@@ -1317,244 +840,57 @@ body{
     display:grid;
 
     grid-template-columns:
-        repeat(
-            2,
-            minmax(0,1fr)
-        );
+        1fr 1fr;
 
-    gap:10px;
-}
-
-.card{
-
-    background:#101620;
-
-    border:
-        1px solid
-        #202a39;
-
-    border-radius:17px;
-
-    padding:14px;
-
-    box-shadow:
-        0 10px 28px
-        rgba(0,0,0,.20);
-}
-
-.hero{
-
-    grid-column:1/-1;
-
-    text-align:center;
-
-    padding:24px 14px;
-
-    border:
-        2px solid
-        #303a4b;
-
-    transition:.2s;
-}
-
-.hero.up{
-
-    border-color:#16c784;
-
-    background:
-        rgba(
-            22,
-            199,
-            132,
-            .13
-        );
-}
-
-.hero.down{
-
-    border-color:#ff4d57;
-
-    background:
-        rgba(
-            255,
-            77,
-            87,
-            .13
-        );
-}
-
-.hero.wait{
-
-    border-color:#d8aa35;
-
-    background:
-        rgba(
-            216,
-            170,
-            53,
-            .12
-        );
+    gap:12px;
 }
 
 .label{
 
-    color:#818da0;
+    color:#7f8b9f;
 
     font-size:10px;
+
+    font-weight:bold;
+
+    text-transform:uppercase;
+
+    letter-spacing:.1em;
+}
+
+.value{
+
+    font-size:25px;
 
     font-weight:800;
 
-    letter-spacing:.12em;
-
-    text-transform:uppercase;
+    margin-top:7px;
 }
 
-.verdict{
+.reason{
 
-    margin-top:6px;
-
-    font-size:38px;
-
-    line-height:1;
-
-    font-weight:950;
-}
-
-.hero.up .verdict{
-
-    color:#16e59a;
-}
-
-.hero.down .verdict{
-
-    color:#ff5961;
-}
-
-.hero.wait .verdict{
-
-    color:#f0c94d;
-}
-
-.conf{
-
-    font-size:14px;
-
-    color:#b7c0cf;
-
-    margin-top:9px;
-}
-
-.big{
-
-    font-size:26px;
-
-    font-weight:850;
-
-    margin-top:5px;
-}
-
-.small{
-
-    font-size:12px;
-
-    color:#a0aaba;
-
-    margin-top:5px;
-}
-
-.row{
-
-    display:flex;
-
-    justify-content:space-between;
-
-    padding:8px 0;
-
-    border-bottom:
-        1px solid
-        #202938;
+    color:#c7cfdb;
 
     font-size:13px;
-}
 
-.row:last-child{
-
-    border-bottom:0;
-}
-
-.upText{
-
-    color:#16e59a;
-}
-
-.downText{
-
-    color:#ff5961;
-}
-
-.waitText{
-
-    color:#f0c94d;
-}
-
-.pills{
-
-    display:flex;
-
-    flex-wrap:wrap;
-
-    gap:6px;
-
-    margin-top:9px;
-}
-
-.pill{
-
-    padding:
-        5px
-        8px;
-
-    border-radius:999px;
-
-    background:#192230;
-
-    color:#cbd3df;
-
-    font-size:10px;
+    line-height:1.5;
 }
 
 .status{
 
-    margin-top:10px;
+    color:#8e99aa;
 
-    padding:9px;
-
-    border-radius:10px;
-
-    background:#0c1119;
-
-    color:#758195;
-
-    font-size:10px;
+    font-size:11px;
 
     word-break:break-word;
 }
 
-@media(max-width:700px){
+@media(max-width:650px){
 
     .grid{
 
-        grid-template-columns:1fr;
-    }
-
-    .hero{
-
-        grid-column:auto;
-    }
-
-    .verdict{
-
-        font-size:34px;
+        grid-template-columns:
+            1fr;
     }
 }
 
@@ -1566,26 +902,37 @@ body{
 
 <div class="wrap">
 
-<div class="header">
-
-<div>
-
-<div class="brand">
-    ₿ BTC STRIKE AI
-</div>
+<h1>
+₿ BTC STRIKE AI
+</h1>
 
 <div class="sub">
-    Multi-exchange reference •
-    Kalshi 15-minute decision engine
+Simple live engine •
+BTC momentum + Kalshi strike confirmation
 </div>
 
+
+<div
+    id="box"
+    class="card verdict wait"
+>
+
+<div class="label">
+CURRENT DECISION
 </div>
 
 <div
-    class="sub"
-    id="clock"
+    id="decision"
+    class="waitText"
 >
-    CONNECTING
+WAIT
+</div>
+
+<div
+    id="confidence"
+    class="conf"
+>
+Strength: --/100
 </div>
 
 </div>
@@ -1594,27 +941,17 @@ body{
 <div class="grid">
 
 
-<div
-    id="hero"
-    class="card hero wait"
->
+<div class="card">
 
 <div class="label">
-    CURRENT DECISION
+BTC Price
 </div>
 
 <div
-    id="verdict"
-    class="verdict"
+    id="btc"
+    class="value"
 >
-    UNDECIDED
-</div>
-
-<div
-    id="confidence"
-    class="conf"
->
-    Confidence: --
+--
 </div>
 
 </div>
@@ -1623,49 +960,14 @@ body{
 <div class="card">
 
 <div class="label">
-    Composite BTC Reference
-</div>
-
-<div
-    id="price"
-    class="big"
->
-    --
-</div>
-
-<div
-    id="binance"
-    class="small"
->
-    Binance: --
-</div>
-
-<div
-    id="sources"
-    class="pills"
-></div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-    Kalshi Strike
+Kalshi Strike
 </div>
 
 <div
     id="strike"
-    class="big"
+    class="value"
 >
-    --
-</div>
-
-<div
-    id="distance"
-    class="small"
->
-    Distance: --
+--
 </div>
 
 </div>
@@ -1674,14 +976,14 @@ body{
 <div class="card">
 
 <div class="label">
-    1 Minute Momentum
+1 Minute
 </div>
 
 <div
     id="m1"
-    class="big"
+    class="value"
 >
-    --
+--
 </div>
 
 </div>
@@ -1690,14 +992,14 @@ body{
 <div class="card">
 
 <div class="label">
-    5 Minute Momentum
+5 Minute
 </div>
 
 <div
     id="m5"
-    class="big"
+    class="value"
 >
-    --
+--
 </div>
 
 </div>
@@ -1706,14 +1008,14 @@ body{
 <div class="card">
 
 <div class="label">
-    15 Minute Momentum
+15 Minute
 </div>
 
 <div
     id="m15"
-    class="big"
+    class="value"
 >
-    --
+--
 </div>
 
 </div>
@@ -1722,73 +1024,18 @@ body{
 <div class="card">
 
 <div class="label">
-    Price Structure
+Signal Strength
 </div>
 
 <div
-    id="structure"
-    class="big"
-    style="font-size:17px"
+    id="score"
+    class="value"
 >
-    --
+--/100
 </div>
 
 </div>
 
-
-<div class="card">
-
-<div class="label">
-    Pressure
-</div>
-
-<div class="row">
-
-<span>
-    Delta proxy
-</span>
-
-<b id="delta">
-    --
-</b>
-
-</div>
-
-<div class="row">
-
-<span>
-    CVD proxy
-</span>
-
-<b id="cvd">
-    --
-</b>
-
-</div>
-
-<div class="row">
-
-<span>
-    Score
-</span>
-
-<b id="score">
-    --
-</b>
-
-</div>
-
-<div class="row">
-
-<span>
-    Agreement
-</span>
-
-<b id="agreement">
-    --
-</b>
-
-</div>
 
 </div>
 
@@ -1796,73 +1043,34 @@ body{
 <div class="card">
 
 <div class="label">
-    Kalshi Market
-</div>
-
-<div class="row">
-
-<span>
-    YES Bid
-</span>
-
-<b id="yb">
-    --
-</b>
-
-</div>
-
-<div class="row">
-
-<span>
-    YES Ask
-</span>
-
-<b id="ya">
-    --
-</b>
-
-</div>
-
-<div class="row">
-
-<span>
-    Last
-</span>
-
-<b id="last">
-    --
-</b>
-
-</div>
-
-</div>
-
-
-<div class="card">
-
-<div class="label">
-    System Status
-</div>
-
-<div class="small">
-
-Conservative engine:
-conflicting evidence produces
-UNDECIDED instead of forcing a direction.
-
+WHY?
 </div>
 
 <div
-    id="error"
+    id="reason"
+    class="reason"
+>
+Waiting for live data...
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="label">
+SYSTEM STATUS
+</div>
+
+<div
+    id="status"
     class="status"
 >
-    No errors reported.
+Starting...
 </div>
 
 </div>
 
-
-</div>
 
 </div>
 
@@ -1875,10 +1083,13 @@ function money(v){
         v === null ||
         v === undefined ||
         isNaN(v)
-    )
-        return "--";
+    ){
 
-    return "$" +
+        return "--";
+    }
+
+    return "$"
+        +
         Number(v).toLocaleString(
             undefined,
             {
@@ -1889,14 +1100,16 @@ function money(v){
 }
 
 
-function pct(v){
+function percent(v){
 
     if(
         v === null ||
         v === undefined ||
         isNaN(v)
-    )
+    ){
+
         return "--";
+    }
 
     return (
         v >= 0
@@ -1910,59 +1123,31 @@ function pct(v){
 }
 
 
-function signed(v){
-
-    if(
-        v === null ||
-        v === undefined ||
-        isNaN(v)
-    )
-        return "--";
-
-    return (
-        v >= 0
-        ? "+"
-        : ""
-    )
-    +
-    Number(v).toFixed(4);
-}
-
-
-function move(id,v){
+function setMomentum(
+    id,
+    value
+){
 
     const element =
-        document.getElementById(id);
-
-    element.textContent =
-        pct(v);
-
-    element.className =
-        "big " +
-        (
-            v > 0
-            ? "upText"
-            : v < 0
-            ? "downText"
-            : "waitText"
+        document.getElementById(
+            id
         );
-}
-
-
-function pressure(id,v){
-
-    const element =
-        document.getElementById(id);
 
     element.textContent =
-        signed(v);
+        percent(value);
 
     element.className =
-        v > 0
-        ? "upText"
-        : v < 0
-        ? "downText"
-        : "waitText";
+        "value "
+        +
+        (
+            value > 0
+            ? "upText"
+            :
+            value < 0
+            ? "downText"
+            :
+            "waitText"
+        );
 }
 
 
@@ -1972,11 +1157,12 @@ async function refresh(){
 
         const response =
             await fetch(
-                "/api/state?x="
+                "/api/state?t="
                 +
                 Date.now(),
                 {
-                    cache:"no-store"
+                    cache:
+                        "no-store"
                 }
             );
 
@@ -1985,213 +1171,149 @@ async function refresh(){
 
 
         document
-            .getElementById("price")
-            .textContent =
-            money(
-                state.reference_price
-            );
-
-
-        document
-            .getElementById("binance")
-            .textContent =
-            "Binance: "
-            +
-            money(
-                state.binance_price
-            );
-
-
-        const sources =
-            document.getElementById(
-                "sources"
-            );
-
-        sources.innerHTML = "";
-
-
-        for(
-            const [
-                name,
-                value
-            ]
-            of Object.entries(
-                state.sources || {}
+            .getElementById(
+                "btc"
             )
-        ){
-
-            const pill =
-                document.createElement(
-                    "span"
-                );
-
-            pill.className =
-                "pill";
-
-            pill.textContent =
-                name
-                +
-                " "
-                +
-                money(value);
-
-            sources.appendChild(
-                pill
-            );
-        }
-
-
-        const kalshi =
-            state.kalshi || {};
-
-
-        document
-            .getElementById("strike")
             .textContent =
             money(
-                kalshi.strike
+                state.btc
             );
 
 
-        const signals =
-            state.signals || {};
+        const market =
+            state.kalshi
+            || {};
 
 
         document
-            .getElementById("distance")
+            .getElementById(
+                "strike"
+            )
             .textContent =
-            "Distance: "
-            +
-            pct(
-                signals.strike_distance_pct
+            money(
+                market.strike
             );
 
 
-        move(
+        setMomentum(
             "m1",
-            signals.m1
+            state.m1
         );
 
-        move(
+        setMomentum(
             "m5",
-            signals.m5
+            state.m5
         );
 
-        move(
+        setMomentum(
             "m15",
-            signals.m15
+            state.m15
         );
 
 
         document
             .getElementById(
-                "structure"
+                "score"
             )
-            .textContent =
-            signals.structure || "--";
-
-
-        pressure(
-            "delta",
-            state.delta
-        );
-
-        pressure(
-            "cvd",
-            state.cvd
-        );
-
-
-        document
-            .getElementById("score")
             .textContent =
             (
-                state.score >= 0
-                ? "+"
-                : ""
+                state.score
+                ??
+                "--"
             )
             +
-            state.score;
+            "/100";
 
 
         document
             .getElementById(
-                "agreement"
+                "reason"
             )
             .textContent =
-            (
-                signals.bullish_signals
-                ?? "--"
-            )
-            +
-            " UP / "
-            +
-            (
-                signals.bearish_signals
-                ?? "--"
-            )
-            +
-            " DOWN";
+            state.reason
+            ||
+            "Waiting...";
 
 
         document
-            .getElementById("yb")
+            .getElementById(
+                "status"
+            )
             .textContent =
-            kalshi.yes_bid == null
-            ? "--"
-            : kalshi.yes_bid + "¢";
-
-
-        document
-            .getElementById("ya")
-            .textContent =
-            kalshi.yes_ask == null
-            ? "--"
-            : kalshi.yes_ask + "¢";
-
-
-        document
-            .getElementById("last")
-            .textContent =
-            kalshi.last_price == null
-            ? "--"
-            : kalshi.last_price + "¢";
-
-
-        const verdict =
+            state.status
+            +
             (
-                state.verdict
+                state.error
+                ?
+                " — "
+                +
+                state.error
+                :
+                ""
+            )
+            +
+            (
+                state.last_update
+                ?
+                " — Updated "
+                +
+                new Date(
+                    state.last_update
+                ).toLocaleTimeString()
+                :
+                ""
+            );
+
+
+        const decision =
+            (
+                state.trend
                 ||
-                "UNDECIDED"
+                "WAIT"
             ).toUpperCase();
 
 
-        const hero =
+        const box =
             document.getElementById(
-                "hero"
+                "box"
+            );
+
+        const decisionElement =
+            document.getElementById(
+                "decision"
             );
 
 
-        hero.className =
-            "card hero "
+        box.className =
+            "card verdict "
             +
             (
-                verdict.includes("UP")
-                ? "up"
+                decision === "UP"
+                ?
+                "up"
                 :
-                verdict.includes("DOWN")
-                ? "down"
+                decision === "DOWN"
+                ?
+                "down"
                 :
                 "wait"
             );
 
 
-        document
-            .getElementById(
-                "verdict"
-            )
-            .textContent =
-            verdict;
+        decisionElement.className =
+            decision === "UP"
+            ?
+            "upText"
+            :
+            decision === "DOWN"
+            ?
+            "downText"
+            :
+            "waitText";
+
+
+        decisionElement.textContent =
+            decision;
 
 
         document
@@ -2199,36 +1321,15 @@ async function refresh(){
                 "confidence"
             )
             .textContent =
-            "Confidence: "
+            "Signal strength: "
             +
             (
-                state.confidence
-                ?? "--"
+                state.score
+                ??
+                "--"
             )
             +
-            "%";
-
-
-        document
-            .getElementById("clock")
-            .textContent =
-            state.last_update
-            ?
-            new Date(
-                state.last_update
-            ).toLocaleTimeString()
-            :
-            "WAITING";
-
-
-        document
-            .getElementById("error")
-            .textContent =
-            state.error
-            ?
-            state.error
-            :
-            "All available feeds responding.";
+            "/100";
 
     }
 
@@ -2236,17 +1337,12 @@ async function refresh(){
 
         document
             .getElementById(
-                "clock"
+                "status"
             )
             .textContent =
-            "CONNECTION ERROR";
-
-        document
-            .getElementById(
-                "error"
-            )
-            .textContent =
-            error.toString();
+            "CONNECTION ERROR — "
+            +
+            error;
     }
 }
 
@@ -2275,20 +1371,19 @@ def index():
 
 
 # ============================================================
-# RENDER / GUNICORN STARTUP FIX
+# IMPORTANT FOR RENDER
 # ============================================================
-# Render starts this program with:
+# Render uses:
 #
 #     gunicorn app:app
 #
-# Gunicorn IMPORTS this module. It does not execute the file
-# as "__main__". Therefore the live BTC/Kalshi data engine
-# must be started during module import.
+# Gunicorn imports this file instead of running it as
+# "__main__", so the live data engine must start here.
 
 _update_thread = threading.Thread(
     target=update_loop,
     daemon=True,
-    name="btc-data-engine",
+    name="btc-live-engine",
 )
 
 _update_thread.start()
@@ -2301,6 +1396,3 @@ if __name__ == "__main__":
         port=PORT,
         threaded=True,
     )
-if __name__ == "__main__":
-    threading.Thread(target=update_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
