@@ -1,5 +1,10 @@
-import os, time, json, statistics, threading
+import os
+import json
+import time
+import threading
+import statistics
 from datetime import datetime, timezone, timedelta
+
 import requests
 from flask import Flask, jsonify, render_template_string
 
@@ -11,8 +16,9 @@ except Exception:
 app = Flask(__name__)
 
 TIMEOUT = 5
-CACHE_SECONDS = 1
-MEMORY_FILE = "signal_memory.json"
+CACHE_SECONDS = 2
+KALSHI_SERIES = "KXBTC15M"
+KALSHI_TICKER = os.getenv("KALSHI_TICKER", "").strip()
 
 KALSHI_BASES = [
     os.getenv(
@@ -22,550 +28,61 @@ KALSHI_BASES = [
     "https://api.elections.kalshi.com/trade-api/v2",
 ]
 
-KALSHI_TICKER = os.getenv(
-    "KALSHI_TICKER",
-    ""
-).strip()
-
-KALSHI_SERIES = "KXBTC15M"
-
 session = requests.Session()
-session.headers["User-Agent"] = "BTC-Strike-AI/9.0"
+session.headers.update({
+    "User-Agent": "BTC-Strike-AI/12.0"
+})
 
 cache = {
-    "time": 0,
+    "time": 0.0,
     "state": None
 }
 
 history_cache = {
-    "time": 0,
+    "time": 0.0,
     "candles": []
 }
 
-feed_health = {}
-market_history = []
-signal_memory = []
-active_market = None
-memory_loaded = False
-
-# =========================================================
-# REAL-TIME BTC STREAM
-# =========================================================
-
-live_btc = {
+live = {
     "price": None,
-    "received_at": 0.0,
-    "event_at": 0.0,
+    "received": 0.0,
     "connected": False,
-    "source": "Coinbase WebSocket"
+    "source": "REST"
 }
 
-live_stream_lock = threading.Lock()
-stream_started = False
-kalshi_last_update = 0.0
-
-
-def safe_event_time(value):
-    try:
-        if value is None:
-            return time.time()
-
-        value = float(value)
-
-        if value > 100000000000:
-            return value / 1000.0
-
-        if value > 1000000000:
-            return value
-
-    except Exception:
-        pass
-
-    return time.time()
-
-
-def _extract_price(obj):
-    if isinstance(obj, dict):
-
-        for key in (
-            "price",
-            "price_usd",
-            "last_trade_price"
-        ):
-            value = number(obj.get(key)) if "number" in globals() else None
-
-            if value is not None and value > 0:
-                return value
-
-        for value in obj.values():
-
-            found = _extract_price(value)
-
-            if found is not None:
-                return found
-
-    elif isinstance(obj, list):
-
-        for value in obj:
-
-            found = _extract_price(value)
-
-            if found is not None:
-                return found
-
-    return None
-
-
-def _set_live_price(
-    price,
-    source,
-    event_at=None
-):
-
-    if price is None or price <= 0:
-        return
-
-    received = time.time()
-
-    if source == "Binance Live":
-
-        coinbase_received = live_btc.get(
-            "received_at",
-            0.0
-        )
-
-        coinbase_source = live_btc.get(
-            "source"
-        )
-
-        if (
-            coinbase_source == "Coinbase Live"
-            and
-            coinbase_received
-            and
-            received - coinbase_received < 3
-        ):
-            return
-
-    with live_stream_lock:
-
-        live_btc["price"] = float(price)
-
-        live_btc["received_at"] = received
-
-        live_btc["event_at"] = (
-            event_at or received
-        )
-
-        live_btc["source"] = source
-
-        live_btc["connected"] = True
-
-    record_feed(
-        source,
-        price
-    )
-
-
-def _coinbase_stream_loop():
-
-    if websocket is None:
-        return
-
-    url = "wss://advanced-trade-ws.coinbase.com"
-
-    backoff = 2
-
-    while True:
-
-        ws = None
-
-        try:
-
-            def on_open(sock):
-
-                sock.send(
-                    json.dumps({
-                        "type": "subscribe",
-                        "product_ids": ["BTC-USD"],
-                        "channel": "ticker"
-                    })
-                )
-
-                sock.send(
-                    json.dumps({
-                        "type": "subscribe",
-                        "product_ids": ["BTC-USD"],
-                        "channel": "heartbeats"
-                    })
-                )
-
-
-            def on_message(
-                sock,
-                raw
-            ):
-
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    return
-
-                if not isinstance(
-                    data,
-                    dict
-                ):
-                    return
-
-                price = _extract_price(
-                    data
-                )
-
-                if price is None:
-                    return
-
-                event_at = time.time()
-
-                events = data.get(
-                    "events"
-                )
-
-                if isinstance(
-                    events,
-                    list
-                ):
-
-                    for event in events:
-
-                        if isinstance(
-                            event,
-                            dict
-                        ):
-
-                            ts = (
-                                event.get(
-                                    "timestamp"
-                                )
-                                or
-                                event.get(
-                                    "time"
-                                )
-                            )
-
-                            if ts:
-
-                                try:
-
-                                    event_at = (
-                                        datetime
-                                        .fromisoformat(
-                                            str(ts)
-                                            .replace(
-                                                "Z",
-                                                "+00:00"
-                                            )
-                                        )
-                                        .timestamp()
-                                    )
-
-                                except Exception:
-                                    pass
-
-                                break
-
-                _set_live_price(
-                    price,
-                    "Coinbase Live",
-                    event_at
-                )
-
-
-            def on_error(
-                sock,
-                error
-            ):
-
-                feed_health[
-                    "Coinbase Live"
-                ] = {
-                    "online": False,
-                    "last_error": str(error),
-                    "last_success":
-                        live_btc.get(
-                            "received_at",
-                            0.0
-                        )
-                }
-
-
-            def on_close(
-                sock,
-                code,
-                msg
-            ):
-
-                with live_stream_lock:
-
-                    live_btc[
-                        "connected"
-                    ] = False
-
-
-            ws = websocket.WebSocketApp(
-                url,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
-
-            ws.run_forever(
-                ping_interval=20,
-                ping_timeout=10,
-                skip_utf8_validation=True
-            )
-
-            backoff = 2
-
-        except Exception as exc:
-
-            feed_health[
-                "Coinbase Live"
-            ] = {
-                "online": False,
-                "last_error": str(exc),
-                "last_success":
-                    live_btc.get(
-                        "received_at",
-                        0.0
-                    )
-            }
-
-            with live_stream_lock:
-
-                live_btc[
-                    "connected"
-                ] = False
-
-        finally:
-
-            try:
-
-                if ws is not None:
-                    ws.close()
-
-            except Exception:
-                pass
-
-        time.sleep(
-            backoff
-        )
-
-        backoff = min(
-            backoff * 2,
-            30
-        )
-
-
-def _binance_stream_loop():
-
-    if websocket is None:
-        return
-
-    url = (
-        "wss://stream.binance.com:9443/"
-        "ws/btcusdt@trade"
-    )
-
-    backoff = 3
-
-    while True:
-
-        ws = None
-
-        try:
-
-            def on_message(
-                sock,
-                raw
-            ):
-
-                try:
-
-                    data = json.loads(
-                        raw
-                    )
-
-                    price = number(
-                        data.get("p")
-                    )
-
-                    if (
-                        price is not None
-                        and
-                        price > 0
-                    ):
-
-                        _set_live_price(
-                            price,
-                            "Binance Live",
-                            safe_event_time(
-                                data.get("T")
-                                or
-                                data.get("E")
-                            )
-                        )
-
-                except Exception:
-                    pass
-
-
-            def on_error(
-                sock,
-                error
-            ):
-
-                feed_health[
-                    "Binance Live"
-                ] = {
-                    "online": False,
-                    "last_error": str(error),
-                    "last_success":
-                        live_btc.get(
-                            "received_at",
-                            0.0
-                        )
-                }
-
-
-            def on_close(
-                sock,
-                code,
-                msg
-            ):
-                return
-
-
-            ws = websocket.WebSocketApp(
-                url,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
-
-            ws.run_forever(
-                ping_interval=20,
-                ping_timeout=10,
-                skip_utf8_validation=True
-            )
-
-            backoff = 3
-
-        except Exception as exc:
-
-            feed_health[
-                "Binance Live"
-            ] = {
-                "online": False,
-                "last_error": str(exc),
-                "last_success":
-                    live_btc.get(
-                        "received_at",
-                        0.0
-                    )
-            }
-
-        finally:
-
-            try:
-
-                if ws is not None:
-                    ws.close()
-
-            except Exception:
-                pass
-
-        time.sleep(
-            backoff
-        )
-
-        backoff = min(
-            backoff * 2,
-            30
-        )
-
-
-def start_live_streams():
-
-    global stream_started
-
-    if websocket is None:
-        return
-
-    with live_stream_lock:
-
-        if stream_started:
-            return
-
-        stream_started = True
-
-    threading.Thread(
-        target=_coinbase_stream_loop,
-        name="coinbase-live-stream",
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=_binance_stream_loop,
-        name="binance-live-stream",
-        daemon=True
-    ).start()
-
-
-start_live_streams()
+lock = threading.Lock()
+streams_started = False
 
 
 # =========================================================
 # BASIC HELPERS
 # =========================================================
 
-def number(value):
-
+def num(value):
     try:
         return float(value)
-
-    except:
+    except Exception:
         return None
 
 
-def get_json(
-    url,
-    params=None
-):
-
+def get_json(url, params=None):
     try:
-
         response = session.get(
             url,
             params=params,
             timeout=TIMEOUT
         )
-
         response.raise_for_status()
-
         return response.json()
-
-    except:
+    except Exception:
         return None
 
 
 def parse_time(value):
-
     if not value:
         return None
 
     try:
-
         dt = datetime.fromisoformat(
             str(value).replace(
                 "Z",
@@ -574,171 +91,254 @@ def parse_time(value):
         )
 
         if dt.tzinfo is None:
-
             dt = dt.replace(
                 tzinfo=timezone.utc
             )
 
         return dt
 
-    except:
+    except Exception:
         return None
 
 
-def seconds_left(value):
-
-    dt = parse_time(
-        value
-    )
-
-    if not dt:
-        return None
-
-    return max(
-        0,
-        int(
-            dt.timestamp()
-            -
-            time.time()
-        )
-    )
-
-
-def record_feed(
-    name,
-    value
-):
-
-    item = feed_health.setdefault(
-        name,
-        {}
-    )
-
-    if value is not None:
-
-        item["online"] = True
-
-        item["last_success"] = (
-            time.time()
-        )
-
-    else:
-
-        item["online"] = False
-
-    return value
-
-
-# =========================================================
-# SIGNAL MEMORY
-# =========================================================
-
-def load_memory():
-
-    global signal_memory
-    global memory_loaded
-
-    if memory_loaded:
+def set_live(price, source):
+    if price is None or price <= 0:
         return
 
-    memory_loaded = True
+    with lock:
+        live.update(
+            price=float(price),
+            received=time.time(),
+            connected=True,
+            source=source
+        )
 
-    try:
 
-        with open(
-            MEMORY_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
+# =========================================================
+# LIVE COINBASE BTC STREAM
+# =========================================================
 
-            data = json.load(
-                file
+def coinbase_loop():
+
+    if websocket is None:
+        return
+
+    url = "wss://advanced-trade-ws.coinbase.com"
+
+    while True:
+
+        try:
+
+            def on_open(ws):
+
+                ws.send(
+                    json.dumps({
+                        "type": "subscribe",
+                        "product_ids": ["BTC-USD"],
+                        "channel": "ticker"
+                    })
+                )
+
+                ws.send(
+                    json.dumps({
+                        "type": "subscribe",
+                        "product_ids": ["BTC-USD"],
+                        "channel": "heartbeats"
+                    })
+                )
+
+
+            def on_message(ws, raw):
+
+                try:
+
+                    data = json.loads(raw)
+
+                    price = None
+
+                    def walk(obj):
+
+                        nonlocal price
+
+                        if price is not None:
+                            return
+
+                        if isinstance(obj, dict):
+
+                            for key in (
+                                "price",
+                                "price_usd",
+                                "last_trade_price"
+                            ):
+
+                                value = num(
+                                    obj.get(key)
+                                )
+
+                                if (
+                                    value is not None
+                                    and
+                                    value > 0
+                                ):
+
+                                    price = value
+                                    return
+
+                            for value in obj.values():
+                                walk(value)
+
+                        elif isinstance(obj, list):
+
+                            for value in obj:
+                                walk(value)
+
+                    walk(data)
+
+                    if price:
+                        set_live(
+                            price,
+                            "Coinbase Live"
+                        )
+
+                except Exception:
+                    pass
+
+
+            def on_close(ws, code, message):
+
+                with lock:
+                    live["connected"] = False
+
+
+            ws = websocket.WebSocketApp(
+                url,
+                on_open=on_open,
+                on_message=on_message,
+                on_close=on_close
             )
 
-        if isinstance(
-            data,
-            list
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10,
+                skip_utf8_validation=True
+            )
+
+        except Exception:
+
+            with lock:
+                live["connected"] = False
+
+        time.sleep(3)
+
+
+# =========================================================
+# LIVE BINANCE FALLBACK STREAM
+# =========================================================
+
+def binance_loop():
+
+    if websocket is None:
+        return
+
+    url = "wss://stream.binance.com:9443/ws/btcusdt@trade"
+
+    while True:
+
+        try:
+
+            def on_message(ws, raw):
+
+                try:
+
+                    data = json.loads(raw)
+
+                    price = num(
+                        data.get("p")
+                    )
+
+                    if (
+                        price
+                        and
+                        not (
+                            live["source"] == "Coinbase Live"
+                            and
+                            time.time() - live["received"] < 3
+                        )
+                    ):
+
+                        set_live(
+                            price,
+                            "Binance Live"
+                        )
+
+                except Exception:
+                    pass
+
+
+            ws = websocket.WebSocketApp(
+                url,
+                on_message=on_message
+            )
+
+            ws.run_forever(
+                ping_interval=20,
+                ping_timeout=10,
+                skip_utf8_validation=True
+            )
+
+        except Exception:
+            pass
+
+        time.sleep(4)
+
+
+# =========================================================
+# START LIVE STREAMS
+# =========================================================
+
+def start_streams():
+
+    global streams_started
+
+    if websocket is None:
+        return
+
+    if streams_started:
+        return
+
+    streams_started = True
+
+    threading.Thread(
+        target=coinbase_loop,
+        daemon=True,
+        name="coinbase-btc"
+    ).start()
+
+    threading.Thread(
+        target=binance_loop,
+        daemon=True,
+        name="binance-btc"
+    ).start()
+
+
+# =========================================================
+# BTC SPOT PRICE
+# =========================================================
+
+def spot_price():
+
+    with lock:
+
+        if (
+            live["price"]
+            and
+            time.time() - live["received"] < 4
         ):
 
-            signal_memory = data[-500:]
-
-        else:
-
-            signal_memory = []
-
-    except:
-
-        signal_memory = []
-
-
-def save_memory():
-
-    try:
-
-        temp_file = (
-            MEMORY_FILE
-            +
-            ".tmp"
-        )
-
-        with open(
-            temp_file,
-            "w",
-            encoding="utf-8"
-        ) as file:
-
-            json.dump(
-                signal_memory[-500:],
-                file
+            return (
+                live["price"],
+                live["source"]
             )
-
-        os.replace(
-            temp_file,
-            MEMORY_FILE
-        )
-
-    except:
-        pass
-
-
-# =========================================================
-# BINANCE / LIVE PRICE
-# =========================================================
-
-def get_binance_price():
-
-    live_price = live_btc.get(
-        "price"
-    )
-
-    received_at = live_btc.get(
-        "received_at",
-        0.0
-    )
-
-    source = (
-        live_btc.get(
-            "source"
-        )
-        or
-        "Live Stream"
-    )
-
-    if (
-        live_price is not None
-        and
-        received_at
-        and
-        time.time()
-        -
-        received_at
-        < 3
-    ):
-
-        return (
-            live_price,
-            source
-        )
 
     sources = [
 
@@ -759,13 +359,22 @@ def get_binance_price():
         ),
 
         (
-            "Binance.US",
-            "https://api.binance.us/api/v3/ticker/price",
+            "Coinbase",
+            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
+            None
+        ),
+
+        (
+            "Kraken",
+            "https://api.kraken.com/0/public/Ticker",
             {
-                "symbol": "BTCUSD"
+                "pair": "XBTUSD"
             }
         )
+
     ]
+
+    values = []
 
     for name, url, params in sources:
 
@@ -774,1155 +383,213 @@ def get_binance_price():
             params
         )
 
-        if isinstance(
-            data,
-            dict
-        ):
+        price = None
 
-            price = number(
-                data.get(
-                    "price"
-                )
-            )
+        if name.startswith("Binance"):
 
-            if (
-                price
-                and
-                price > 0
-            ):
-
-                return (
-                    price,
-                    name
+            if isinstance(data, dict):
+                price = num(
+                    data.get("price")
                 )
 
-    return (
-        None,
-        "REST fallback"
-    )
+        elif name == "Coinbase":
 
+            try:
+                price = num(
+                    data["data"]["amount"]
+                )
+            except Exception:
+                pass
 
-# =========================================================
-# BTC SPOT FEEDS
-# =========================================================
-
-def get_spot_feeds():
-
-    binance_price, binance_name = (
-        get_binance_price()
-    )
-
-    feeds = {}
-
-    feeds["Binance"] = record_feed(
-        "Binance",
-        binance_price
-    )
-
-    if binance_name in (
-        "Coinbase Live",
-        "Binance Live"
-    ):
-
-        record_feed(
-            binance_name,
-            binance_price
-        )
-
-    data = get_json(
-        "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-    )
-
-    try:
-
-        coinbase = number(
-            data["data"]["amount"]
-        )
-
-    except:
-
-        coinbase = None
-
-    feeds["Coinbase"] = record_feed(
-        "Coinbase",
-        coinbase
-    )
-
-    data = get_json(
-        "https://api.kraken.com/0/public/Ticker",
-        {
-            "pair": "XBTUSD"
-        }
-    )
-
-    try:
-
-        pair = next(
-            iter(
-                data["result"]
-            )
-        )
-
-        kraken = number(
-            data["result"][
-                pair
-            ]["c"][0]
-        )
-
-    except:
-
-        kraken = None
-
-    feeds["Kraken"] = record_feed(
-        "Kraken",
-        kraken
-    )
-
-    data = get_json(
-        "https://www.bitstamp.net/api/v2/ticker/btcusd/"
-    )
-
-    if isinstance(
-        data,
-        dict
-    ):
-
-        bitstamp = number(
-            data.get(
-                "last"
-            )
-        )
-
-    else:
-
-        bitstamp = None
-
-    feeds["Bitstamp"] = record_feed(
-        "Bitstamp",
-        bitstamp
-    )
-
-    values = [
-        value
-        for value in feeds.values()
-        if value is not None
-        and
-        value > 0
-    ]
-
-    if not values:
-
-        return (
-            None,
-            feeds
-        )
-
-    median = statistics.median(
-        values
-    )
-
-    filtered = [
-        value
-        for value in values
-        if abs(
-            value - median
-        )
-        /
-        median
-        <=
-        0.0035
-    ]
-
-    reference = statistics.median(
-        filtered
-        or
-        values
-    )
-
-    return (
-        reference,
-        feeds
-    )
-
-
-# =========================================================
-# BUYER / SELLER BATTLE
-# =========================================================
-
-def get_buy_sell_pressure():
-
-    result = {
-        "available": False,
-        "buyers": 0.0,
-        "sellers": 0.0,
-        "buy_pct": None,
-        "sell_pct": None,
-        "delta": None,
-        "winner": "WAIT",
-        "strength": "NO DATA",
-        "trades": 0,
-        "source": None
-    }
-
-    endpoints = [
-
-        (
-            "Binance",
-            "https://api.binance.com/api/v3/aggTrades",
-            {
-                "symbol": "BTCUSDT",
-                "limit": 1000
-            }
-        ),
-
-        (
-            "Binance",
-            "https://data-api.binance.vision/api/v3/aggTrades",
-            {
-                "symbol": "BTCUSDT",
-                "limit": 1000
-            }
-        ),
-
-        (
-            "Binance.US",
-            "https://api.binance.us/api/v3/aggTrades",
-            {
-                "symbol": "BTCUSD",
-                "limit": 1000
-            }
-        )
-    ]
-
-    for name, url, params in endpoints:
-
-        data = get_json(
-            url,
-            params
-        )
-
-        if not isinstance(
-            data,
-            list
-        ):
-            continue
-
-        buyers = 0.0
-        sellers = 0.0
-        count = 0
-
-        for trade in data:
+        else:
 
             try:
 
-                price = float(
-                    trade.get(
-                        "p",
-                        0
-                    )
+                key = next(
+                    key
+                    for key in data["result"]
+                    if key != "last"
                 )
 
-                quantity = float(
-                    trade.get(
-                        "q",
-                        0
-                    )
+                price = num(
+                    data["result"][key]["c"][0]
                 )
 
-                if (
-                    price <= 0
-                    or
-                    quantity <= 0
-                ):
-                    continue
+            except Exception:
+                pass
 
-                notional = (
-                    price
-                    *
-                    quantity
-                )
+        if price and price > 0:
+            values.append(price)
 
-                if trade.get(
-                    "m"
-                ) is True:
+    if values:
 
-                    sellers += (
-                        notional
-                    )
-
-                else:
-
-                    buyers += (
-                        notional
-                    )
-
-                count += 1
-
-            except:
-
-                continue
-
-        total = (
-            buyers
-            +
-            sellers
+        return (
+            statistics.median(values),
+            "Composite REST"
         )
 
-        if (
-            total <= 0
-            or
-            count == 0
-        ):
-            continue
-
-        buy_pct = (
-            buyers
-            /
-            total
-            *
-            100
-        )
-
-        sell_pct = (
-            sellers
-            /
-            total
-            *
-            100
-        )
-
-        delta = (
-            buyers
-            -
-            sellers
-        )
-
-        if buy_pct >= 60:
-
-            winner = "BUYERS"
-            strength = "STRONG BUY"
-
-        elif buy_pct >= 55:
-
-            winner = "BUYERS"
-            strength = "BUY"
-
-        elif sell_pct >= 60:
-
-            winner = "SELLERS"
-            strength = "STRONG SELL"
-
-        elif sell_pct >= 55:
-
-            winner = "SELLERS"
-            strength = "SELL"
-
-        else:
-
-            winner = "BALANCED"
-            strength = "BALANCED"
-
-        record_feed(
-            "Binance Trades",
-            total
-        )
-
-        result.update({
-
-            "available": True,
-
-            "buyers": buyers,
-
-            "sellers": sellers,
-
-            "buy_pct": buy_pct,
-
-            "sell_pct": sell_pct,
-
-            "delta": delta,
-
-            "winner": winner,
-
-            "strength": strength,
-
-            "trades": count,
-
-            "source": name
-        })
-
-        return result
-
-    return result
-
-
-# =========================================================
-# ORDER BOOK PRESSURE
-# =========================================================
-
-def get_order_book_pressure():
-
-    result = {
-        "available": False,
-        "bid_qty": 0.0,
-        "ask_qty": 0.0,
-        "bid_pct": None,
-        "ask_pct": None,
-        "winner": "WAIT",
-        "strength": "NO DATA",
-        "source": None
-    }
-
-    endpoints = [
-
-        (
-            "Binance",
-            "https://api.binance.com/api/v3/depth",
-            {
-                "symbol": "BTCUSDT",
-                "limit": 100
-            }
-        ),
-
-        (
-            "Binance",
-            "https://data-api.binance.vision/api/v3/depth",
-            {
-                "symbol": "BTCUSDT",
-                "limit": 100
-            }
-        ),
-
-        (
-            "Binance.US",
-            "https://api.binance.us/api/v3/depth",
-            {
-                "symbol": "BTCUSD",
-                "limit": 100
-            }
-        )
-    ]
-
-    for name, url, params in endpoints:
-
-        data = get_json(
-            url,
-            params
-        )
-
-        if not isinstance(
-            data,
-            dict
-        ):
-            continue
-
-        bids = data.get(
-            "bids",
-            []
-        )
-
-        asks = data.get(
-            "asks",
-            []
-        )
-
-        try:
-
-            bid_qty = sum(
-                float(row[1])
-                for row in bids
-                if len(row) >= 2
-            )
-
-            ask_qty = sum(
-                float(row[1])
-                for row in asks
-                if len(row) >= 2
-            )
-
-        except:
-
-            continue
-
-        total = (
-            bid_qty
-            +
-            ask_qty
-        )
-
-        if total <= 0:
-            continue
-
-        bid_pct = (
-            bid_qty
-            /
-            total
-            *
-            100
-        )
-
-        ask_pct = (
-            ask_qty
-            /
-            total
-            *
-            100
-        )
-
-        if bid_pct >= 60:
-
-            winner = "BIDS"
-            strength = "STRONG BUY"
-
-        elif bid_pct >= 55:
-
-            winner = "BIDS"
-            strength = "BUY"
-
-        elif ask_pct >= 60:
-
-            winner = "ASKS"
-            strength = "STRONG SELL"
-
-        elif ask_pct >= 55:
-
-            winner = "ASKS"
-            strength = "SELL"
-
-        else:
-
-            winner = "BALANCED"
-            strength = "BALANCED"
-
-        result.update({
-
-            "available": True,
-
-            "bid_qty": bid_qty,
-
-            "ask_qty": ask_qty,
-
-            "bid_pct": bid_pct,
-
-            "ask_pct": ask_pct,
-
-            "winner": winner,
-
-            "strength": strength,
-
-            "source": name
-        })
-
-        return result
-
-    return result
-
-
-# =========================================================
-# PREDICTION STRENGTH
-# =========================================================
-
-def prediction_strength(
-    signal,
-    price,
-    market,
-    buy_sell,
-    order_book,
-    quality,
-    memory_rate=None,
-    memory_matches=0
-):
-
-    up = 0
-    down = 0
-
-    reasons = []
-
-    if (
-        price is not None
-        and
-        market
-    ):
-
-        target = market.get(
-            "target"
-        )
-
-        if target is not None:
-
-            if price > target:
-
-                up += 1
-
-            elif price < target:
-
-                down += 1
-
-    for value in (
-        signal.get("m1"),
-        signal.get("m5"),
-        signal.get("m15")
-    ):
-
-        if value is not None:
-
-            if value > 0:
-                up += 1
-
-            elif value < 0:
-                down += 1
-
-    structure = signal.get(
-        "structure",
-        ""
+    return (
+        None,
+        "Unavailable"
     )
 
-    if structure.startswith(
-        "HIGHER"
-    ):
-
-        up += 1
-
-    elif structure.startswith(
-        "LOWER"
-    ):
-
-        down += 1
-
-    if buy_sell.get(
-        "available"
-    ):
-
-        if buy_sell.get(
-            "winner"
-        ) == "BUYERS":
-
-            up += 1
-
-        elif buy_sell.get(
-            "winner"
-        ) == "SELLERS":
-
-            down += 1
-
-    if order_book.get(
-        "available"
-    ):
-
-        if order_book.get(
-            "winner"
-        ) == "BIDS":
-
-            up += 1
-
-        elif order_book.get(
-            "winner"
-        ) == "ASKS":
-
-            down += 1
-
-    yes = yes_mid(
-        market
-    )
-
-    if yes is not None:
-
-        if yes >= 0.60:
-
-            up += 1
-
-        elif yes <= 0.40:
-
-            down += 1
-
-    if signal.get(
-        "reversal"
-    ) == "HIGH":
-
-        if up > down:
-
-            up = max(
-                0,
-                up - 2
-            )
-
-        elif down > up:
-
-            down = max(
-                0,
-                down - 2
-            )
-
-    if (
-        memory_matches >= 3
-        and
-        memory_rate is not None
-    ):
-
-        if memory_rate >= 70:
-
-            if signal.get(
-                "verdict"
-            ) == "UP":
-
-                up += 1
-
-            elif signal.get(
-                "verdict"
-            ) == "DOWN":
-
-                down += 1
-
-        elif memory_rate <= 40:
-
-            if signal.get(
-                "verdict"
-            ) == "UP":
-
-                up = max(
-                    0,
-                    up - 1
-                )
-
-            elif signal.get(
-                "verdict"
-            ) == "DOWN":
-
-                down = max(
-                    0,
-                    down - 1
-                )
-
-    total = (
-        up
-        +
-        down
-    )
-
-    if total == 0:
-
-        direction = "WAIT"
-        label = "🟡 WAIT"
-        score = 0
-
-    else:
-
-        if up > down:
-
-            direction = "UP"
-
-            score = min(
-                10,
-                round(
-                    up
-                    /
-                    max(
-                        10,
-                        total
-                    )
-                    *
-                    10
-                )
-            )
-
-            label = (
-                f"🟢 UP — {score}/10"
-            )
-
-        elif down > up:
-
-            direction = "DOWN"
-
-            score = min(
-                10,
-                round(
-                    down
-                    /
-                    max(
-                        10,
-                        total
-                    )
-                    *
-                    10
-                )
-            )
-
-            label = (
-                f"🔴 DOWN — {score}/10"
-            )
-
-        else:
-
-            direction = "WAIT"
-            score = 5
-            label = (
-                "🟡 WAIT — BALANCED"
-            )
-
-    if signal.get(
-        "reversal"
-    ) == "HIGH":
-
-        label = (
-            "🟡 WAIT — REVERSAL RISK"
-        )
-
-        direction = "WAIT"
-
-    if quality < 60:
-
-        label = (
-            "🟡 WAIT — DATA QUALITY"
-        )
-
-        direction = "WAIT"
-
-    if direction == "UP":
-
-        reasons.append(
-            f"{up} bullish confirmations"
-        )
-
-    elif direction == "DOWN":
-
-        reasons.append(
-            f"{down} bearish confirmations"
-        )
-
-    else:
-
-        reasons.append(
-            "Evidence is not aligned enough"
-        )
-
-    return {
-
-        "direction": direction,
-
-        "score": score,
-
-        "label": label,
-
-        "bullish_points": up,
-
-        "bearish_points": down,
-
-        "reasons": reasons
-    }
-
 
 # =========================================================
-# BTC HISTORY
+# ONE-MINUTE BTC HISTORY
 # =========================================================
 
-def get_history():
+def candles():
 
     now = time.time()
 
     if (
-        history_cache["candles"]
+        now - history_cache["time"] < 15
         and
-        now
-        -
-        history_cache["time"]
-        <
-        15
+        history_cache["candles"]
     ):
 
-        return history_cache[
-            "candles"
-        ]
+        return history_cache["candles"]
 
-    end = datetime.now(
-        timezone.utc
+    data = get_json(
+        "https://api.binance.com/api/v3/klines",
+        {
+            "symbol": "BTCUSDT",
+            "interval": "1m",
+            "limit": 21
+        }
     )
 
-    start = (
-        end
-        -
-        timedelta(
-            minutes=21
-        )
-    )
+    output = []
 
-    sources = [
+    if isinstance(data, list):
 
-        (
-            "Coinbase",
-            "https://api.exchange.coinbase.com/products/BTC-USD/candles",
-            {
-                "granularity": 60,
-                "start": start.isoformat(),
-                "end": end.isoformat()
-            }
-        ),
+        for row in data:
 
-        (
-            "Kraken",
-            "https://api.kraken.com/0/public/OHLC",
-            {
-                "pair": "XBTUSD",
-                "interval": 1
-            }
-        ),
+            try:
 
-        (
-            "Binance",
-            "https://api.binance.com/api/v3/klines",
-            {
-                "symbol": "BTCUSDT",
-                "interval": "1m",
-                "limit": 21
-            }
-        ),
-
-        (
-            "Binance",
-            "https://data-api.binance.vision/api/v3/klines",
-            {
-                "symbol": "BTCUSDT",
-                "interval": "1m",
-                "limit": 21
-            }
-        ),
-
-        (
-            "Binance.US",
-            "https://api.binance.us/api/v3/klines",
-            {
-                "symbol": "BTCUSD",
-                "interval": "1m",
-                "limit": 21
-            }
-        )
-    ]
-
-    for mode, url, params in sources:
-
-        data = get_json(
-            url,
-            params
-        )
-
-        candles = []
-
-        try:
-
-            if mode == "Coinbase":
-
-                for row in (
-                    data
-                    if isinstance(
-                        data,
-                        list
+                output.append(
+                    (
+                        float(row[0]) / 1000.0,
+                        float(row[4])
                     )
-                    else []
-                ):
-
-                    close = number(
-                        row[4]
-                    )
-
-                    if close is not None:
-
-                        candles.append(
-                            (
-                                float(
-                                    row[0]
-                                ),
-                                close
-                            )
-                        )
-
-            elif mode == "Kraken":
-
-                result = data[
-                    "result"
-                ]
-
-                pair = next(
-                    key
-                    for key in result
-                    if key != "last"
                 )
 
-                for row in (
-                    result[pair][-21:]
-                ):
+            except Exception:
+                pass
 
-                    close = number(
-                        row[4]
-                    )
+    if len(output) < 16:
 
-                    if close is not None:
+        data = get_json(
+            "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+            {
+                "granularity": 60
+            }
+        )
 
-                        candles.append(
-                            (
-                                float(
-                                    row[0]
-                                ),
-                                close
-                            )
+        if isinstance(data, list):
+
+            output = []
+
+            for row in data:
+
+                try:
+
+                    output.append(
+                        (
+                            float(row[0]),
+                            float(row[4])
                         )
-
-            else:
-
-                for row in (
-                    data
-                    if isinstance(
-                        data,
-                        list
-                    )
-                    else []
-                ):
-
-                    close = number(
-                        row[4]
                     )
 
-                    if close is not None:
+                except Exception:
+                    pass
 
-                        candles.append(
-                            (
-                                float(
-                                    row[0]
-                                )
-                                /
-                                1000,
-                                close
-                            )
-                        )
+            output.sort()
+            output = output[-21:]
 
-        except:
+    history_cache.update(
+        time=now,
+        candles=output
+    )
 
-            candles = []
-
-        candles.sort()
-
-        if len(candles) >= 16:
-
-            history_cache[
-                "time"
-            ] = now
-
-            history_cache[
-                "candles"
-            ] = candles
-
-            record_feed(
-                mode
-                +
-                " Candles",
-                candles[-1][1]
-            )
-
-            return candles
-
-    history_cache[
-        "time"
-    ] = now
-
-    history_cache[
-        "candles"
-    ] = []
-
-    return []
+    return output
 
 
 # =========================================================
 # MOMENTUM
 # =========================================================
 
-def momentum(
-    candles,
-    minutes
-):
+def momentum(candles_data, minutes):
 
-    if len(candles) < 2:
+    if len(candles_data) < 2:
         return None
 
-    current_time, current = (
-        candles[-1]
-    )
+    current = candles_data[-1][1]
 
     target_time = (
-        current_time
+        candles_data[-1][0]
         -
         minutes * 60
     )
 
-    previous = None
+    previous = next(
+        (
+            price
+            for timestamp, price
+            in reversed(candles_data[:-1])
+            if timestamp <= target_time
+        ),
+        None
+    )
 
-    for timestamp, close in reversed(
-        candles[:-1]
-    ):
-
-        if timestamp <= target_time:
-
-            previous = close
-
-            break
-
-    if not previous:
+    if previous is None:
         return None
 
     return (
-        (
-            current
-            -
-            previous
-        )
+        (current - previous)
         /
         previous
-    ) * 100
+        *
+        100
+    )
 
 
 # =========================================================
-# STRUCTURE
+# PRICE STRUCTURE
 # =========================================================
 
-def price_structure(
-    candles
-):
+def structure(candles_data):
 
-    if len(candles) < 8:
+    if len(candles_data) < 8:
         return "WAIT"
 
-    values = [
-        close
-        for _, close
-        in candles[-8:]
+    first = [
+        price
+        for _, price
+        in candles_data[-8:-4]
     ]
 
-    first = values[:4]
-    second = values[4:]
+    second = [
+        price
+        for _, price
+        in candles_data[-4:]
+    ]
 
     if (
-        max(second)
-        >
-        max(first)
+        max(second) > max(first)
         and
-        min(second)
-        >
-        min(first)
+        min(second) > min(first)
     ):
 
-        return (
-            "HIGHER HIGHS / HIGHER LOWS"
-        )
+        return "HIGHER HIGHS / HIGHER LOWS"
 
     if (
-        max(second)
-        <
-        max(first)
+        max(second) < max(first)
         and
-        min(second)
-        <
-        min(first)
+        min(second) < min(first)
     ):
 
-        return (
-            "LOWER HIGHS / LOWER LOWS"
-        )
+        return "LOWER HIGHS / LOWER LOWS"
 
     return "MIXED"
 
@@ -1931,33 +598,23 @@ def price_structure(
 # KALSHI NORMALIZATION
 # =========================================================
 
-def normalize_market(
-    market
-):
+def normalize_market(market):
 
     if (
-        not isinstance(
-            market,
-            dict
-        )
+        not isinstance(market, dict)
         or
-        not market.get(
-            "ticker"
-        )
+        not market.get("ticker")
     ):
 
         return None
 
-    def probability(
-        *keys
-    ):
+
+    def probability(*keys):
 
         for key in keys:
 
-            value = number(
-                market.get(
-                    key
-                )
+            value = num(
+                market.get(key)
             )
 
             if value is not None:
@@ -1969,6 +626,7 @@ def normalize_market(
 
         return None
 
+
     target = None
 
     for key in (
@@ -1979,66 +637,49 @@ def normalize_market(
         "cap_strike"
     ):
 
-        value = number(
-            market.get(
-                key
-            )
+        value = num(
+            market.get(key)
         )
 
         if value is not None:
 
             target = value
-
             break
 
+
     return {
+        "ticker": market.get("ticker"),
 
-        "ticker":
-            market.get(
-                "ticker"
-            ),
+        "target": target,
 
-        "target":
-            target,
+        "yes_bid": probability(
+            "yes_bid_dollars",
+            "yes_bid"
+        ),
 
-        "yes_bid":
-            probability(
-                "yes_bid_dollars",
-                "yes_bid"
-            ),
+        "yes_ask": probability(
+            "yes_ask_dollars",
+            "yes_ask"
+        ),
 
-        "yes_ask":
-            probability(
-                "yes_ask_dollars",
-                "yes_ask"
-            ),
+        "last": probability(
+            "last_price_dollars",
+            "last_price"
+        ),
 
-        "last":
-            probability(
-                "last_price_dollars",
-                "last_price"
-            ),
-
-        "close_time":
-            (
-                market.get(
-                    "close_time"
-                )
-                or
-                market.get(
-                    "expiration_time"
-                )
-            )
+        "close_time": (
+            market.get("close_time")
+            or
+            market.get("expiration_time")
+        )
     }
 
 
 # =========================================================
-# KALSHI
+# KALSHI MARKET
 # =========================================================
 
 def get_kalshi():
-
-    global kalshi_last_update
 
     if KALSHI_TICKER:
 
@@ -2048,59 +689,45 @@ def get_kalshi():
                 f"{base}/markets/{KALSHI_TICKER}"
             )
 
-            if isinstance(
-                data,
-                dict
-            ):
-
-                market = normalize_market(
-                    data.get(
-                        "market",
-                        data
-                    )
+            market = normalize_market(
+                data.get(
+                    "market",
+                    data
                 )
+                if isinstance(data, dict)
+                else None
+            )
 
-                if market:
+            if market:
+                return market
 
-                    kalshi_last_update = (
-                        time.time()
-                    )
-
-                    return market
 
     for base in KALSHI_BASES:
 
         data = get_json(
             f"{base}/markets",
             {
-                "series_ticker":
-                    KALSHI_SERIES,
-
-                "status":
-                    "open",
-
-                "limit":
-                    100
+                "series_ticker": KALSHI_SERIES,
+                "status": "open",
+                "limit": 100
             }
         )
 
         markets = (
-            data.get(
-                "markets",
-                []
-            )
-            if isinstance(
-                data,
-                dict
-            )
+            data.get("markets", [])
+            if isinstance(data, dict)
             else []
         )
 
-        candidates = []
-
-        now = time.time()
+        valid = []
 
         for market in markets:
+
+            close = parse_time(
+                market.get("close_time")
+                or
+                market.get("expiration_time")
+            )
 
             ticker = str(
                 market.get(
@@ -2109,235 +736,207 @@ def get_kalshi():
                 )
             ).upper()
 
-            if not ticker.startswith(
-                KALSHI_SERIES
-            ):
-                continue
-
-            close = parse_time(
-                market.get(
-                    "close_time"
-                )
-                or
-                market.get(
-                    "expiration_time"
-                )
-            )
-
             if (
+                ticker.startswith(
+                    KALSHI_SERIES
+                )
+                and
                 close
                 and
-                close.timestamp()
-                >
-                now
+                close.timestamp() > time.time()
             ):
 
-                candidates.append(
-                    market
+                valid.append(
+                    (
+                        close.timestamp(),
+                        market
+                    )
                 )
 
-        candidates.sort(
-            key=lambda market:
-            parse_time(
-                market.get(
-                    "close_time"
-                )
-                or
-                market.get(
-                    "expiration_time"
-                )
-            ).timestamp()
-        )
+        if valid:
 
-        if candidates:
-
-            kalshi_last_update = (
-                time.time()
+            valid.sort(
+                key=lambda x: x[0]
             )
 
             return normalize_market(
-                candidates[0]
+                valid[0][1]
             )
 
     return None
 
 
-def yes_mid(
-    market
-):
-
-    if not market:
-        return None
-
-    bid = market.get(
-        "yes_bid"
-    )
-
-    ask = market.get(
-        "yes_ask"
-    )
-
-    if (
-        bid is not None
-        and
-        ask is not None
-    ):
-
-        return (
-            bid
-            +
-            ask
-        ) / 2
-
-    return market.get(
-        "last"
-    )
-
-
 # =========================================================
-# QUALITY
+# BUYER / SELLER PRESSURE
 # =========================================================
 
-def calculate_quality(
-    feeds,
-    market,
-    candles
-):
+def get_pressure():
 
-    values = [
-        value
-        for value in feeds.values()
-        if value is not None
-    ]
+    data = get_json(
+        "https://api.binance.com/api/v3/aggTrades",
+        {
+            "symbol": "BTCUSDT",
+            "limit": 1000
+        }
+    )
 
-    live = len(values)
+    if not isinstance(data, list):
 
-    score = 0
+        return {
+            "winner": "UNAVAILABLE",
+            "buy_pct": None,
+            "sell_pct": None,
+            "delta": None,
+            "trades": 0
+        }
 
-    if live >= 4:
+    buyers = 0.0
+    sellers = 0.0
 
-        score += 35
+    for trade in data:
 
-    elif live == 3:
-
-        score += 30
-
-    elif live == 2:
-
-        score += 20
-
-    elif live == 1:
-
-        score += 8
-
-    score += 25
-
-    spread = 0
-
-    if len(values) >= 2:
-
-        med = statistics.median(
-            values
+        quantity = num(
+            trade.get("q")
         )
 
-        if med:
+        price = num(
+            trade.get("p")
+        )
 
-            spread = (
-                max(values)
-                -
-                min(values)
-            )
+        if not quantity or not price:
+            continue
+
+        value = (
+            quantity
+            *
+            price
+        )
+
+        if trade.get("m"):
+            sellers += value
+        else:
+            buyers += value
+
+    total = (
+        buyers
+        +
+        sellers
+    )
+
+    buy_pct = (
+        buyers
+        /
+        total
+        *
+        100
+        if total
+        else None
+    )
+
+    sell_pct = (
+        sellers
+        /
+        total
+        *
+        100
+        if total
+        else None
+    )
+
+    if buyers > sellers:
+        winner = "BUYERS"
+    elif sellers > buyers:
+        winner = "SELLERS"
+    else:
+        winner = "BALANCED"
+
+    return {
+        "winner": winner,
+        "buy_pct": buy_pct,
+        "sell_pct": sell_pct,
+        "delta": buyers - sellers,
+        "trades": len(data)
+    }
+
+
+# =========================================================
+# ORDER BOOK
+# =========================================================
+
+def get_orderbook():
+
+    data = get_json(
+        "https://api.binance.com/api/v3/depth",
+        {
+            "symbol": "BTCUSDT",
+            "limit": 100
+        }
+    )
+
+    if not isinstance(data, dict):
+
+        return {
+            "winner": "UNAVAILABLE",
+            "bid_pct": None,
+            "ask_pct": None
+        }
+
+    bids = sum(
+        (
+            num(row[1]) or 0
+        )
+        for row in data.get(
+            "bids",
+            []
+        )
+    )
+
+    asks = sum(
+        (
+            num(row[1]) or 0
+        )
+        for row in data.get(
+            "asks",
+            []
+        )
+    )
+
+    total = (
+        bids
+        +
+        asks
+    )
+
+    if bids > asks:
+        winner = "BIDS"
+    elif asks > bids:
+        winner = "ASKS"
+    else:
+        winner = "BALANCED"
+
+    return {
+        "winner": winner,
+
+        "bid_pct": (
+            bids
             /
-            med
+            total
             *
             100
+            if total
+            else None
+        ),
 
-    if spread <= 0.03:
-
-        score += 30
-
-    elif spread <= 0.08:
-
-        score += 25
-
-    elif spread <= 0.20:
-
-        score += 15
-
-    elif spread <= 0.35:
-
-        score += 5
-
-    kalshi_score = 0
-
-    if market:
-
-        if market.get(
-            "ticker"
-        ):
-
-            kalshi_score += 30
-
-        if market.get(
-            "target"
-        ) is not None:
-
-            kalshi_score += 25
-
-        if yes_mid(
-            market
-        ) is not None:
-
-            kalshi_score += 25
-
-        if market.get(
-            "close_time"
-        ):
-
-            kalshi_score += 20
-
-    score = (
-        score * 0.60
-        +
-        kalshi_score * 0.25
-    )
-
-    if len(candles) >= 20:
-
-        score += 15
-
-    elif len(candles) >= 16:
-
-        score += 10
-
-    elif len(candles) >= 10:
-
-        score += 5
-
-    score = round(
-        min(
-            100,
-            score
+        "ask_pct": (
+            asks
+            /
+            total
+            *
+            100
+            if total
+            else None
         )
-    )
-
-    grade = (
-        "HIGH"
-        if score >= 85
-        else
-        "GOOD"
-        if score >= 70
-        else
-        "FAIR"
-        if score >= 50
-        else
-        "LOW"
-    )
-
-    return (
-        score,
-        grade
-    )
+    }
 
 
 # =========================================================
@@ -2347,108 +946,74 @@ def calculate_quality(
 def build_signal(
     price,
     market,
-    candles,
-    quality
+    candles_data,
+    pressure
 ):
 
     m1 = momentum(
-        candles,
+        candles_data,
         1
     )
 
     m5 = momentum(
-        candles,
+        candles_data,
         5
     )
 
     m15 = momentum(
-        candles,
+        candles_data,
         15
     )
 
-    structure = price_structure(
-        candles
+    price_structure = structure(
+        candles_data
     )
-
-    signal = {
-
-        "verdict":
-            "WAIT",
-
-        "label":
-            "🟡 WAIT",
-
-        "confidence":
-            0,
-
-        "score":
-            0,
-
-        "bullish":
-            0,
-
-        "bearish":
-            0,
-
-        "m1":
-            m1,
-
-        "m5":
-            m5,
-
-        "m15":
-            m15,
-
-        "structure":
-            structure,
-
-        "acceleration":
-            "STABLE / MIXED",
-
-        "reversal":
-            "LOW",
-
-        "quality_score":
-            quality,
-
-        "reasons":
-            []
-    }
 
     if (
         price is None
         or
         not market
         or
-        market.get(
-            "target"
-        ) is None
+        market.get("target") is None
         or
-        len(candles) < 16
+        len(candles_data) < 16
     ):
 
-        signal[
-            "reasons"
-        ] = [
-            "Waiting for live BTC history and Kalshi target."
-        ]
+        return {
+            "verdict": "WAIT",
+            "label": "🟡 WAIT",
+            "confidence": 0,
+            "score": 0,
+            "bullish": 0,
+            "bearish": 0,
+            "m1": m1,
+            "m5": m5,
+            "m15": m15,
+            "structure": price_structure,
+            "reversal": "LOW",
+            "reasons": [
+                "Waiting for live BTC history and Kalshi target."
+            ]
+        }
 
-        return signal
-
-    target = market[
-        "target"
-    ]
 
     bullish = 0
     bearish = 0
+
+    reasons = []
+
+    target = market["target"]
+
+
+    # -----------------------------------------------------
+    # PRICE VS KALSHI TARGET
+    # -----------------------------------------------------
 
     if price > target:
 
         bullish += 2
 
-        signal[
-            "reasons"
-        ].append(
+        reasons.append(
             "BTC is above the Kalshi target."
         )
 
@@ -2456,11 +1021,14 @@ def build_signal(
 
         bearish += 2
 
-        signal[
-            "reasons"
-        ].append(
+        reasons.append(
             "BTC is below the Kalshi target."
         )
+
+
+    # -----------------------------------------------------
+    # MULTI-TIMEFRAME MOMENTUM
+    # -----------------------------------------------------
 
     for value in (
         m1,
@@ -2472,98 +1040,59 @@ def build_signal(
             continue
 
         if value > 0:
-
             bullish += 2
 
         elif value < 0:
-
             bearish += 2
 
-    if structure.startswith(
+
+    # -----------------------------------------------------
+    # PRICE STRUCTURE
+    # -----------------------------------------------------
+
+    if price_structure.startswith(
         "HIGHER"
     ):
 
         bullish += 2
 
-        signal[
-            "reasons"
-        ].append(
+        reasons.append(
             "Price structure is bullish."
         )
 
-    elif structure.startswith(
+    elif price_structure.startswith(
         "LOWER"
     ):
 
         bearish += 2
 
-        signal[
-            "reasons"
-        ].append(
+        reasons.append(
             "Price structure is bearish."
         )
 
+
+    # -----------------------------------------------------
+    # KALSHI YES
+    # -----------------------------------------------------
+
+    yes = None
+
     if (
-        m1 is not None
+        market.get("yes_bid") is not None
         and
-        m5 is not None
-        and
-        m15 is not None
+        market.get("yes_ask") is not None
     ):
 
-        if (
-            m1 < -0.01
-            and
-            m5 < -0.02
-            and
-            m15 < -0.04
-        ):
+        yes = (
+            market["yes_bid"]
+            +
+            market["yes_ask"]
+        ) / 2
 
-            signal[
-                "acceleration"
-            ] = (
-                "ACCELERATING DOWN"
-            )
+    elif market.get("last") is not None:
 
-            bearish += 2
+        yes = market["last"]
 
-        elif (
-            m1 > 0.01
-            and
-            m5 > 0.02
-            and
-            m15 > 0.04
-        ):
-
-            signal[
-                "acceleration"
-            ] = (
-                "ACCELERATING UP"
-            )
-
-            bullish += 2
-
-        if (
-            m15 < 0
-            and
-            m5 < 0
-            and
-            m1 > 0
-        ) or (
-            m15 > 0
-            and
-            m5 > 0
-            and
-            m1 < 0
-        ):
-
-            signal[
-                "reversal"
-            ] = "HIGH"
-
-    yes = yes_mid(
-        market
-    )
 
     if yes is not None:
 
@@ -2571,9 +1100,7 @@ def build_signal(
 
             bullish += 1
 
-            signal[
-                "reasons"
-            ].append(
+            reasons.append(
                 "Kalshi YES is favoring UP."
             )
 
@@ -2581,11 +1108,73 @@ def build_signal(
 
             bearish += 1
 
-            signal[
-                "reasons"
-            ].append(
+            reasons.append(
                 "Kalshi YES is favoring DOWN."
             )
+
+
+    # -----------------------------------------------------
+    # TRADE PRESSURE
+    # -----------------------------------------------------
+
+    if pressure.get(
+        "winner"
+    ) == "BUYERS":
+
+        bullish += 1
+
+        reasons.append(
+            "Recent Binance trade flow favors buyers."
+        )
+
+    elif pressure.get(
+        "winner"
+    ) == "SELLERS":
+
+        bearish += 1
+
+        reasons.append(
+            "Recent Binance trade flow favors sellers."
+        )
+
+
+    # -----------------------------------------------------
+    # REVERSAL DETECTION
+    # -----------------------------------------------------
+
+    reversal = "LOW"
+
+    if (
+        (m15 or 0) < 0
+        and
+        (m5 or 0) < 0
+        and
+        (m1 or 0) > 0
+    ):
+
+        reversal = "HIGH"
+
+    elif (
+        (m15 or 0) > 0
+        and
+        (m5 or 0) > 0
+        and
+        (m1 or 0) < 0
+    ):
+
+        reversal = "HIGH"
+
+
+    if reversal == "HIGH":
+
+        reasons.append(
+            "Short-term momentum is conflicting with the larger trend."
+        )
+
+
+    # -----------------------------------------------------
+    # FINAL DECISION
+    # -----------------------------------------------------
 
     total = (
         bullish
@@ -2599,890 +1188,199 @@ def build_signal(
         bearish
     )
 
+    verdict = "WAIT"
+    label = "🟡 WAIT"
+
     if (
-        total >= 7
+        reversal != "HIGH"
+        and
+        total >= 6
         and
         difference >= 3
     ):
 
         if bullish > bearish:
 
-            signal[
-                "verdict"
-            ] = "UP"
+            verdict = "UP"
 
-            signal[
-                "label"
-            ] = (
-                "🟢 UP — STRONG CONFIRMATION"
+            label = (
+                "🟢 UP — STRONG SETUP"
             )
 
         else:
 
-            signal[
-                "verdict"
-            ] = "DOWN"
+            verdict = "DOWN"
 
-            signal[
-                "label"
-            ] = (
-                "🔴 DOWN — STRONG CONFIRMATION"
+            label = (
+                "🔴 DOWN — STRONG SETUP"
             )
 
-        signal[
-            "confidence"
-        ] = min(
+
+    if verdict != "WAIT":
+
+        confidence = min(
             96,
-            60
-            +
-            difference * 5
-            +
-            min(
-                quality * 0.10,
-                8
-            )
-        )
-
-    elif (
-        total >= 5
-        and
-        difference >= 2
-    ):
-
-        if bullish > bearish:
-
-            signal[
-                "verdict"
-            ] = "UP"
-
-            signal[
-                "label"
-            ] = (
-                "🟢 UP — CONFIRMING"
-            )
-
-        else:
-
-            signal[
-                "verdict"
-            ] = "DOWN"
-
-            signal[
-                "label"
-            ] = (
-                "🔴 DOWN — CONFIRMING"
-            )
-
-        signal[
-            "confidence"
-        ] = min(
-            88,
-            55
-            +
-            difference * 5
-            +
-            min(
-                quality * 0.10,
-                8
-            )
+            50 + difference * 7
         )
 
     else:
 
-        signal[
-            "reasons"
-        ].append(
-            "Signals are not aligned strongly enough."
+        confidence = min(
+            49,
+            35 + difference * 3
         )
 
-    if (
-        signal[
-            "reversal"
-        ]
-        ==
-        "HIGH"
-    ):
 
-        signal[
-            "verdict"
-        ] = "WAIT"
-
-        signal[
-            "label"
-        ] = (
-            "🟡 WAIT — REVERSAL RISK"
-        )
-
-        signal[
-            "confidence"
-        ] = 0
-
-    countdown = seconds_left(
-        market.get(
-            "close_time"
-        )
-    )
-
-    if (
-        countdown is not None
-        and
-        countdown <= 60
-    ):
-
-        signal[
-            "verdict"
-        ] = "WAIT"
-
-        signal[
-            "label"
-        ] = (
-            "🟡 WAIT — FINAL-MINUTE BRAKE"
-        )
-
-        signal[
-            "confidence"
-        ] = 0
-
-    signal[
-        "bullish"
-    ] = bullish
-
-    signal[
-        "bearish"
-    ] = bearish
-
-    signal[
-        "score"
-    ] = (
-        bullish
-        -
-        bearish
-    )
-
-    return signal
-
-
-# =========================================================
-# SIGNAL MEMORY TRACKING
-# =========================================================
-
-def update_memory(
-    market,
-    price,
-    signal,
-    distance_pct
-):
-
-    global active_market
-
-    load_memory()
-
-    close = parse_time(
-        market.get(
-            "close_time"
-        )
-    )
-
-    close_ts = (
-        close.timestamp()
-        if close
-        else
-        time.time() + 900
-    )
-
-    ticker = market.get(
-        "ticker"
-    )
-
-    if (
-        active_market is None
-        or
-        active_market.get(
-            "ticker"
-        )
-        !=
-        ticker
-    ):
-
-        active_market = {
-
-            "ticker":
-                ticker,
-
-            "close_ts":
-                close_ts,
-
-            "target":
-                market.get(
-                    "target"
-                ),
-
-            "direction":
-                (
-                    signal[
-                        "verdict"
-                    ]
-                    if signal[
-                        "verdict"
-                    ]
-                    in (
-                        "UP",
-                        "DOWN"
-                    )
-                    else
-                    "WAIT"
-                ),
-
-            "m1":
-                signal.get(
-                    "m1"
-                ),
-
-            "m5":
-                signal.get(
-                    "m5"
-                ),
-
-            "m15":
-                signal.get(
-                    "m15"
-                ),
-
-            "distance":
-                distance_pct,
-
-            "structure":
-                signal.get(
-                    "structure"
-                ),
-
-            "last_price":
-                price
-        }
-
-    else:
-
-        active_market[
-            "last_price"
-        ] = price
-
-        active_market[
-            "m1"
-        ] = signal.get(
-            "m1"
-        )
-
-        active_market[
-            "m5"
-        ] = signal.get(
-            "m5"
-        )
-
-        active_market[
-            "m15"
-        ] = signal.get(
-            "m15"
-        )
-
-        active_market[
-            "distance"
-        ] = distance_pct
-
-        active_market[
-            "structure"
-        ] = signal.get(
-            "structure"
-        )
-
-        if (
-            signal[
-                "verdict"
-            ]
-            in (
-                "UP",
-                "DOWN"
-            )
-            and
-            active_market[
-                "direction"
-            ]
-            ==
-            "WAIT"
-        ):
-
-            active_market[
-                "direction"
-            ] = signal[
-                "verdict"
-            ]
-
-    if (
-        time.time()
-        >=
-        active_market.get(
-            "close_ts",
-            0
-        )
-    ):
-
-        record = active_market
-
-        target = record.get(
-            "target"
-        )
-
-        final_price = record.get(
-            "last_price"
-        )
-
-        if (
-            target is not None
-            and
-            final_price is not None
-        ):
-
-            if final_price > target:
-
-                outcome = "UP"
-
-            elif final_price < target:
-
-                outcome = "DOWN"
-
-            else:
-
-                outcome = "PUSH"
-
-            signal_memory.append({
-
-                **record,
-
-                "outcome":
-                    outcome,
-
-                "resolved":
-                    datetime.now(
-                        timezone.utc
-                    ).isoformat()
-            })
-
-            signal_memory[:] = (
-                signal_memory[-500:]
-            )
-
-            save_memory()
-
-        active_market = None
-
-
-# =========================================================
-# SIGNAL MEMORY MATCHING
-# =========================================================
-
-def memory_match(
-    signal,
-    distance_pct
-):
-
-    load_memory()
-
-    if signal.get(
-        "verdict"
-    ) not in (
-        "UP",
-        "DOWN"
-    ):
-
-        return (
-            0,
-            None
-        )
-
-    current = {
-
-        "direction":
-            signal[
-                "verdict"
-            ],
-
-        "m1":
-            signal.get(
-                "m1"
-            ),
-
-        "m5":
-            signal.get(
-                "m5"
-            ),
-
-        "m15":
-            signal.get(
-                "m15"
-            ),
-
-        "distance":
-            distance_pct,
-
-        "structure":
-            signal.get(
-                "structure"
-            )
+    return {
+        "verdict": verdict,
+        "label": label,
+        "confidence": confidence,
+        "score": total,
+        "bullish": bullish,
+        "bearish": bearish,
+        "m1": m1,
+        "m5": m5,
+        "m15": m15,
+        "structure": price_structure,
+        "reversal": reversal,
+        "reasons": reasons
     }
 
-    matches = []
-
-    for record in signal_memory:
-
-        if (
-            record.get(
-                "direction"
-            )
-            not in (
-                "UP",
-                "DOWN"
-            )
-        ):
-            continue
-
-        if (
-            record.get(
-                "outcome"
-            )
-            not in (
-                "UP",
-                "DOWN"
-            )
-        ):
-            continue
-
-        points = 0
-        total = 0
-
-        for key, tolerance in (
-            ("m1", 0.025),
-            ("m5", 0.05),
-            ("m15", 0.08),
-            ("distance", 0.10)
-        ):
-
-            a = current.get(
-                key
-            )
-
-            b = record.get(
-                key
-            )
-
-            if (
-                a is not None
-                and
-                b is not None
-            ):
-
-                total += 1
-
-                if (
-                    abs(
-                        a - b
-                    )
-                    <=
-                    tolerance
-                ):
-
-                    points += 1
-
-        if (
-            current.get(
-                "structure"
-            )
-            ==
-            record.get(
-                "structure"
-            )
-        ):
-
-            total += 1
-
-            points += 1
-
-        if (
-            total
-            and
-            points / total
-            >=
-            0.67
-        ):
-
-            matches.append(
-                record
-            )
-
-    matches = matches[-25:]
-
-    if not matches:
-
-        return (
-            0,
-            None
-        )
-
-    wins = sum(
-        1
-        for record
-        in matches
-        if record.get(
-            "outcome"
-        )
-        ==
-        current[
-            "direction"
-        ]
-    )
-
-    rate = (
-        wins
-        /
-        len(matches)
-    ) * 100
-
-    return (
-        len(matches),
-        rate
-    )
-
 
 # =========================================================
-# COLLECT STATE
+# DATA COLLECTION
 # =========================================================
 
 def collect_state():
 
-    load_memory()
-
-    price, feeds = (
-        get_spot_feeds()
-    )
-
-    candles = get_history()
+    price, source = spot_price()
 
     market = get_kalshi()
 
-    buy_sell = (
-        get_buy_sell_pressure()
-    )
+    candle_data = candles()
 
-    order_book = (
-        get_order_book_pressure()
-    )
+    pressure = get_pressure()
 
-    quality_score, quality_grade = (
-        calculate_quality(
-            feeds,
-            market,
-            candles
-        )
-    )
+    book = get_orderbook()
 
     signal = build_signal(
         price,
         market,
-        candles,
-        quality_score
+        candle_data,
+        pressure
     )
 
-    target = (
-        market.get(
-            "target"
-        )
-        if market
-        else
-        None
-    )
 
-    distance_pct = None
+    # -----------------------------------------------------
+    # DATA QUALITY
+    # -----------------------------------------------------
 
-    if (
-        price is not None
-        and
-        target is not None
-    ):
+    quality_score = 0
 
-        distance_pct = (
-            (
-                price
-                -
-                target
-            )
-            /
-            target
-        ) * 100
+    if price is not None:
+        quality_score += 35
 
     if (
         market
         and
-        price is not None
+        market.get("target") is not None
     ):
 
-        update_memory(
-            market,
-            price,
-            signal,
-            distance_pct
-        )
+        quality_score += 35
 
-    matches = 0
-    rate = None
+    if len(candle_data) >= 16:
+        quality_score += 30
+
+
+    if quality_score >= 85:
+        quality_grade = "HIGH"
+
+    elif quality_score >= 70:
+        quality_grade = "GOOD"
+
+    else:
+        quality_grade = "FAIR"
+
+
+    # -----------------------------------------------------
+    # COUNTDOWN
+    # -----------------------------------------------------
+
+    countdown = None
 
     if (
         market
         and
-        signal[
-            "verdict"
-        ]
-        in (
-            "UP",
-            "DOWN"
-        )
+        market.get("close_time")
     ):
 
-        matches, rate = (
-            memory_match(
-                signal,
-                distance_pct
-            )
+        close = parse_time(
+            market["close_time"]
         )
 
-        if (
-            matches >= 3
-            and
-            rate is not None
-        ):
+        if close:
 
-            if rate >= 70:
-
-                signal[
-                    "confidence"
-                ] = min(
-                    98,
-                    signal[
-                        "confidence"
-                    ]
-                    +
-                    5
-                )
-
-                signal[
-                    "reasons"
-                ].append(
-                    "Memory: "
-                    +
-                    str(matches)
-                    +
-                    " similar setups, "
-                    +
-                    f"{rate:.0f}% favored this direction."
-                )
-
-            elif rate <= 40:
-
-                signal[
-                    "confidence"
-                ] = max(
-                    0,
-                    signal[
-                        "confidence"
-                    ]
+            countdown = max(
+                0,
+                int(
+                    close.timestamp()
                     -
-                    8
+                    time.time()
                 )
+            )
 
-                signal[
-                    "reasons"
-                ].append(
-                    "Memory warning: similar setups favored against this direction."
-                )
 
-    strength = prediction_strength(
-        signal,
-        price,
-        market,
-        buy_sell,
-        order_book,
-        quality_score,
-        rate,
-        matches
-    )
+    # -----------------------------------------------------
+    # LIVE LATENCY
+    # -----------------------------------------------------
+
+    with lock:
+
+        if live["received"]:
+
+            age = (
+                time.time()
+                -
+                live["received"]
+            ) * 1000
+
+        else:
+
+            age = None
+
+        stream_connected = bool(
+            live["connected"]
+        )
+
 
     return {
+        "btc": price,
 
-        "updated":
-            datetime.now(
-                timezone.utc
-            ).isoformat(),
+        "source": source,
 
-        "btc":
-            price,
+        "market": market,
 
-        "feeds":
-            feeds,
+        "countdown": countdown,
 
-        "market":
-            market,
+        "candles": len(
+            candle_data
+        ),
 
-        "countdown":
-            (
-                seconds_left(
-                    market.get(
-                        "close_time"
-                    )
-                )
-                if market
-                else
-                None
-            ),
+        "signal": signal,
 
-        "candles":
-            len(candles),
+        "buy_sell": pressure,
 
-        "signal":
-            signal,
+        "order_book": book,
 
-        "data_quality":
-            {
-                "score":
-                    quality_score,
-
-                "grade":
-                    quality_grade
-            },
-
-        "buy_sell":
-            buy_sell,
-
-        "order_book":
-            order_book,
-
-        "prediction_strength":
-            strength,
-
-        "latency": {
-
-            "btc_age_ms":
-                (
-                    round(
-                        max(
-                            0.0,
-                            time.time()
-                            -
-                            live_btc.get(
-                                "received_at",
-                                0.0
-                            )
-                        )
-                        *
-                        1000,
-                        1
-                    )
-                    if
-                    live_btc.get(
-                        "received_at"
-                    )
-                    else
-                    None
-                ),
-
-            "btc_stream":
-                bool(
-                    live_btc.get(
-                        "connected"
-                    )
-                    and
-                    live_btc.get(
-                        "received_at"
-                    )
-                    and
-                    time.time()
-                    -
-                    live_btc.get(
-                        "received_at",
-                        0.0
-                    )
-                    <
-                    3
-                ),
-
-            "kalshi_age_ms":
-                (
-                    round(
-                        max(
-                            0.0,
-                            time.time()
-                            -
-                            kalshi_last_update
-                        )
-                        *
-                        1000,
-                        1
-                    )
-                    if
-                    kalshi_last_update
-                    else
-                    None
-                ),
-
-            "spot_source":
-                (
-                    live_btc.get(
-                        "source"
-                    )
-                    if
-                    live_btc.get(
-                        "received_at"
-                    )
-                    else
-                    None
-                ),
-
-            "state_cache_seconds":
-                CACHE_SECONDS
+        "quality": {
+            "score": quality_score,
+            "grade": quality_grade
         },
 
-        "memory":
-            {
-
-                "records":
-                    len(
-                        signal_memory
-                    ),
-
-                "matches":
-                    matches,
-
-                "rate":
-                    rate,
-
-                "up":
-                    sum(
-                        r.get(
-                            "outcome"
-                        )
-                        ==
-                        "UP"
-                        for r
-                        in signal_memory
-                    ),
-
-                "down":
-                    sum(
-                        r.get(
-                            "outcome"
-                        )
-                        ==
-                        "DOWN"
-                        for r
-                        in signal_memory
-                    )
-            }
+        "latency": {
+            "btc_age_ms": age,
+            "btc_stream": stream_connected
+        }
     }
 
 
@@ -3490,7 +1388,7 @@ def collect_state():
 # DASHBOARD
 # =========================================================
 
-PAGE = r"""
+PAGE = r'''
 <!doctype html>
 
 <html>
@@ -3498,141 +1396,307 @@ PAGE = r"""
 <head>
 
 <meta name="viewport"
-content="width=device-width,initial-scale=1">
+      content="width=device-width,initial-scale=1">
 
-<title>BTC Strike AI</title>
+<title>
+BTC Strike AI
+</title>
 
 <style>
 
-body{
-margin:0;
-background:#071019;
-color:#eef4f8;
-font-family:Arial,sans-serif
+* {
+    box-sizing: border-box;
 }
 
-.wrap{
-max-width:1150px;
-margin:auto;
-padding:18px
+body {
+
+    margin: 0;
+
+    background:
+        #070b12;
+
+    color:
+        #e9eef7;
+
+    font-family:
+        Arial,
+        sans-serif;
 }
 
-.grid{
-display:grid;
-grid-template-columns:repeat(4,1fr);
-gap:12px
+main {
+
+    max-width:
+        1100px;
+
+    margin:
+        auto;
+
+    padding:
+        18px;
 }
 
-.card{
-background:#0d1822;
-border:1px solid #1c2c38;
-border-radius:14px;
-padding:16px
+.top {
+
+    display:
+        flex;
+
+    justify-content:
+        space-between;
+
+    gap:
+        12px;
+
+    align-items:
+        center;
 }
 
-.wide{
-grid-column:1/-1
+.title {
+
+    font-size:
+        28px;
+
+    font-weight:
+        800;
 }
 
-.verdict{
-text-align:center;
-padding:25px;
-border-radius:16px;
-margin-bottom:14px
+.sub {
+
+    color:
+        #8d9aae;
 }
 
-.up{
-background:#092b1a;
-border:1px solid #1b9b5c
+.verdict {
+
+    margin-top:
+        16px;
+
+    border-radius:
+        16px;
+
+    padding:
+        20px;
+
+    text-align:
+        center;
+
+    border:
+        1px solid #263142;
 }
 
-.down{
-background:#321014;
-border:1px solid #d44754
+.verdict.up {
+
+    background:
+        #082e1c;
+
+    border-color:
+        #18b66a;
 }
 
-.wait{
-background:#30280b;
-border:1px solid #c4a63a
+.verdict.down {
+
+    background:
+        #3a1015;
+
+    border-color:
+        #ef4d5b;
 }
 
-.label{
-font-size:30px;
-font-weight:900
+.verdict.wait {
+
+    background:
+        #3a2d08;
+
+    border-color:
+        #e5b63f;
 }
 
-.big{
-font-size:27px;
-font-weight:800;
-margin-top:8px
+.verdictLabel {
+
+    font-size:
+        30px;
+
+    font-weight:
+        900;
 }
 
-.value{
-font-size:20px;
-font-weight:700;
-margin-top:8px
+.grid {
+
+    display:
+        grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap:
+        12px;
+
+    margin-top:
+        14px;
 }
 
-.small{
-color:#91a3b0;
-font-size:13px;
-margin-top:5px
+.card {
+
+    background:
+        #101722;
+
+    border:
+        1px solid #263142;
+
+    border-radius:
+        14px;
+
+    padding:
+        16px;
+
+    min-height:
+        105px;
 }
 
-.ok{
-color:#43d184
+.wide {
+
+    grid-column:
+        span 2;
 }
 
-.bad{
-color:#ff6570
+.label {
+
+    font-size:
+        12px;
+
+    color:
+        #8996a8;
+
+    font-weight:
+        700;
+
+    letter-spacing:
+        .08em;
 }
 
-.battle{
-display:flex;
-justify-content:space-between;
-gap:10px;
-margin-top:12px;
-font-size:16px;
-font-weight:800
+.big {
+
+    font-size:
+        28px;
+
+    font-weight:
+        800;
+
+    margin-top:
+        9px;
 }
 
-.battleBar{
-height:12px;
-background:#182632;
-border-radius:8px;
-overflow:hidden;
-margin-top:10px
+.value {
+
+    font-size:
+        18px;
+
+    font-weight:
+        700;
+
+    margin-top:
+        10px;
 }
 
-.battleBuy{
-height:100%;
-background:#1b9b5c
+.small {
+
+    font-size:
+        13px;
+
+    color:
+        #9aa7b9;
+
+    margin-top:
+        7px;
 }
 
-.battleSell{
-height:100%;
-background:#d44754;
-float:right
+.bar {
+
+    height:
+        16px;
+
+    background:
+        #252e3b;
+
+    border-radius:
+        10px;
+
+    overflow:
+        hidden;
+
+    margin-top:
+        10px;
 }
 
-@media(max-width:800px){
+.bar > div {
 
-.grid{
-grid-template-columns:repeat(2,1fr)
+    height:
+        100%;
+
+    background:
+        #18b66a;
 }
 
+.row {
+
+    display:
+        flex;
+
+    justify-content:
+        space-between;
+
+    gap:
+        10px;
 }
 
-@media(max-width:520px){
+.reason {
 
-.grid{
-grid-template-columns:1fr
+    white-space:
+        pre-line;
 }
 
-.wide{
-grid-column:auto
+.footer {
+
+    margin-top:
+        18px;
+
+    text-align:
+        center;
+
+    color:
+        #667286;
+
+    font-size:
+        12px;
 }
 
+@media(max-width:800px) {
+
+    .grid {
+
+        grid-template-columns:
+            repeat(2, 1fr);
+    }
+
+    .wide {
+
+        grid-column:
+            span 2;
+    }
+}
+
+@media(max-width:500px) {
+
+    .grid {
+
+        grid-template-columns:
+            1fr;
+    }
+
+    .wide {
+
+        grid-column:
+            span 1;
+    }
 }
 
 </style>
@@ -3641,1004 +1705,884 @@ grid-column:auto
 
 <body>
 
-<div class="wrap">
+<main>
 
-<h1>BTC Strike AI</h1>
+<div class="top">
 
-<div class="small">
-KXBTC15M • Binance Protected • Signal Memory 🧠
+<div>
+
+<div class="title">
+⚡ BTC STRIKE AI
 </div>
 
+<div class="sub">
+KXBTC15M • Live BTC Feed • Signal Engine
+</div>
+
+</div>
+
+<div id="status"
+     class="sub">
+Connecting...
+</div>
+
+</div>
+
+
 <div id="verdict"
-class="verdict wait">
+     class="verdict wait">
 
 <div id="label"
-class="label">
+     class="verdictLabel">
 🟡 WAIT
 </div>
 
-<div id="confidence">
-0%
+<div id="confidence"
+     class="small">
+0% confidence
 </div>
 
-<div id="agreement">
+<div id="agreement"
+     class="small">
+--
 </div>
 
 </div>
+
 
 <div class="grid">
 
+
 <div class="card">
-<div class="small">
-BTC REFERENCE
+
+<div class="label">
+LIVE BTC
 </div>
 
 <div id="btc"
-class="big">
+     class="big">
 --
 </div>
 
-<div id="feeds"
-class="small">
+<div id="btcAge"
+     class="small">
 --
 </div>
+
 </div>
+
 
 <div class="card">
-<div class="small">
-⚡ DATA LATENCY
-</div>
 
-<div id="btcAge" class="big">
---
-</div>
-
-<div id="latencyDetail" class="small">
-Starting live stream...
-</div>
-</div>
-
-<div class="card">
-<div class="small">
+<div class="label">
 KALSHI TARGET
 </div>
 
 <div id="target"
-class="big">
+     class="big">
 --
 </div>
 
 <div id="ticker"
-class="small">
+     class="small">
 --
 </div>
+
 </div>
 
+
 <div class="card">
-<div class="small">
+
+<div class="label">
 BTC VS TARGET
 </div>
 
 <div id="distance"
-class="big">
+     class="big">
 --
 </div>
 
 <div id="distancePct"
-class="small">
+     class="small">
 --
 </div>
+
 </div>
 
+
 <div class="card">
-<div class="small">
+
+<div class="label">
 COUNTDOWN
 </div>
 
 <div id="countdown"
-class="big">
+     class="big">
 --
 </div>
 
 <div class="small">
 until market close
 </div>
+
 </div>
 
+
 <div class="card">
-<div class="small">
+
+<div class="label">
 1 MIN
 </div>
 
 <div id="m1"
-class="value">
+     class="value">
 --
 </div>
+
 </div>
 
+
 <div class="card">
-<div class="small">
+
+<div class="label">
 5 MIN
 </div>
 
 <div id="m5"
-class="value">
+     class="value">
 --
 </div>
+
 </div>
 
+
 <div class="card">
-<div class="small">
+
+<div class="label">
 15 MIN
 </div>
 
 <div id="m15"
-class="value">
+     class="value">
 --
 </div>
+
 </div>
 
+
 <div class="card">
-<div class="small">
+
+<div class="label">
 STRUCTURE
 </div>
 
 <div id="structure"
-class="value">
+     class="value">
 --
 </div>
+
 </div>
 
+
 <div class="card">
-<div class="small">
+
+<div class="label">
 MOMENTUM
 </div>
 
-<div id="acceleration"
-class="value">
+<div id="accel"
+     class="value">
 --
 </div>
+
 </div>
 
+
 <div class="card">
-<div class="small">
+
+<div class="label">
 REVERSAL RISK
 </div>
 
 <div id="reversal"
-class="value">
+     class="value">
 --
 </div>
+
 </div>
 
+
 <div class="card">
-<div class="small">
+
+<div class="label">
 KALSHI YES
 </div>
 
 <div id="yes"
-class="value">
+     class="value">
 --
 </div>
+
 </div>
 
+
 <div class="card">
-<div class="small">
+
+<div class="label">
 SIGNAL SCORE
 </div>
 
 <div id="score"
-class="value">
+     class="value">
 --
 </div>
+
 </div>
+
 
 <div class="card wide">
 
-<div class="small">
+<div class="label">
 ⚔️ BUYER / SELLER BATTLE
 </div>
 
-<div id="battleWinner" class="value">
+<div id="battle"
+     class="value">
 --
 </div>
 
-<div class="battle">
-<span id="buyPct">🟢 Buyers --</span>
-<span id="sellPct">🔴 Sellers --</span>
+<div class="row">
+
+<span id="buy">
+🟢 Buyers --
+</span>
+
+<span id="sell">
+🔴 Sellers --
+</span>
+
 </div>
 
-<div class="battleBar">
-<div id="buyBar" class="battleBuy" style="width:50%"></div>
+<div class="bar">
+
+<div id="buybar"
+     style="width:50%">
 </div>
 
-<div id="battleDelta" class="small">
+</div>
+
+<div id="delta"
+     class="small">
 Delta: --
 </div>
 
-<div id="battleTrades" class="small">
-Trades: --
 </div>
 
-</div>
 
 <div class="card wide">
 
-<div class="small">
-📖 ORDER-BOOK PRESSURE
+<div class="label">
+📖 ORDER BOOK PRESSURE
 </div>
 
-<div id="bookWinner" class="value">
+<div id="book"
+     class="value">
 --
 </div>
 
-<div class="battle">
-<span id="bidPct">🟢 Bids --</span>
-<span id="askPct">🔴 Asks --</span>
-</div>
-
-<div id="bookText" class="small">
+<div id="bookdetail"
+     class="small">
 --
 </div>
 
 </div>
 
+
 <div class="card wide">
 
-<div class="small">
+<div class="label">
 🧠 PREDICTION STRENGTH
 </div>
 
-<div id="prediction" class="big">
+<div id="pred"
+     class="big">
 --
 </div>
 
-<div id="predictionDetail" class="small">
---
+<div id="predetail"
+     class="small">
+Alignment score — not a probability.
 </div>
 
 </div>
+
 
 <div class="card wide">
 
-<div class="small">
+<div class="label">
 DATA QUALITY BRAIN
 </div>
 
 <div id="quality"
-class="big">
+     class="big">
 --
 </div>
 
-<div id="qualityText"
-class="small">
+<div id="qdetail"
+     class="small">
 --
 </div>
 
 </div>
 
-<div class="card wide">
-
-<div class="small">
-SIGNAL MEMORY 🧠
-</div>
-
-<div id="memory"
-class="value">
-0 resolved setups stored
-</div>
-
-<div id="memoryMatch"
-class="small">
-Building pattern history...
-</div>
-
-<div id="memoryStats"
-class="small">
-</div>
-
-</div>
 
 <div class="card wide">
 
-<div class="small">
+<div class="label">
 WHY THE ENGINE CHOSE THIS
 </div>
 
 <div id="reasons"
-class="small">
+     class="small reason">
 Waiting...
 </div>
 
 </div>
 
-<div class="card wide">
-
-<div class="small">
-FEED HEALTH
-</div>
-
-<div id="health"
-class="small">
---
-</div>
 
 </div>
 
-</div>
+
+<div class="footer">
+
+BRTI-style composite only — not official CF Benchmarks BRTI.
+Trade-flow and order-book readings are exchange-specific proxies.
 
 </div>
+
+</main>
+
 
 <script>
 
-function money(value){
+const $ = id =>
+    document.getElementById(id);
 
-if(value==null)
-return "--";
 
-return "$"
-+
-Number(value).toLocaleString(
-undefined,
-{
-minimumFractionDigits:2,
-maximumFractionDigits:2
-}
-);
+function money(value) {
 
-}
+    if (value == null)
+        return "--";
 
-function percent(value){
-
-if(value==null)
-return "--";
-
-return (
-value>=0 ? "+" : ""
-)
-+
-Number(value).toFixed(3)
-+
-"%";
-
-}
-
-function clock(seconds){
-
-if(seconds==null)
-return "--";
-
-return String(
-Math.floor(seconds/60)
-).padStart(2,"0")
-+
-":"
-+
-String(
-seconds%60
-).padStart(2,"0");
-
-}
-
-function setText(id,value){
-
-document.getElementById(
-id
-).textContent =
-value;
-
+    return "$" +
+        Number(value).toLocaleString(
+            undefined,
+            {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2
+            }
+        );
 }
 
 
-async function refreshLive(){
+function percent(value) {
 
-try{
+    if (value == null)
+        return "--";
 
-const response = await fetch(
-"/api/live?x=" + Date.now(),
-{cache:"no-store"}
-);
-
-const live = await response.json();
-
-if(live.price != null){
-
-setText(
-"btc",
-money(live.price)
-);
-
-}
-
-if(live.age_ms != null){
-
-setText(
-"btcAge",
-Number(
-live.age_ms
-).toFixed(0)
-+
-" ms"
-);
-
-}
-
-setText(
-"latencyDetail",
-(
-live.connected
-?
-"⚡ Live stream"
-:
-"↩ REST fallback"
-)
-+
-" • direct browser feed"
-);
-
-}catch(error){}
-
+    return (
+        value >= 0
+        ? "+"
+        : ""
+    )
+    +
+    Number(value).toFixed(3)
+    +
+    "%";
 }
 
 
-async function refresh(){
+function clock(seconds) {
 
-try{
+    if (seconds == null)
+        return "--";
 
-const response =
-await fetch(
-"/api/state?x="
-+
-Date.now()
-);
-
-const data =
-await response.json();
-
-const signal =
-data.signal || {};
-
-const market =
-data.market || {};
-
-const quality =
-data.data_quality || {};
-
-const memory =
-data.memory || {};
-
-const buySell =
-data.buy_sell || {};
-
-const orderBook =
-data.order_book || {};
-
-const prediction =
-data.prediction_strength || {};
-
-const verdict =
-document.getElementById(
-"verdict"
-);
-
-verdict.className =
-"verdict "
-+
-(
-signal.verdict === "UP"
-?
-"up"
-:
-signal.verdict === "DOWN"
-?
-"down"
-:
-"wait"
-);
-
-setText(
-"label",
-signal.label || "🟡 WAIT"
-);
-
-setText(
-"confidence",
-(signal.confidence || 0)
-+
-"%"
-);
-
-setText(
-"agreement",
-(signal.bullish || 0)
-+
-" BULLISH / "
-+
-(signal.bearish || 0)
-+
-" BEARISH"
-);
-
-setText(
-"btc",
-money(data.btc)
-);
-
-const feedCount =
-Object.values(
-data.feeds || {}
-).filter(
-x => x != null
-).length;
-
-setText(
-"feeds",
-feedCount +
-" live feeds"
-);
-
-const latency =
-data.latency || {};
-
-setText(
-"btcAge",
-latency.btc_age_ms == null
-?
-"--"
-:
-Number(
-latency.btc_age_ms
-).toFixed(0)
-+
-" ms"
-);
-
-setText(
-"latencyDetail",
-(
-latency.btc_stream
-?
-(
-"⚡ "
-+
-(
-latency.spot_source
-||
-"Live stream"
-)
-)
-:
-"↩ REST fallback"
-)
-+
-" • Kalshi "
-+
-(
-latency.kalshi_age_ms == null
-?
-"--"
-:
-Number(
-latency.kalshi_age_ms
-).toFixed(0)
-+
-" ms old"
-)
-);
-
-setText(
-"target",
-money(
-market.target
-)
-);
-
-setText(
-"ticker",
-market.ticker || "--"
-);
-
-if(
-data.btc != null
-&&
-market.target != null
-){
-
-const difference =
-data.btc
--
-market.target;
-
-setText(
-"distance",
-(
-difference >= 0
-?
-"+"
-:
-"-"
-)
-+
-money(
-Math.abs(
-difference
-)
-)
-);
-
-setText(
-"distancePct",
-percent(
-difference
-/
-market.target
-*
-100
-)
-);
-
+    return String(
+        Math.floor(seconds / 60)
+    ).padStart(2, "0")
+    +
+    ":"
+    +
+    String(
+        seconds % 60
+    ).padStart(2, "0");
 }
 
-setText(
-"countdown",
-clock(
-data.countdown
-)
-);
 
-setText(
-"m1",
-percent(
-signal.m1
-)
-);
+async function refresh() {
 
-setText(
-"m5",
-percent(
-signal.m5
-)
-);
+    try {
 
-setText(
-"m15",
-percent(
-signal.m15
-)
-);
+        const response =
+            await fetch(
+                "/api/state?x=" +
+                Date.now(),
+                {
+                    cache: "no-store"
+                }
+            );
 
-setText(
-"structure",
-signal.structure || "--"
-);
+        const data =
+            await response.json();
 
-setText(
-"acceleration",
-signal.acceleration || "--"
-);
 
-setText(
-"reversal",
-signal.reversal || "--"
-);
+        const signal =
+            data.signal || {};
 
-if(
-market.yes_bid != null
-&&
-market.yes_ask != null
-){
+        const market =
+            data.market || {};
 
-setText(
-"yes",
-(
-(
-market.yes_bid
-+
-market.yes_ask
-)
-/
-2
-*
-100
-).toFixed(1)
-+
-"%"
-);
+        const pressure =
+            data.buy_sell || {};
 
-}else{
+        const book =
+            data.order_book || {};
 
-setText(
-"yes",
-"--"
-);
+        const quality =
+            data.quality || {};
 
+        const latency =
+            data.latency || {};
+
+
+        const verdict =
+            $("verdict");
+
+
+        verdict.className =
+            "verdict " +
+            (
+                signal.verdict === "UP"
+                ?
+                "up"
+                :
+                signal.verdict === "DOWN"
+                ?
+                "down"
+                :
+                "wait"
+            );
+
+
+        $("label").textContent =
+            signal.label ||
+            "🟡 WAIT";
+
+
+        $("confidence").textContent =
+            (
+                signal.confidence ||
+                0
+            )
+            +
+            "% confidence";
+
+
+        $("agreement").textContent =
+            (
+                signal.bullish ||
+                0
+            )
+            +
+            " BULLISH / "
+            +
+            (
+                signal.bearish ||
+                0
+            )
+            +
+            " BEARISH";
+
+
+        $("btc").textContent =
+            money(
+                data.btc
+            );
+
+
+        $("btcAge").textContent =
+            latency.btc_age_ms == null
+            ?
+            "--"
+            :
+            Math.round(
+                latency.btc_age_ms
+            )
+            +
+            " ms • "
+            +
+            (
+                latency.btc_stream
+                ?
+                "LIVE"
+                :
+                "REST"
+            );
+
+
+        $("target").textContent =
+            money(
+                market.target
+            );
+
+
+        $("ticker").textContent =
+            market.ticker ||
+            "--";
+
+
+        if (
+            data.btc
+            &&
+            market.target
+        ) {
+
+            const difference =
+                data.btc -
+                market.target;
+
+
+            $("distance").textContent =
+                (
+                    difference >= 0
+                    ?
+                    "+"
+                    :
+                    "-"
+                )
+                +
+                money(
+                    Math.abs(
+                        difference
+                    )
+                );
+
+
+            $("distancePct").textContent =
+                percent(
+                    difference
+                    /
+                    market.target
+                    *
+                    100
+                );
+
+        }
+
+
+        $("countdown").textContent =
+            clock(
+                data.countdown
+            );
+
+
+        $("m1").textContent =
+            percent(
+                signal.m1
+            );
+
+
+        $("m5").textContent =
+            percent(
+                signal.m5
+            );
+
+
+        $("m15").textContent =
+            percent(
+                signal.m15
+            );
+
+
+        $("structure").textContent =
+            signal.structure ||
+            "--";
+
+
+        if (
+            signal.m15 > 0
+            &&
+            signal.m5 > 0
+            &&
+            signal.m1 > 0
+        ) {
+
+            $("accel").textContent =
+                "ACCELERATING UP";
+
+        }
+
+        else if (
+            signal.m15 < 0
+            &&
+            signal.m5 < 0
+            &&
+            signal.m1 < 0
+        ) {
+
+            $("accel").textContent =
+                "ACCELERATING DOWN";
+
+        }
+
+        else {
+
+            $("accel").textContent =
+                "MIXED";
+        }
+
+
+        $("reversal").textContent =
+            signal.reversal ||
+            "--";
+
+
+        let yes = null;
+
+
+        if (
+            market.yes_bid != null
+            &&
+            market.yes_ask != null
+        ) {
+
+            yes =
+                (
+                    market.yes_bid
+                    +
+                    market.yes_ask
+                )
+                /
+                2;
+
+        }
+
+        else if (
+            market.last != null
+        ) {
+
+            yes =
+                market.last;
+        }
+
+
+        $("yes").textContent =
+            yes == null
+            ?
+            "--"
+            :
+            (
+                yes * 100
+            ).toFixed(1)
+            +
+            "%";
+
+
+        $("score").textContent =
+            signal.score ??
+            "--";
+
+
+        $("battle").textContent =
+            pressure.winner ||
+            "--";
+
+
+        $("buy").textContent =
+            "🟢 Buyers " +
+            (
+                pressure.buy_pct == null
+                ?
+                "--"
+                :
+                pressure.buy_pct.toFixed(1)
+                +
+                "%"
+            );
+
+
+        $("sell").textContent =
+            "🔴 Sellers " +
+            (
+                pressure.sell_pct == null
+                ?
+                "--"
+                :
+                pressure.sell_pct.toFixed(1)
+                +
+                "%"
+            );
+
+
+        $("buybar").style.width =
+            (
+                pressure.buy_pct ||
+                50
+            )
+            +
+            "%";
+
+
+        $("delta").textContent =
+            "Delta: " +
+            (
+                pressure.delta == null
+                ?
+                "--"
+                :
+                (
+                    pressure.delta >= 0
+                    ?
+                    "+$"
+                    :
+                    "-$"
+                )
+                +
+                Math.abs(
+                    pressure.delta
+                ).toLocaleString(
+                    undefined,
+                    {
+                        maximumFractionDigits: 0
+                    }
+                )
+            );
+
+
+        $("book").textContent =
+            book.winner ||
+            "--";
+
+
+        $("bookdetail").textContent =
+            book.bid_pct == null
+            ?
+            "--"
+            :
+            "Bids " +
+            book.bid_pct.toFixed(1)
+            +
+            "% • Asks " +
+            book.ask_pct.toFixed(1)
+            +
+            "%";
+
+
+        const prediction =
+            Math.min(
+                100,
+                Math.round(
+                    (
+                        Math.max(
+                            signal.bullish || 0,
+                            signal.bearish || 0
+                        )
+                        /
+                        Math.max(
+                            1,
+                            signal.score || 1
+                        )
+                    )
+                    *
+                    100
+                )
+            );
+
+
+        $("pred").textContent =
+            prediction +
+            " / 100";
+
+
+        $("predetail").textContent =
+            (
+                signal.bullish ||
+                0
+            )
+            +
+            " bullish confirmations • "
+            +
+            (
+                signal.bearish ||
+                0
+            )
+            +
+            " bearish confirmations";
+
+
+        $("quality").textContent =
+            (
+                quality.score ||
+                0
+            )
+            +
+            "/100 "
+            +
+            (
+                quality.grade ||
+                ""
+            );
+
+
+        $("qdetail").textContent =
+            (
+                data.candles ||
+                0
+            )
+            +
+            " one-minute history candles • "
+            +
+            (
+                data.source ||
+                "unknown"
+            );
+
+
+        $("reasons").textContent =
+            (
+                signal.reasons ||
+                []
+            )
+            .map(
+                reason =>
+                    "• " +
+                    reason
+            )
+            .join("\n")
+            ||
+            "Waiting...";
+
+
+        $("status").textContent =
+            "Auto-refresh • " +
+            new Date().toLocaleTimeString();
+
+    }
+
+    catch (error) {
+
+        $("status").textContent =
+            "Reconnecting...";
+
+    }
 }
 
-setText(
-"score",
-signal.score == null
-?
-"--"
-:
-signal.score
-);
-
-setText(
-"battleWinner",
-buySell.strength || "--"
-);
-
-if(
-buySell.buy_pct != null
-&&
-buySell.sell_pct != null
-){
-
-setText(
-"buyPct",
-"🟢 Buyers "
-+
-Number(
-buySell.buy_pct
-).toFixed(1)
-+
-"%"
-);
-
-setText(
-"sellPct",
-"🔴 Sellers "
-+
-Number(
-buySell.sell_pct
-).toFixed(1)
-+
-"%"
-);
-
-document.getElementById(
-"buyBar"
-).style.width =
-Number(
-buySell.buy_pct
-)
-+
-"%";
-
-setText(
-"battleDelta",
-"Delta: "
-+
-(
-buySell.delta >= 0
-?
-"+$"
-:
-"-$"
-)
-+
-Math.abs(
-buySell.delta || 0
-).toLocaleString(
-undefined,
-{
-maximumFractionDigits:0
-}
-)
-);
-
-setText(
-"battleTrades",
-"Trades: "
-+
-(
-buySell.trades || 0
-).toLocaleString()
-);
-
-}else{
-
-setText(
-"battleDelta",
-"Delta: --"
-);
-
-setText(
-"battleTrades",
-"Trades: --"
-);
-
-}
-
-setText(
-"bookWinner",
-orderBook.strength || "--"
-);
-
-if(
-orderBook.bid_pct != null
-&&
-orderBook.ask_pct != null
-){
-
-setText(
-"bidPct",
-"🟢 Bids "
-+
-Number(
-orderBook.bid_pct
-).toFixed(1)
-+
-"%"
-);
-
-setText(
-"askPct",
-"🔴 Asks "
-+
-Number(
-orderBook.ask_pct
-).toFixed(1)
-+
-"%"
-);
-
-setText(
-"bookText",
-"Order-book pressure: "
-+
-(
-orderBook.winner
-||
-"BALANCED"
-)
-);
-
-}
-
-setText(
-"prediction",
-prediction.label || "--"
-);
-
-setText(
-"predictionDetail",
-(
-prediction.bullish_points || 0
-)
-+
-" bullish confirmations • "
-+
-(
-prediction.bearish_points || 0
-)
-+
-" bearish confirmations"
-);
-
-setText(
-"quality",
-(
-quality.score || 0
-)
-+
-"/100 "
-+
-(
-quality.grade || "--"
-)
-);
-
-setText(
-"qualityText",
-data.candles
-+
-" history candles"
-);
-
-setText(
-"memory",
-(
-memory.records || 0
-)
-+
-" resolved setups stored"
-);
-
-if(
-memory.matches
-){
-
-setText(
-"memoryMatch",
-memory.matches
-+
-" similar setups • "
-+
-Number(
-memory.rate
-).toFixed(0)
-+
-"% historical support"
-);
-
-}else{
-
-setText(
-"memoryMatch",
-"Building pattern history..."
-);
-
-}
-
-setText(
-"memoryStats",
-"Stored outcomes: "
-+
-(memory.up || 0)
-+
-" UP • "
-+
-(memory.down || 0)
-+
-" DOWN"
-);
-
-setText(
-"reasons",
-(
-signal.reasons || []
-).map(
-reason =>
-"• "
-+
-reason
-).join("\n")
-);
-
-setText(
-"health",
-Object.entries(
-data.feeds || {}
-).map(
-([name,value]) =>
-name
-+
-": "
-+
-(
-value != null
-?
-"LIVE"
-:
-"OFFLINE"
-)
-).join(" • ")
-);
-
-}catch(error){
-
-setText(
-"health",
-"Dashboard reconnecting..."
-);
-
-}
-
-}
 
 refresh();
 
-refreshLive();
-
 setInterval(
-refresh,
-1000
-);
-
-setInterval(
-refreshLive,
-250
+    refresh,
+    2000
 );
 
 </script>
@@ -4646,7 +2590,7 @@ refreshLive,
 </body>
 
 </html>
-"""
+'''
 
 
 # =========================================================
@@ -4661,56 +2605,6 @@ def index():
     )
 
 
-@app.get("/api/live")
-def api_live():
-
-    received = live_btc.get(
-        "received_at",
-        0.0
-    )
-
-    return jsonify({
-
-        "price":
-            live_btc.get(
-                "price"
-            ),
-
-        "received_at":
-            received,
-
-        "age_ms":
-            (
-                round(
-                    max(
-                        0.0,
-                        time.time()
-                        -
-                        received
-                    )
-                    *
-                    1000,
-                    1
-                )
-                if received
-                else
-                None
-            ),
-
-        "connected":
-            bool(
-                live_btc.get(
-                    "connected"
-                )
-            ),
-
-        "source":
-            live_btc.get(
-                "source"
-            )
-    })
-
-
 @app.get("/api/state")
 def api_state():
 
@@ -4719,9 +2613,7 @@ def api_state():
     if (
         cache["state"] is not None
         and
-        now
-        -
-        cache["time"]
+        now - cache["time"]
         <
         CACHE_SECONDS
     ):
@@ -4732,13 +2624,46 @@ def api_state():
 
     state = collect_state()
 
-    cache["time"] = now
-
-    cache["state"] = state
+    cache.update(
+        time=now,
+        state=state
+    )
 
     return jsonify(
         state
     )
+
+
+@app.get("/api/live")
+def api_live():
+
+    with lock:
+
+        if live["received"]:
+
+            age = (
+                time.time()
+                -
+                live["received"]
+            ) * 1000
+
+        else:
+
+            age = None
+
+        return jsonify({
+            "price": live["price"],
+            "age_ms": age,
+            "connected": live["connected"],
+            "source": live["source"]
+        })
+
+
+# =========================================================
+# START LIVE STREAMS
+# =========================================================
+
+start_streams()
 
 
 # =========================================================
