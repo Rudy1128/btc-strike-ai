@@ -75,7 +75,11 @@ def _binance_stream_loop():
         try:
             ws = websocket.create_connection(
                 url,
-                timeout=10
+                timeout=10,
+                http_proxy_host=None,
+                http_proxy_port=None,
+                http_no_proxy=["stream.binance.com"],
+                suppress_origin=True
             )
 
             live_btc["connected"] = True
@@ -1011,18 +1015,14 @@ def prediction_strength(
 
         elif memory_rate <= 40:
 
-            if signal.get(
-                "verdict"
-            ) == "UP":
+            if signal.get("verdict") == "UP":
 
                 up = max(
                     0,
                     up - 1
                 )
 
-            elif signal.get(
-                "verdict"
-            ) == "DOWN":
+            elif signal.get("verdict") == "DOWN":
 
                 down = max(
                     0,
@@ -2832,38 +2832,7 @@ def collect_state():
         "latency":
             {
 
-                # ACTUAL BINANCE MESSAGE LATENCY:
-                # exchange event timestamp -> server receive timestamp
                 "btc_age_ms":
-                    (
-                        round(
-                            max(
-                                0.0,
-                                live_btc.get(
-                                    "received_at",
-                                    0.0
-                                )
-                                -
-                                live_btc.get(
-                                    "event_at",
-                                    0.0
-                                )
-                            ) * 1000,
-                            1
-                        )
-                        if live_btc.get(
-                            "received_at"
-                        )
-                        and
-                        live_btc.get(
-                            "event_at"
-                        )
-                        else
-                        None
-                    ),
-
-                # HOW OLD THE LAST RECEIVED MESSAGE IS:
-                "btc_freshness_ms":
                     (
                         round(
                             max(
@@ -3853,23 +3822,9 @@ setText(
 (
 latency.btc_stream
 ?
-"⚡ Binance live"
+"⚡ Binance live stream"
 :
 "↩ REST fallback"
-)
-+
-" • "
-+
-(
-latency.btc_freshness_ms == null
-?
-"--"
-:
-Number(
-latency.btc_freshness_ms
-).toFixed(0)
-+
-" ms fresh"
 )
 +
 " • Kalshi "
