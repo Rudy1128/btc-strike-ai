@@ -39,10 +39,6 @@ KALSHI_TICKER = os.getenv("KALSHI_TICKER", "").strip()
 TIMEOUT = 4
 UPDATE_SECONDS = 2
 
-# ------------------------------------------------------------
-# Public BTC exchange feeds
-# ------------------------------------------------------------
-
 EXCHANGE_URLS = {
     "Binance":
         "https://api.binance.com/api/v3/ticker/bookTicker?symbol=BTCUSDT",
@@ -92,7 +88,9 @@ STATE = {
 # ============================================================
 
 def num(value):
+
     try:
+
         x = float(value)
 
         if math.isfinite(x):
@@ -101,23 +99,36 @@ def num(value):
         return None
 
     except (TypeError, ValueError):
+
         return None
 
 
 def now():
+
     return time.time()
 
 
 def iso_now():
-    return datetime.now(timezone.utc).isoformat()
+
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
 def pct_change(old, new):
 
-    if old is None or new is None or old == 0:
+    if (
+        old is None
+        or new is None
+        or old == 0
+    ):
+
         return 0.0
 
-    return ((new - old) / old) * 100.0
+    return (
+        (new - old)
+        / old
+    ) * 100.0
 
 
 def get_json(url):
@@ -126,7 +137,8 @@ def get_json(url):
         url,
         timeout=TIMEOUT,
         headers={
-            "User-Agent": "BTC-Strike-AI/1.0"
+            "User-Agent":
+                "BTC-Strike-AI/1.0"
         },
     )
 
@@ -275,8 +287,10 @@ def get_feeds():
 
             if (
                 item
-                and item.get("price") is not None
+                and item.get("price")
+                is not None
             ):
+
                 data[name] = item
 
         except Exception as exc:
@@ -334,15 +348,19 @@ def reference_price(feeds):
 
         if (
             median
-            and abs(
-                item["price"] - median
-            ) / median
+            and
+            abs(
+                item["price"]
+                - median
+            )
+            / median
             <= 0.0035
         ):
 
             valid[name] = item
 
     if not valid:
+
         valid = feeds
 
     price = (
@@ -366,6 +384,7 @@ def normalize_market(market):
         market,
         dict
     ):
+
         return {}
 
     strike = None
@@ -401,40 +420,49 @@ def normalize_market(market):
 
         "yes_bid":
             num(
-                market.get("yes_bid")
+                market.get(
+                    "yes_bid"
+                )
             ),
 
         "yes_ask":
             num(
-                market.get("yes_ask")
+                market.get(
+                    "yes_ask"
+                )
             ),
 
         "no_bid":
             num(
-                market.get("no_bid")
+                market.get(
+                    "no_bid"
+                )
             ),
 
         "no_ask":
             num(
-                market.get("no_ask")
+                market.get(
+                    "no_ask"
+                )
             ),
 
         "last_price":
             num(
-                market.get("last_price")
+                market.get(
+                    "last_price"
+                )
             ),
 
         "close_time":
-            market.get("close_time"),
+            market.get(
+                "close_time"
+            ),
     }
 
 
 def get_kalshi():
 
     try:
-
-        # If a specific ticker is supplied,
-        # always use it.
 
         if KALSHI_TICKER:
 
@@ -449,8 +477,6 @@ def get_kalshi():
                     data
                 )
             )
-
-        # Otherwise discover an open BTC market.
 
         data = get_json(
             f"{KALSHI_BASE}/markets"
@@ -473,7 +499,6 @@ def get_kalshi():
                         ""
                     )
                 )
-
                 for key in (
                     "ticker",
                     "title",
@@ -492,10 +517,8 @@ def get_kalshi():
                 )
 
         if not candidates:
-            return {}
 
-        # Prefer markets that appear to be
-        # 15-minute BTC contracts.
+            return {}
 
         candidates.sort(
             key=lambda market: (
@@ -507,7 +530,6 @@ def get_kalshi():
                     )
                 ).lower()
                 and
-
                 "15"
                 not in str(
                     market.get(
@@ -552,6 +574,7 @@ def momentum(seconds):
     )
 
     if len(points) < 2:
+
         return 0.0
 
     return pct_change(
@@ -563,6 +586,7 @@ def momentum(seconds):
 def price_structure():
 
     if len(history) < 12:
+
         return "NOT ENOUGH DATA"
 
     values = [
@@ -583,7 +607,10 @@ def price_structure():
         min(second) > min(first)
     ):
 
-        return "HIGHER HIGHS / HIGHER LOWS"
+        return (
+            "HIGHER HIGHS / "
+            "HIGHER LOWS"
+        )
 
     if (
         max(second) < max(first)
@@ -591,7 +618,10 @@ def price_structure():
         min(second) < min(first)
     ):
 
-        return "LOWER HIGHS / LOWER LOWS"
+        return (
+            "LOWER HIGHS / "
+            "LOWER LOWS"
+        )
 
     return "MIXED / CHOP"
 
@@ -610,7 +640,8 @@ def calculate_signal(
         return {
             "signals": {},
             "score": 0,
-            "verdict": "UNDECIDED",
+            "verdict":
+                "UNDECIDED",
             "confidence": 0,
         }
 
@@ -635,7 +666,7 @@ def calculate_signal(
     distance_pct = None
 
     # --------------------------------------------------------
-    # Strike location
+    # STRIKE LOCATION
     # --------------------------------------------------------
 
     if (
@@ -665,7 +696,7 @@ def calculate_signal(
             )
 
     # --------------------------------------------------------
-    # Momentum
+    # MOMENTUM
     # --------------------------------------------------------
 
     for (
@@ -695,12 +726,13 @@ def calculate_signal(
             )
 
     # --------------------------------------------------------
-    # Price structure
+    # PRICE STRUCTURE
     # --------------------------------------------------------
 
     if (
         structure
-        == "HIGHER HIGHS / HIGHER LOWS"
+        ==
+        "HIGHER HIGHS / HIGHER LOWS"
     ):
 
         score += 2
@@ -711,7 +743,8 @@ def calculate_signal(
 
     elif (
         structure
-        == "LOWER HIGHS / LOWER LOWS"
+        ==
+        "LOWER HIGHS / LOWER LOWS"
     ):
 
         score -= 2
@@ -721,7 +754,7 @@ def calculate_signal(
         )
 
     # --------------------------------------------------------
-    # Delta / CVD
+    # DELTA / CVD
     # --------------------------------------------------------
 
     delta = STATE["delta"]
@@ -761,7 +794,7 @@ def calculate_signal(
         )
 
     # --------------------------------------------------------
-    # Signal agreement
+    # SIGNAL AGREEMENT
     # --------------------------------------------------------
 
     bullish = (
@@ -779,16 +812,21 @@ def calculate_signal(
 
         int(
             structure
-            == "HIGHER HIGHS / HIGHER LOWS"
+            ==
+            "HIGHER HIGHS / HIGHER LOWS"
         )
 
         +
 
-        int(delta > 0)
+        int(
+            delta > 0
+        )
 
         +
 
-        int(cvd > 0)
+        int(
+            cvd > 0
+        )
     )
 
     bearish = (
@@ -806,31 +844,35 @@ def calculate_signal(
 
         int(
             structure
-            == "LOWER HIGHS / LOWER LOWS"
+            ==
+            "LOWER HIGHS / LOWER LOWS"
         )
 
         +
 
-        int(delta < 0)
+        int(
+            delta < 0
+        )
 
         +
 
-        int(cvd < 0)
+        int(
+            cvd < 0
+        )
     )
 
     # --------------------------------------------------------
-    # Dynamic confidence
+    # DYNAMIC CONFIDENCE
     # --------------------------------------------------------
 
     confidence = (
         50
-        + min(
+        +
+        min(
             abs(score) * 4,
             40
         )
     )
-
-    # Conflicting signals reduce confidence.
 
     if bullish and bearish:
 
@@ -851,37 +893,45 @@ def calculate_signal(
     )
 
     # --------------------------------------------------------
-    # Conservative verdict
+    # CONSERVATIVE VERDICT
     # --------------------------------------------------------
 
     if (
         score >= 7
-        and bullish >= 4
-        and bearish <= 2
+        and
+        bullish >= 4
+        and
+        bearish <= 2
     ):
 
         verdict = "STRONG UP"
 
     elif (
         score >= 3
-        and bullish >= 3
-        and bullish > bearish
+        and
+        bullish >= 3
+        and
+        bullish > bearish
     ):
 
         verdict = "UP"
 
     elif (
         score <= -7
-        and bearish >= 4
-        and bullish <= 2
+        and
+        bearish >= 4
+        and
+        bullish <= 2
     ):
 
         verdict = "STRONG DOWN"
 
     elif (
         score <= -3
-        and bearish >= 3
-        and bearish > bullish
+        and
+        bearish >= 3
+        and
+        bearish > bullish
     ):
 
         verdict = "DOWN"
@@ -961,7 +1011,7 @@ def update_loop():
                 feed_errors
             )
 
-            reference, valid = (
+            ref, valid = (
                 reference_price(
                     feeds
                 )
@@ -969,7 +1019,7 @@ def update_loop():
 
             with lock:
 
-                if reference is not None:
+                if ref is not None:
 
                     old = (
                         STATE[
@@ -980,8 +1030,7 @@ def update_loop():
                     if old is not None:
 
                         move = (
-                            reference
-                            - old
+                            ref - old
                         )
 
                         STATE[
@@ -994,12 +1043,12 @@ def update_loop():
 
                     STATE[
                         "reference_price"
-                    ] = reference
+                    ] = ref
 
                     history.append(
                         (
                             now(),
-                            reference
+                            ref
                         )
                     )
 
@@ -2226,22 +2275,32 @@ def index():
 
 
 # ============================================================
-# START SERVER
+# RENDER / GUNICORN STARTUP FIX
 # ============================================================
+# Render starts this program with:
+#
+#     gunicorn app:app
+#
+# Gunicorn IMPORTS this module. It does not execute the file
+# as "__main__". Therefore the live BTC/Kalshi data engine
+# must be started during module import.
+
+_update_thread = threading.Thread(
+    target=update_loop,
+    daemon=True,
+    name="btc-data-engine",
+)
+
+_update_thread.start()
+
 
 if __name__ == "__main__":
-
-    threading.Thread(
-        target=update_loop,
-        daemon=True
-    ).start()
 
     app.run(
         host="0.0.0.0",
         port=PORT,
-        threaded=True
+        threaded=True,
     )
-
 if __name__ == "__main__":
     threading.Thread(target=update_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT, threaded=True)
