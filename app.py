@@ -2670,10 +2670,8 @@ def update_memory(
     )
 
     close_ts = (
-
         close.timestamp()
         if close
-
         else
         time.time() + 900
     )
@@ -2682,6 +2680,7 @@ def update_memory(
         "ticker"
     )
 
+    # Start tracking a new 15-minute market.
     if (
         active_market is None
         or
@@ -2704,6 +2703,8 @@ def update_memory(
                     "target"
                 ),
 
+            # The first real UP/DOWN signal is the prediction we score.
+            # WAIT is deliberately not counted as a prediction.
             "direction":
                 (
                     signal[
@@ -2717,6 +2718,49 @@ def update_memory(
                     )
                     else
                     "WAIT"
+                ),
+
+            "confidence":
+                (
+                    signal.get(
+                        "confidence"
+                    )
+                    if signal.get(
+                        "verdict"
+                    ) in (
+                        "UP",
+                        "DOWN"
+                    )
+                    else
+                    None
+                ),
+
+            "signal_score":
+                signal.get(
+                    "score"
+                ),
+
+            "prediction_locked":
+                signal.get(
+                    "verdict"
+                ) in (
+                    "UP",
+                    "DOWN"
+                ),
+
+            "prediction_locked_at":
+                (
+                    datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                    if signal.get(
+                        "verdict"
+                    ) in (
+                        "UP",
+                        "DOWN"
+                    )
+                    else
+                    None
                 ),
 
             "m1":
@@ -2752,45 +2796,47 @@ def update_memory(
             "last_price"
         ] = price
 
+        # Keep the original prediction snapshot locked.
+        # These fields are updated only for diagnostic context.
         active_market[
-            "m1"
+            "current_m1"
         ] = signal.get(
             "m1"
         )
 
         active_market[
-            "m5"
+            "current_m5"
         ] = signal.get(
             "m5"
         )
 
         active_market[
-            "m15"
+            "current_m15"
         ] = signal.get(
             "m15"
         )
 
         active_market[
-            "distance"
+            "current_distance"
         ] = distance_pct
 
         active_market[
-            "structure"
+            "current_structure"
         ] = signal.get(
             "structure"
         )
 
         if (
-            signal[
+            signal.get(
                 "verdict"
-            ] in (
+            ) in (
                 "UP",
                 "DOWN"
             )
             and
-            active_market[
+            active_market.get(
                 "direction"
-            ] == "WAIT"
+            ) == "WAIT"
         ):
 
             active_market[
@@ -2798,6 +2844,60 @@ def update_memory(
             ] = signal[
                 "verdict"
             ]
+
+            active_market[
+                "confidence"
+            ] = signal.get(
+                "confidence"
+            )
+
+            active_market[
+                "signal_score"
+            ] = signal.get(
+                "score"
+            )
+
+            active_market[
+                "prediction_locked"
+            ] = True
+
+            active_market[
+                "prediction_locked_at"
+            ] = (
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+            )
+
+            # Save the exact conditions at the moment the first
+            # real prediction was made.
+            active_market[
+                "m1"
+            ] = signal.get(
+                "m1"
+            )
+
+            active_market[
+                "m5"
+            ] = signal.get(
+                "m5"
+            )
+
+            active_market[
+                "m15"
+            ] = signal.get(
+                "m15"
+            )
+
+            active_market[
+                "distance"
+            ] = distance_pct
+
+            active_market[
+                "structure"
+            ] = signal.get(
+                "structure"
+            )
 
     if (
         time.time()
@@ -2818,6 +2918,10 @@ def update_memory(
             "last_price"
         )
 
+        direction = record.get(
+            "direction"
+        )
+
         if (
             target is not None
             and
@@ -2836,12 +2940,39 @@ def update_memory(
 
                 outcome = "PUSH"
 
+            # Only UP/DOWN predictions are scored for win/loss.
+            # WAIT remains an unscored pass.
+            if direction in (
+                "UP",
+                "DOWN"
+            ):
+
+                result = (
+                    "WIN"
+                    if direction == outcome
+                    else
+                    "LOSS"
+                )
+
+                scored = True
+
+            else:
+
+                result = "UNSCORED"
+                scored = False
+
             signal_memory.append({
 
                 **record,
 
                 "outcome":
                     outcome,
+
+                "result":
+                    result,
+
+                "scored":
+                    scored,
 
                 "resolved":
                     datetime.now(
@@ -2856,6 +2987,299 @@ def update_memory(
             save_memory()
 
         active_market = None
+
+
+def performance_stats():
+
+    load_memory()
+
+    wins = 0
+    losses = 0
+    pushes = 0
+    unscored = 0
+
+    results = []
+
+    confidence_buckets = {
+        "90-96": {
+            "wins": 0,
+            "losses": 0
+        },
+        "80-89": {
+            "wins": 0,
+            "losses": 0
+        },
+        "70-79": {
+            "wins": 0,
+            "losses": 0
+        },
+        "50-69": {
+            "wins": 0,
+            "losses": 0
+        }
+    }
+
+    # Read both the new records and older memory records so an existing
+    # signal_memory.json does not have to be deleted.
+    for record in signal_memory:
+
+        direction = record.get(
+            "direction"
+        )
+
+        outcome = record.get(
+            "outcome"
+        )
+
+        result = record.get(
+            "result"
+        )
+
+        # Legacy records have no "result" field.
+        if result not in (
+            "WIN",
+            "LOSS",
+            "PUSH",
+            "UNSCORED"
+        ):
+
+            if (
+                direction in (
+                    "UP",
+                    "DOWN"
+                )
+                and
+                outcome in (
+                    "UP",
+                    "DOWN"
+                )
+            ):
+
+                result = (
+                    "WIN"
+                    if direction == outcome
+                    else
+                    "LOSS"
+                )
+
+            elif outcome == "PUSH":
+
+                result = "PUSH"
+
+            else:
+
+                result = "UNSCORED"
+
+        if result == "WIN":
+
+            wins += 1
+
+        elif result == "LOSS":
+
+            losses += 1
+
+        elif result == "PUSH":
+
+            pushes += 1
+
+        else:
+
+            unscored += 1
+
+        if result in (
+            "WIN",
+            "LOSS"
+        ):
+
+            results.append({
+                "result": result,
+                "confidence":
+                    record.get(
+                        "confidence"
+                    ),
+                "resolved":
+                    record.get(
+                        "resolved"
+                    ),
+                "direction":
+                    direction
+            })
+
+            confidence = record.get(
+                "confidence"
+            )
+
+            if confidence is not None:
+
+                try:
+                    confidence = float(
+                        confidence
+                    )
+                except Exception:
+                    confidence = None
+
+            if confidence is not None:
+
+                if confidence >= 90:
+                    bucket = "90-96"
+
+                elif confidence >= 80:
+                    bucket = "80-89"
+
+                elif confidence >= 70:
+                    bucket = "70-79"
+
+                else:
+                    bucket = "50-69"
+
+                if result == "WIN":
+                    confidence_buckets[
+                        bucket
+                    ]["wins"] += 1
+
+                elif result == "LOSS":
+                    confidence_buckets[
+                        bucket
+                    ]["losses"] += 1
+
+    decided = wins + losses
+
+    accuracy = (
+        (wins / decided) * 100
+        if decided
+        else
+        None
+    )
+
+    recent = results[-10:]
+
+    recent_wins = sum(
+        1
+        for item in recent
+        if item["result"] == "WIN"
+    )
+
+    recent_losses = sum(
+        1
+        for item in recent
+        if item["result"] == "LOSS"
+    )
+
+    recent_decided = (
+        recent_wins +
+        recent_losses
+    )
+
+    recent_accuracy = (
+        (recent_wins / recent_decided) * 100
+        if recent_decided
+        else
+        None
+    )
+
+    streak_type = None
+    streak = 0
+
+    for item in reversed(results):
+
+        result = item["result"]
+
+        if streak_type is None:
+
+            streak_type = result
+            streak = 1
+
+        elif result == streak_type:
+
+            streak += 1
+
+        else:
+
+            break
+
+    bucket_stats = {}
+
+    for name, bucket in confidence_buckets.items():
+
+        total = (
+            bucket["wins"] +
+            bucket["losses"]
+        )
+
+        bucket_stats[name] = {
+
+            "wins":
+                bucket["wins"],
+
+            "losses":
+                bucket["losses"],
+
+            "decided":
+                total,
+
+            "accuracy":
+                (
+                    bucket["wins"] /
+                    total *
+                    100
+                    if total
+                    else
+                    None
+                )
+        }
+
+    return {
+
+        "total_records":
+            len(signal_memory),
+
+        "decided":
+            decided,
+
+        "wins":
+            wins,
+
+        "losses":
+            losses,
+
+        "pushes":
+            pushes,
+
+        "unscored":
+            unscored,
+
+        "accuracy":
+            accuracy,
+
+        "recent_decided":
+            recent_decided,
+
+        "recent_accuracy":
+            recent_accuracy,
+
+        "streak_type":
+            streak_type,
+
+        "streak":
+            streak,
+
+        "last10":
+            [
+                item["result"]
+                for item in recent
+            ],
+
+        "confidence_buckets":
+            bucket_stats,
+
+        # 20 decided predictions is a useful minimum sample marker.
+        # It does NOT mean 20 is statistically sufficient for every use.
+        "enough_data":
+            decided >= 20,
+
+        "minimum_sample":
+            20
+    }
 
 
 def memory_match(
@@ -3320,7 +3744,10 @@ def collect_state():
                         for r
                         in signal_memory
                     )
-            }
+            },
+
+        "performance":
+            performance_stats()
     }
 
 
@@ -3427,7 +3854,8 @@ margin-top:8px
 .small{
 color:#91a3b0;
 font-size:13px;
-margin-top:5px
+margin-top:5px;
+white-space:pre-wrap
 }
 
 .ok{
@@ -4038,6 +4466,44 @@ Building pattern history...
 
 <div id="memoryStats"
 class="small">
+</div>
+
+</div>
+
+<div class="card wide">
+
+<div class="small">
+🏆 PROVEN PERFORMANCE — ACTUAL COMPLETED 15-MIN RESULTS
+</div>
+
+<div id="performanceStatus"
+class="big">
+BUILDING DATA
+</div>
+
+<div id="performanceMain"
+class="value">
+0 wins • 0 losses • 0% actual accuracy
+</div>
+
+<div id="performanceDetail"
+class="small">
+The engine's confidence score is NOT the same as proven accuracy.
+</div>
+
+<div id="performanceStreak"
+class="small">
+Streak: --
+</div>
+
+<div id="performanceLast10"
+class="small">
+Last 10: --
+</div>
+
+<div id="performanceBuckets"
+class="small">
+Confidence vs actual accuracy: building data...
 </div>
 
 </div>
@@ -4961,6 +5427,158 @@ memory.down ||
 )
 +
 " DOWN"
+);
+
+
+// ---------------------------------------------------------
+// PROVEN PERFORMANCE TRACKER
+// ---------------------------------------------------------
+const performance =
+data.performance || {};
+
+const decided =
+Number(
+performance.decided || 0
+);
+
+const wins =
+Number(
+performance.wins || 0
+);
+
+const losses =
+Number(
+performance.losses || 0
+);
+
+const pushes =
+Number(
+performance.pushes || 0
+);
+
+const accuracy =
+performance.accuracy;
+
+setText(
+"performanceStatus",
+performance.enough_data
+?
+"🟢 TRACKER ACTIVE"
+:
+"🟡 BUILDING DATA — " +
+decided +
+"/" +
+(
+performance.minimum_sample ||
+20
+)
+);
+
+setText(
+"performanceMain",
+wins +
+" wins • " +
+losses +
+" losses • " +
+(
+accuracy == null
+?
+"--"
+:
+Number(accuracy).toFixed(1) + "%"
+) +
+" actual accuracy"
+);
+
+setText(
+"performanceDetail",
+"Decided: " +
+decided +
+" • Pushes: " +
+pushes +
+" • Total stored: " +
+(
+performance.total_records ||
+0
+) +
+" • Recent accuracy: " +
+(
+performance.recent_accuracy == null
+?
+"--"
+:
+Number(
+performance.recent_accuracy
+).toFixed(1) + "%"
+)
+);
+
+setText(
+"performanceStreak",
+"Current streak: " +
+(
+performance.streak
+?
+(
+performance.streak +
+" " +
+(
+performance.streak_type === "WIN"
+?
+"WIN"
+:
+"LOSS"
+)
+)
+:
+"--"
+)
+);
+
+setText(
+"performanceLast10",
+"Last 10: " +
+(
+performance.last10 &&
+performance.last10.length
+?
+performance.last10.join(" • ")
+:
+"--"
+)
+);
+
+const buckets =
+performance.confidence_buckets || {};
+
+const bucketText =
+Object.entries(
+buckets
+).map(
+([name,bucket]) =>
+name +
+"% confidence: " +
+(
+bucket.decided
+?
+Number(bucket.accuracy).toFixed(0) + "%"
+:
+"--"
+) +
+" (" +
+(
+bucket.decided || 0
+) +
+" decided)"
+).join(" • ");
+
+setText(
+"performanceBuckets",
+"Confidence vs actual accuracy: " +
+(
+bucketText ||
+"building data..."
+)
 );
 
 
