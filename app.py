@@ -89,13 +89,28 @@ live_btc = {
     "received_at": 0.0,
     "event_at": 0.0,
     "connected": False,
-    "source": "Binance WebSocket"
+    "source": "Binance WebSocket",
+    "last_error": None,
+    "reconnects": 0,
 }
 
+live_coinbase = {
+    "price": None,
+    "received_at": 0.0,
+    "event_at": 0.0,
+    "connected": False,
+    "source": "Coinbase WebSocket",
+    "last_error": None,
+    "reconnects": 0,
+}
+
+STREAM_MAX_AGE = 1.5
+active_btc_source = "REST fallback"
 kalshi_last_update = 0.0
 
 
 def _binance_stream_loop():
+    """Primary BTC stream with heartbeat and rapid reconnects."""
     if websocket is None:
         return
 
@@ -103,74 +118,141 @@ def _binance_stream_loop():
 
     while True:
         ws = None
-
         try:
             ws = websocket.create_connection(
                 url,
-                timeout=10,
+                timeout=5,
                 http_proxy_host=None,
                 http_proxy_port=None,
                 http_no_proxy=["stream.binance.com"],
-                suppress_origin=True
+                suppress_origin=True,
+                enable_multithread=True
             )
 
             live_btc["connected"] = True
+            live_btc["last_error"] = None
 
             while True:
-                raw = ws.recv()
+                try:
+                    raw = ws.recv()
+                    if not raw:
+                        raise RuntimeError("Empty Binance stream message")
 
-                if not raw:
-                    raise RuntimeError(
-                        "Empty Binance stream message"
-                    )
+                    data = json.loads(raw)
+                    price = number(data.get("p"))
+                    if price is None or price <= 0:
+                        continue
 
-                data = json.loads(raw)
-                price = number(
-                    data.get("p")
-                )
+                    received = time.time()
+                    live_btc["price"] = price
+                    live_btc["received_at"] = received
+                    live_btc["event_at"] = safe_event_time(data.get("T"))
+                    record_feed("Binance Live", price)
 
-                if price is None or price <= 0:
-                    continue
-
-                received = time.time()
-
-                live_btc["price"] = price
-                live_btc["received_at"] = received
-                live_btc["event_at"] = (
-                    safe_event_time(
-                        data.get("T")
-                    )
-                )
-
-                record_feed(
-                    "Binance Live",
-                    price
-                )
+                except Exception as recv_exc:
+                    timeout_cls = getattr(websocket, "WebSocketTimeoutException", None)
+                    if timeout_cls is not None and isinstance(recv_exc, timeout_cls):
+                        try:
+                            ws.ping("btc-strike-heartbeat")
+                            continue
+                        except Exception:
+                            raise
+                    raise
 
         except Exception as exc:
-
             live_btc["connected"] = False
-
+            live_btc["last_error"] = str(exc)[:240]
+            live_btc["reconnects"] = int(live_btc.get("reconnects", 0)) + 1
             feed_health["Binance Live"] = {
                 "online": False,
-                "last_error": str(exc),
-                "last_success":
-                    live_btc.get(
-                        "received_at",
-                        0.0
-                    )
+                "last_error": live_btc["last_error"],
+                "last_success": live_btc.get("received_at", 0.0),
+                "reconnects": live_btc["reconnects"],
             }
-
-            time.sleep(1)
+            time.sleep(0.5)
 
         finally:
-
             try:
                 if ws is not None:
                     ws.close()
             except Exception:
                 pass
 
+
+def _coinbase_stream_loop():
+    """Secondary public Coinbase stream used as a hot backup."""
+    if websocket is None:
+        return
+
+    url = "wss://ws-feed.exchange.coinbase.com"
+
+    while True:
+        ws = None
+        try:
+            ws = websocket.create_connection(
+                url,
+                timeout=5,
+                http_proxy_host=None,
+                http_proxy_port=None,
+                http_no_proxy=["ws-feed.exchange.coinbase.com"],
+                suppress_origin=True,
+                enable_multithread=True
+            )
+
+            ws.send(json.dumps({
+                "type": "subscribe",
+                "product_ids": ["BTC-USD"],
+                "channels": ["ticker"]
+            }))
+
+            live_coinbase["connected"] = True
+            live_coinbase["last_error"] = None
+
+            while True:
+                try:
+                    raw = ws.recv()
+                    if not raw:
+                        raise RuntimeError("Empty Coinbase stream message")
+
+                    data = json.loads(raw)
+                    price = number(data.get("price"))
+                    if price is None or price <= 0:
+                        continue
+
+                    received = time.time()
+                    live_coinbase["price"] = price
+                    live_coinbase["received_at"] = received
+                    live_coinbase["event_at"] = safe_event_time(data.get("time"))
+                    record_feed("Coinbase Live", price)
+
+                except Exception as recv_exc:
+                    timeout_cls = getattr(websocket, "WebSocketTimeoutException", None)
+                    if timeout_cls is not None and isinstance(recv_exc, timeout_cls):
+                        try:
+                            ws.ping("btc-strike-heartbeat")
+                            continue
+                        except Exception:
+                            raise
+                    raise
+
+        except Exception as exc:
+            live_coinbase["connected"] = False
+            live_coinbase["last_error"] = str(exc)[:240]
+            live_coinbase["reconnects"] = int(live_coinbase.get("reconnects", 0)) + 1
+            feed_health["Coinbase Live"] = {
+                "online": False,
+                "last_error": live_coinbase["last_error"],
+                "last_success": live_coinbase.get("received_at", 0.0),
+                "reconnects": live_coinbase["reconnects"],
+            }
+            time.sleep(0.75)
+
+        finally:
+            try:
+                if ws is not None:
+                    ws.close()
+            except Exception:
+                pass
 
 def safe_event_time(value):
     try:
@@ -334,80 +416,44 @@ def save_memory():
 # =========================================================
 
 def get_binance_price():
+    """Prefer the freshest live WebSocket price; REST is emergency fallback."""
+    global active_btc_source
 
-    live_price = live_btc.get(
-        "price"
-    )
+    now = time.time()
+    candidates = [
+        (live_btc.get("price"), live_btc.get("received_at", 0.0), "Binance Live"),
+        (live_coinbase.get("price"), live_coinbase.get("received_at", 0.0), "Coinbase Live"),
+    ]
 
-    received_at = live_btc.get(
-        "received_at",
-        0.0
-    )
+    candidates = [
+        item for item in candidates
+        if item[0] is not None
+        and item[0] > 0
+        and item[1]
+        and now - item[1] <= STREAM_MAX_AGE
+    ]
 
-    if (
-        live_price is not None
-        and
-        received_at
-        and
-        time.time() - received_at < 3
-    ):
-
-        return (
-            live_price,
-            "Binance Live"
-        )
+    if candidates:
+        price, _, source = min(candidates, key=lambda item: now - item[1])
+        active_btc_source = source
+        return price, source
 
     sources = [
-
-        (
-            "Binance",
-            "https://api.binance.com/api/v3/ticker/price",
-            {
-                "symbol": "BTCUSDT"
-            }
-        ),
-
-        (
-            "Binance Data",
-            "https://data-api.binance.vision/api/v3/ticker/price",
-            {
-                "symbol": "BTCUSDT"
-            }
-        ),
-
-        (
-            "Binance.US",
-            "https://api.binance.us/api/v3/ticker/price",
-            {
-                "symbol": "BTCUSD"
-            }
-        )
+        ("Binance", "https://api.binance.com/api/v3/ticker/price", {"symbol": "BTCUSDT"}),
+        ("Binance Data", "https://data-api.binance.vision/api/v3/ticker/price", {"symbol": "BTCUSDT"}),
+        ("Binance.US", "https://api.binance.us/api/v3/ticker/price", {"symbol": "BTCUSD"}),
     ]
 
     for name, url, params in sources:
-
-        data = get_json(
-            url,
-            params
-        )
-
+        data = get_json(url, params)
         if isinstance(data, dict):
-
-            price = number(
-                data.get("price")
-            )
-
+            price = number(data.get("price"))
             if price and price > 0:
+                active_btc_source = name + " REST"
+                return price, name
 
-                return (
-                    price,
-                    name
-                )
-
-    return (
-        None,
-        "Binance"
-    )
+    active_btc_source = "REST unavailable"
+    return None, "REST unavailable"
 
 
 # =========================================================
@@ -4328,41 +4374,50 @@ def collect_state():
                                 0.0,
                                 time.time()
                                 -
-                                live_btc.get(
-                                    "received_at",
-                                    0.0
+                                (
+                                    live_btc.get("received_at", 0.0)
+                                    if active_btc_source == "Binance Live"
+                                    else live_coinbase.get("received_at", 0.0)
                                 )
                             ) * 1000,
                             1
                         )
-                        if live_btc.get(
-                            "received_at"
-                        )
-                        else
-                        None
+                        if active_btc_source in ("Binance Live", "Coinbase Live")
+                        else None
                     ),
 
                 "btc_stream":
-                    bool(
-                        live_btc.get(
-                            "connected"
-                        )
+                    active_btc_source in ("Binance Live", "Coinbase Live"),
+
+                "btc_source": active_btc_source,
+
+                "binance_connected": bool(live_btc.get("connected")),
+
+                "coinbase_connected": bool(live_coinbase.get("connected")),
+
+                "binance_age_ms":
+                    (
+                        round(max(0.0, time.time() - live_btc.get("received_at", 0.0)) * 1000, 1)
+                        if live_btc.get("received_at") else None
                     ),
+
+                "coinbase_age_ms":
+                    (
+                        round(max(0.0, time.time() - live_coinbase.get("received_at", 0.0)) * 1000, 1)
+                        if live_coinbase.get("received_at") else None
+                    ),
+
+                "binance_reconnects": live_btc.get("reconnects", 0),
+                "coinbase_reconnects": live_coinbase.get("reconnects", 0),
 
                 "kalshi_age_ms":
                     (
                         round(
-                            max(
-                                0.0,
-                                time.time()
-                                -
-                                kalshi_last_update
-                            ) * 1000,
+                            max(0.0, time.time() - kalshi_last_update) * 1000,
                             1
                         )
                         if kalshi_last_update
-                        else
-                        None
+                        else None
                     )
             },
 
@@ -4413,6 +4468,12 @@ if websocket is not None:
     threading.Thread(
         target=_binance_stream_loop,
         name="binance-live-stream",
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=_coinbase_stream_loop,
+        name="coinbase-live-stream",
         daemon=True
     ).start()
 
@@ -5794,29 +5855,17 @@ latency.btc_age_ms
 );
 
 
+const source = latency.btc_source || "REST fallback";
+const sourceIcon = source === "Binance Live" || source === "Coinbase Live" ? "⚡" : "↩";
+const binanceStatus = latency.binance_connected ? "Binance 🟢" : "Binance 🔴";
+const coinbaseStatus = latency.coinbase_connected ? "Coinbase 🟢" : "Coinbase 🔴";
 setText(
 "latencyDetail",
-(
-latency.btc_stream
-?
-"⚡ Binance live stream"
-:
-"↩ REST fallback"
-)
-+
-" • Kalshi "
-+
-(
-latency.kalshi_age_ms == null
-?
-"--"
-:
-Number(
-latency.kalshi_age_ms
-).toFixed(0)
-+
-" ms old"
-)
+sourceIcon + " " + source +
+" • " + binanceStatus +
+" • " + coinbaseStatus +
+" • Kalshi " +
+(latency.kalshi_age_ms == null ? "--" : Number(latency.kalshi_age_ms).toFixed(0) + " ms")
 );
 
 
@@ -6640,48 +6689,24 @@ def index():
 @app.get("/api/live")
 def api_live():
 
-    received = live_btc.get(
-        "received_at",
-        0.0
-    )
+    now = time.time()
+    candidates = [
+        (live_btc.get("price"), live_btc.get("received_at", 0.0), "Binance Live", live_btc.get("connected")),
+        (live_coinbase.get("price"), live_coinbase.get("received_at", 0.0), "Coinbase Live", live_coinbase.get("connected")),
+    ]
+    fresh = [x for x in candidates if x[0] and x[1] and now - x[1] <= STREAM_MAX_AGE]
+    selected = min(fresh, key=lambda x: now - x[1]) if fresh else (None, 0.0, active_btc_source, False)
 
     return jsonify({
-
-        "price":
-            live_btc.get(
-                "price"
-            ),
-
-        "received_at":
-            received,
-
-        "age_ms":
-            (
-                round(
-                    max(
-                        0.0,
-                        time.time()
-                        -
-                        received
-                    ) * 1000,
-                    1
-                )
-                if received
-                else
-                None
-            ),
-
-        "connected":
-            bool(
-                live_btc.get(
-                    "connected"
-                )
-            ),
-
-        "source":
-            live_btc.get(
-                "source"
-            )
+        "price": selected[0],
+        "received_at": selected[1],
+        "age_ms": round(max(0.0, now - selected[1]) * 1000, 1) if selected[1] else None,
+        "connected": bool(selected[3]),
+        "source": selected[2],
+        "binance_connected": bool(live_btc.get("connected")),
+        "coinbase_connected": bool(live_coinbase.get("connected")),
+        "binance_age_ms": round(max(0.0, now - live_btc.get("received_at", 0.0)) * 1000, 1) if live_btc.get("received_at") else None,
+        "coinbase_age_ms": round(max(0.0, now - live_coinbase.get("received_at", 0.0)) * 1000, 1) if live_coinbase.get("received_at") else None,
     })
 
 
