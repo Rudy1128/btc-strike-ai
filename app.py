@@ -30,7 +30,7 @@ KALSHI_TICKER = os.getenv(
 KALSHI_SERIES = "KXBTC15M"
 
 session = requests.Session()
-session.headers["User-Agent"] = "BTC-Strike-AI/9.0"
+session.headers["User-Agent"] = "BTC-Strike-AI/10.0-Heat"
 
 cache = {
     "time": 0,
@@ -54,6 +54,14 @@ memory_loaded = False
 shift_history = []
 shift_lock = threading.Lock()
 SHIFT_HISTORY_MAX = 30
+
+# Market-control heat history.  This is a short rolling record of the
+# balance between executed flow, resting liquidity, momentum, price-vs-strike
+# and rapid control shifts.  It is a decision aid, not a guarantee of the
+# eventual Kalshi outcome.
+heat_history = []
+heat_lock = threading.Lock()
+HEAT_HISTORY_MAX = 60
 
 # =========================================================
 # REAL-TIME BINANCE STREAM
@@ -3464,6 +3472,184 @@ def memory_match(
 
 
 # =========================================================
+# MARKET CONTROL HEAT ENGINE
+# =========================================================
+
+def _paired_heat(value, default=50.0):
+    """Return a 0-100 buyer-side heat value."""
+    try:
+        return clamp(float(value))
+    except Exception:
+        return default
+
+
+def build_market_heat(
+    signal,
+    buy_sell,
+    order_book,
+    power_battle,
+    shift_detector,
+    price,
+    target
+):
+    """
+    Build a rolling BUYER-vs-SELLER control heat score.
+
+    Components:
+      30% executed trade pressure
+      30% visible order-book liquidity
+      20% momentum/structure
+      10% price vs Kalshi strike
+      10% rapid battle shift
+
+    The engine intentionally measures *control* rather than claiming it can
+    know the future.  The rolling history makes acceleration visible.
+    """
+    execution = _paired_heat(buy_sell.get("buy_pct")) if buy_sell.get("available") else None
+    liquidity = _paired_heat(order_book.get("bid_pct")) if order_book.get("available") else None
+
+    momentum = _signed_number((power_battle.get("bullish") or {}).get("momentum_power"))
+    momentum = _paired_heat(momentum) if momentum is not None else None
+
+    structure = str(signal.get("structure") or "")
+    if structure.startswith("HIGHER"):
+        structure_heat = 75.0
+    elif structure.startswith("LOWER"):
+        structure_heat = 25.0
+    else:
+        structure_heat = 50.0
+
+    if price is not None and target is not None:
+        try:
+            if price > target:
+                strike_heat = 70.0
+            elif price < target:
+                strike_heat = 30.0
+            else:
+                strike_heat = 50.0
+        except Exception:
+            strike_heat = 50.0
+    else:
+        strike_heat = 50.0
+
+    # Recent heat gives us a short-term acceleration measurement.
+    with heat_lock:
+        recent = heat_history[-8:]
+        previous_heat = heat_history[-1] if heat_history else None
+
+    base_parts = []
+    weights = []
+    for value, weight in (
+        (execution, 0.30),
+        (liquidity, 0.30),
+        (momentum, 0.20),
+        (strike_heat, 0.10),
+        (structure_heat, 0.10),
+    ):
+        if value is not None:
+            base_parts.append(value * weight)
+            weights.append(weight)
+
+    if not base_parts:
+        buyer_heat = 50.0
+    else:
+        buyer_heat = sum(base_parts) / sum(weights)
+
+    # Rapid-shift contribution is deliberately small so one noisy snapshot
+    # cannot overpower actual executed flow and liquidity.
+    shift_direction = shift_detector.get("direction", "WAIT")
+    shift_score = _signed_number(shift_detector.get("score")) or 0.0
+    if shift_direction == "BULL":
+        buyer_heat += min(7.0, abs(shift_score) * 0.7)
+    elif shift_direction == "BEAR":
+        buyer_heat -= min(7.0, abs(shift_score) * 0.7)
+
+    buyer_heat = clamp(buyer_heat)
+    seller_heat = clamp(100.0 - buyer_heat)
+
+    # Compare with the short rolling baseline.
+    baseline = None
+    if recent:
+        vals = [x.get("buyer_heat") for x in recent if x.get("buyer_heat") is not None]
+        if vals:
+            baseline = sum(vals) / len(vals)
+
+    acceleration = 0.0 if baseline is None else buyer_heat - baseline
+    instant_change = 0.0
+    if previous_heat and previous_heat.get("buyer_heat") is not None:
+        instant_change = buyer_heat - previous_heat.get("buyer_heat")
+
+    if buyer_heat >= 62 and buyer_heat > seller_heat:
+        winner = "BUYERS"
+    elif seller_heat >= 62 and seller_heat > buyer_heat:
+        winner = "SELLERS"
+    else:
+        winner = "BALANCED"
+
+    if winner == "BUYERS":
+        label = "🔥 BUYERS IN CONTROL"
+    elif winner == "SELLERS":
+        label = "🔥 SELLERS IN CONTROL"
+    else:
+        label = "🟡 HEAT BALANCED"
+
+    if acceleration >= 5:
+        acceleration_label = "BUYER HEAT ACCELERATING"
+        acceleration_direction = "BULL"
+    elif acceleration <= -5:
+        acceleration_label = "SELLER HEAT ACCELERATING"
+        acceleration_direction = "BEAR"
+    else:
+        acceleration_label = "CONTROL STABLE"
+        acceleration_direction = "WAIT"
+
+    spread = buyer_heat - seller_heat
+    heat_confidence = round(clamp(50.0 + abs(spread) * 1.15, 50.0, 96.0))
+
+    early_edge = False
+    if winner == "BUYERS" and acceleration >= 5:
+        early_edge = True
+    elif winner == "SELLERS" and acceleration <= -5:
+        early_edge = True
+
+    snapshot = {
+        "time": time.time(),
+        "buyer_heat": round(buyer_heat, 1),
+        "seller_heat": round(seller_heat, 1),
+        "winner": winner,
+        "acceleration": round(acceleration, 1),
+        "instant_change": round(instant_change, 1),
+    }
+
+    with heat_lock:
+        heat_history.append(snapshot)
+        if len(heat_history) > HEAT_HISTORY_MAX:
+            del heat_history[:-HEAT_HISTORY_MAX]
+        history_for_ui = list(heat_history[-24:])
+
+    return {
+        "available": bool(base_parts),
+        "buyer_heat": round(buyer_heat, 1),
+        "seller_heat": round(seller_heat, 1),
+        "winner": winner,
+        "label": label,
+        "heat_confidence": heat_confidence,
+        "acceleration": round(acceleration, 1),
+        "instant_change": round(instant_change, 1),
+        "acceleration_label": acceleration_label,
+        "acceleration_direction": acceleration_direction,
+        "early_edge": early_edge,
+        "execution_heat": round(execution, 1) if execution is not None else None,
+        "liquidity_heat": round(liquidity, 1) if liquidity is not None else None,
+        "momentum_heat": round(momentum, 1) if momentum is not None else None,
+        "strike_heat": round(strike_heat, 1),
+        "structure_heat": round(structure_heat, 1),
+        "history": history_for_ui,
+        "note": "Control heat combines flow and liquidity; it is not a guarantee of the final result.",
+    }
+
+
+# =========================================================
 # COLLECT STATE
 # =========================================================
 
@@ -3542,6 +3728,16 @@ def collect_state():
             /
             target
         ) * 100
+
+    market_heat = build_market_heat(
+        signal,
+        buy_sell,
+        order_book,
+        power_battle,
+        shift_detector,
+        price,
+        target
+    )
 
     if (
         market
@@ -3662,6 +3858,9 @@ def collect_state():
         "shift_detector":
             shift_detector,
 
+        "market_heat":
+            market_heat,
+
         "prediction_strength":
             strength,
 
@@ -3778,7 +3977,7 @@ PAGE = r"""
 <meta name="viewport"
 content="width=device-width,initial-scale=1">
 
-<title>BTC Strike AI</title>
+<title>BTC Strike AI — Heat Engine</title>
 
 <style>
 
@@ -4006,6 +4205,129 @@ grid-template-columns:1fr
 grid-column:auto
 }
 
+}
+
+
+/* =======================================================
+   MARKET CONTROL HEAT
+   ======================================================= */
+.heatPanel{
+background:#09141d;
+border:1px solid #253744;
+border-radius:16px;
+padding:18px;
+margin-top:10px
+}
+.heatHeader{
+display:flex;
+justify-content:space-between;
+align-items:center;
+gap:10px;
+flex-wrap:wrap
+}
+.heatWinner{
+font-size:25px;
+font-weight:900
+}
+.heatSub{
+color:#91a3b0;
+font-size:13px;
+margin-top:4px
+}
+.heatRows{
+display:grid;
+grid-template-columns:1fr;
+gap:9px;
+margin-top:16px
+}
+.heatRow{
+display:grid;
+grid-template-columns:115px 1fr 58px;
+align-items:center;
+gap:10px
+}
+.heatName{
+font-size:13px;
+color:#a9b9c4
+}
+.heatTrack{
+height:12px;
+background:#172631;
+border-radius:99px;
+overflow:hidden;
+position:relative
+}
+.heatFill{
+height:100%;
+width:50%;
+transition:width .25s ease;
+background:#3ed37f
+}
+.heatFill.sell{
+background:#ef5360
+}
+.heatNumber{
+text-align:right;
+font-weight:800
+}
+.heatBattle{
+display:grid;
+grid-template-columns:1fr 1fr;
+gap:10px;
+margin-top:16px
+}
+.heatSide{
+padding:12px;
+border-radius:12px;
+background:#0f202b
+}
+.heatSideTitle{
+font-size:13px;
+color:#9db0bc;
+margin-bottom:5px
+}
+.heatBig{
+font-size:30px;
+font-weight:900
+}
+.heatAccel{
+margin-top:14px;
+padding:11px 13px;
+border-radius:12px;
+background:#111f28;
+font-weight:800
+}
+.heatAccel.bull{
+border:1px solid #28b86b;
+color:#53df91
+}
+.heatAccel.bear{
+border:1px solid #d84a58;
+color:#ff6a76
+}
+.heatAccel.wait{
+border:1px solid #596873;
+color:#b3c0c8
+}
+.heatHistory{
+display:flex;
+gap:3px;
+height:22px;
+margin-top:14px;
+width:100%;
+}
+.heatCell{
+flex:1;
+border-radius:3px;
+background:#44525b;
+min-width:3px
+}
+.heatCell.bull{background:#35cf7b}
+.heatCell.bear{background:#ef5260}
+.heatCell.flat{background:#68757d}
+@media(max-width:700px){
+.heatRow{grid-template-columns:92px 1fr 52px}
+.heatBattle{grid-template-columns:1fr}
 }
 
 </style>
@@ -4378,6 +4700,64 @@ Waiting for data...
 <div id="shiftBox" class="shiftBox shiftWait">
 <div id="shiftTitle" class="shiftTitle">🟡 BUILDING SHIFT HISTORY</div>
 <div id="shiftDetail" class="shiftDetail">Watching for a change in control...</div>
+</div>
+
+</div>
+
+<div class="card wide">
+
+<div class="small">
+🔥 MARKET CONTROL HEAT
+</div>
+
+<div class="heatPanel">
+  <div class="heatHeader">
+    <div>
+      <div id="heatWinner" class="heatWinner">🟡 HEAT BALANCED</div>
+      <div id="heatConfidence" class="heatSub">Control heat: --</div>
+    </div>
+    <div id="heatEdge" class="heatSub">Watching for control acceleration...</div>
+  </div>
+
+  <div class="heatRows">
+    <div class="heatRow">
+      <div class="heatName">🟢 Buyer Heat</div>
+      <div class="heatTrack"><div id="buyerHeatBar" class="heatFill" style="width:50%"></div></div>
+      <div id="buyerHeat" class="heatNumber">50</div>
+    </div>
+    <div class="heatRow">
+      <div class="heatName">🔴 Seller Heat</div>
+      <div class="heatTrack"><div id="sellerHeatBar" class="heatFill sell" style="width:50%"></div></div>
+      <div id="sellerHeat" class="heatNumber">50</div>
+    </div>
+  </div>
+
+  <div class="heatBattle">
+    <div class="heatSide">
+      <div class="heatSideTitle">EXECUTED FLOW</div>
+      <div id="executionHeat" class="heatBig">--</div>
+      <div class="heatSub">Buyer-side heat</div>
+    </div>
+    <div class="heatSide">
+      <div class="heatSideTitle">LIQUIDITY / BOOK</div>
+      <div id="liquidityHeat" class="heatBig">--</div>
+      <div class="heatSub">Bid-side liquidity heat</div>
+    </div>
+    <div class="heatSide">
+      <div class="heatSideTitle">MOMENTUM</div>
+      <div id="momentumHeat" class="heatBig">--</div>
+      <div class="heatSub">Directional momentum heat</div>
+    </div>
+    <div class="heatSide">
+      <div class="heatSideTitle">STRIKE / STRUCTURE</div>
+      <div id="strikeStructureHeat" class="heatBig">--</div>
+      <div class="heatSub">Price + market structure</div>
+    </div>
+  </div>
+
+  <div id="heatAccel" class="heatAccel wait">🟡 CONTROL STABLE</div>
+  <div id="heatHistory" class="heatHistory"></div>
+  <div id="heatNote" class="heatSub">Control heat combines flow and liquidity; it is not a guarantee of the final result.</div>
 </div>
 
 </div>
@@ -5322,6 +5702,83 @@ setText(
 shiftDetector.detail ||
 "Watching for a change in control..."
 );
+
+// ---------------------------------------------------------
+// MARKET CONTROL HEAT
+// ---------------------------------------------------------
+const heat = data.market_heat || {};
+const buyerHeat = Number(heat.buyer_heat == null ? 50 : heat.buyer_heat);
+const sellerHeat = Number(heat.seller_heat == null ? 50 : heat.seller_heat);
+
+setText(
+"heatWinner",
+heat.label || "🟡 HEAT BALANCED"
+);
+
+setText(
+"heatConfidence",
+"Control heat: " +
+(heat.heat_confidence == null ? "--" : Number(heat.heat_confidence).toFixed(0) + "%") +
+" • spread " +
+Math.abs(buyerHeat - sellerHeat).toFixed(1) +
+" pts"
+);
+
+setText(
+"heatEdge",
+heat.early_edge
+? "⚡ EARLY EDGE — CONTROL ACCELERATING"
+: (heat.acceleration_label || "Watching for control acceleration...")
+);
+
+setText("buyerHeat", buyerHeat.toFixed(1));
+setText("sellerHeat", sellerHeat.toFixed(1));
+
+document.getElementById("buyerHeatBar").style.width = buyerHeat + "%";
+document.getElementById("sellerHeatBar").style.width = sellerHeat + "%";
+
+setText(
+"executionHeat",
+heat.execution_heat == null ? "--" : Number(heat.execution_heat).toFixed(1) + "%"
+);
+setText(
+"liquidityHeat",
+heat.liquidity_heat == null ? "--" : Number(heat.liquidity_heat).toFixed(1) + "%"
+);
+setText(
+"momentumHeat",
+heat.momentum_heat == null ? "--" : Number(heat.momentum_heat).toFixed(1) + "%"
+);
+setText(
+"strikeStructureHeat",
+(heat.strike_heat == null ? "--" : Number(heat.strike_heat).toFixed(0)) +
+" / " +
+(heat.structure_heat == null ? "--" : Number(heat.structure_heat).toFixed(0))
+);
+
+const heatAccel = document.getElementById("heatAccel");
+const heatDir = heat.acceleration_direction || "WAIT";
+heatAccel.className = "heatAccel " +
+(heatDir === "BULL" ? "bull" : heatDir === "BEAR" ? "bear" : "wait");
+setText(
+"heatAccel",
+(heat.acceleration_label || "🟡 CONTROL STABLE") +
+" • " +
+((Number(heat.acceleration || 0) >= 0 ? "+" : "") + Number(heat.acceleration || 0).toFixed(1) + " pts")
+);
+
+const heatHistoryEl = document.getElementById("heatHistory");
+if(heatHistoryEl){
+  heatHistoryEl.innerHTML = "";
+  (heat.history || []).forEach(item => {
+    const cell = document.createElement("div");
+    cell.className = "heatCell " +
+      (item.winner === "BUYERS" ? "bull" : item.winner === "SELLERS" ? "bear" : "flat");
+    const value = Number(item.buyer_heat == null ? 50 : item.buyer_heat);
+    cell.title = "Buyer heat " + value.toFixed(1) + " / Seller heat " + (100-value).toFixed(1);
+    heatHistoryEl.appendChild(cell);
+  });
+}
 
 
 setText(
