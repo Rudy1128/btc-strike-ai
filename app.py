@@ -48,6 +48,13 @@ signal_memory = []
 active_market = None
 memory_loaded = False
 
+# Short-term battle-shift history. This lets the dashboard detect a rapid
+# change in pressure instead of waiting for the full 1,000-trade window
+# to turn bearish/bullish.
+shift_history = []
+shift_lock = threading.Lock()
+SHIFT_HISTORY_MAX = 30
+
 # =========================================================
 # REAL-TIME BINANCE STREAM
 # =========================================================
@@ -1081,6 +1088,173 @@ def build_power_battle(signal, buy_sell, order_book, quality):
 
     return result
 
+
+
+# =========================================================
+# RAPID BATTLE-SHIFT DETECTOR
+# =========================================================
+
+def _signed_number(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def build_shift_detector(signal, buy_sell, order_book, power_battle, price):
+    """
+    Detect a fast change in control between dashboard snapshots.
+    Power Battle answers who is strongest now; this answers who is gaining
+    or losing control now.
+    """
+    current = {
+        "time": time.time(),
+        "price": _signed_number(price),
+        "buy_power": _signed_number((power_battle.get("bullish") or {}).get("buying_power")),
+        "sell_power": _signed_number((power_battle.get("bearish") or {}).get("selling_power")),
+        "bull_momentum": _signed_number((power_battle.get("bullish") or {}).get("momentum_power")),
+        "bear_momentum": _signed_number((power_battle.get("bearish") or {}).get("momentum_power")),
+        "buy_pct": _signed_number(buy_sell.get("buy_pct")),
+        "sell_pct": _signed_number(buy_sell.get("sell_pct")),
+        "delta": _signed_number(buy_sell.get("delta")),
+        "bid_pct": _signed_number(order_book.get("bid_pct")),
+        "ask_pct": _signed_number(order_book.get("ask_pct")),
+        "m1": _signed_number(signal.get("m1")),
+        "m5": _signed_number(signal.get("m5")),
+        "winner": power_battle.get("winner", "WAIT"),
+    }
+
+    with shift_lock:
+        previous = shift_history[-1] if shift_history else None
+        recent = shift_history[-6:]
+        shift_history.append(current)
+        if len(shift_history) > SHIFT_HISTORY_MAX:
+            del shift_history[:-SHIFT_HISTORY_MAX]
+
+    if previous is None:
+        return {
+            "available": False,
+            "direction": "WAIT",
+            "label": "🟡 BUILDING SHIFT HISTORY",
+            "score": 0,
+            "signals": [],
+            "detail": "Watching for a change in control...",
+            "bull_shift": 0,
+            "bear_shift": 0,
+        }
+
+    baseline = {}
+    for key in ("buy_power", "sell_power", "bull_momentum", "bear_momentum",
+                "buy_pct", "sell_pct", "bid_pct", "ask_pct", "m1", "m5"):
+        vals = [x.get(key) for x in recent if x.get(key) is not None]
+        baseline[key] = (sum(vals) / len(vals)) if vals else None
+
+    bull = 0
+    bear = 0
+    bull_signals = []
+    bear_signals = []
+
+    def change(key):
+        now = current.get(key)
+        base = baseline.get(key)
+        if now is None or base is None:
+            return None
+        return now - base
+
+    def add_bull(msg):
+        nonlocal bull
+        bull += 1
+        bull_signals.append(msg)
+
+    def add_bear(msg):
+        nonlocal bear
+        bear += 1
+        bear_signals.append(msg)
+
+    c = change("buy_power")
+    if c is not None:
+        if c >= 8: add_bull(f"Buying Power +{c:.1f}")
+        elif c <= -8: add_bear(f"Buying Power {c:.1f}")
+
+    c = change("sell_power")
+    if c is not None:
+        if c >= 8: add_bear(f"Selling Power +{c:.1f}")
+        elif c <= -8: add_bull(f"Selling Power {c:.1f}")
+
+    c = change("bull_momentum")
+    if c is not None:
+        if c >= 8: add_bull(f"Bullish Momentum +{c:.1f}")
+        elif c <= -8: add_bear(f"Bullish Momentum {c:.1f}")
+
+    c = change("bear_momentum")
+    if c is not None:
+        if c >= 8: add_bear(f"Bearish Momentum +{c:.1f}")
+        elif c <= -8: add_bull(f"Bearish Momentum {c:.1f}")
+
+    c = change("ask_pct")
+    if c is not None:
+        if c >= 10: add_bear(f"Asks +{c:.1f} pts")
+        elif c <= -10: add_bull(f"Asks {c:.1f} pts")
+
+    c = change("bid_pct")
+    if c is not None:
+        if c >= 10: add_bull(f"Bids +{c:.1f} pts")
+        elif c <= -10: add_bear(f"Bids {c:.1f} pts")
+
+    c = change("buy_pct")
+    if c is not None:
+        if c >= 8: add_bull(f"Buyers +{c:.1f} pts")
+        elif c <= -8: add_bear(f"Buyers {c:.1f} pts")
+
+    c = change("sell_pct")
+    if c is not None:
+        if c >= 8: add_bear(f"Sellers +{c:.1f} pts")
+        elif c <= -8: add_bull(f"Sellers {c:.1f} pts")
+
+    old_delta = previous.get("delta")
+    new_delta = current.get("delta")
+    if old_delta is not None and new_delta is not None:
+        if old_delta > 0 and new_delta < 0: add_bear("Delta flipped NEGATIVE")
+        elif old_delta < 0 and new_delta > 0: add_bull("Delta flipped POSITIVE")
+
+    old_m1 = previous.get("m1")
+    new_m1 = current.get("m1")
+    if old_m1 is not None and new_m1 is not None:
+        if old_m1 > 0 and new_m1 < 0: add_bear("1m momentum flipped DOWN")
+        elif old_m1 < 0 and new_m1 > 0: add_bull("1m momentum flipped UP")
+
+    if bear >= 3 and bear > bull:
+        direction, label = "BEAR", "🔴 BEARS TAKING CONTROL"
+        detail = " • ".join(bear_signals[:4])
+    elif bull >= 3 and bull > bear:
+        direction, label = "BULL", "🟢 BULLS TAKING CONTROL"
+        detail = " • ".join(bull_signals[:4])
+    elif bear >= 2 and bear > bull:
+        direction, label = "BEAR", "⚠️ BEARISH SHIFT"
+        detail = " • ".join(bear_signals[:4])
+    elif bull >= 2 and bull > bear:
+        direction, label = "BULL", "⚠️ BULLISH SHIFT"
+        detail = " • ".join(bull_signals[:4])
+    elif current.get("winner") == "BULLS":
+        direction, label = "BULL", "🟢 BULLS STABLE"
+        detail = "No rapid control shift detected."
+    elif current.get("winner") == "BEARS":
+        direction, label = "BEAR", "🔴 BEARS STABLE"
+        detail = "No rapid control shift detected."
+    else:
+        direction, label = "WAIT", "🟡 BATTLE STABLE / MIXED"
+        detail = "No strong control shift detected."
+
+    return {
+        "available": True,
+        "direction": direction,
+        "label": label,
+        "score": abs(bull - bear),
+        "signals": (bear_signals if direction == "BEAR" else bull_signals)[:5],
+        "detail": detail,
+        "bull_shift": bull,
+        "bear_shift": bear,
+    }
 
 
 # =========================================================
@@ -2911,6 +3085,14 @@ def collect_state():
         quality_score
     )
 
+    shift_detector = build_shift_detector(
+        signal,
+        buy_sell,
+        order_book,
+        power_battle,
+        price
+    )
+
     target = (
         market.get(
             "target"
@@ -3052,6 +3234,9 @@ def collect_state():
 
         "power_battle":
             power_battle,
+
+        "shift_detector":
+            shift_detector,
 
         "prediction_strength":
             strength,
@@ -3331,6 +3516,42 @@ font-size:28px;
 font-weight:900;
 text-align:center;
 margin-top:14px
+}
+
+.shiftBox{
+margin-top:14px;
+padding:14px;
+border-radius:12px;
+background:#101f2b;
+border:1px solid #243847;
+text-align:center
+}
+
+.shiftTitle{
+font-size:20px;
+font-weight:900
+}
+
+.shiftDetail{
+color:#91a3b0;
+font-size:13px;
+margin-top:7px;
+line-height:1.45
+}
+
+.shiftBull{
+border-color:#1b9b5c;
+background:#092b1a
+}
+
+.shiftBear{
+border-color:#d44754;
+background:#321014
+}
+
+.shiftWait{
+border-color:#c4a63a;
+background:#30280b
 }
 
 @media(max-width:520px){
@@ -3726,6 +3947,11 @@ style="text-align:center">
 Waiting for data...
 </div>
 
+<div id="shiftBox" class="shiftBox shiftWait">
+<div id="shiftTitle" class="shiftTitle">🟡 BUILDING SHIFT HISTORY</div>
+<div id="shiftDetail" class="shiftDetail">Watching for a change in control...</div>
+</div>
+
 </div>
 
 <div class="card wide">
@@ -4105,6 +4331,9 @@ data.order_book || {};
 
 const powerBattle =
 data.power_battle || {};
+
+const shiftDetector =
+data.shift_detector || {};
 
 const prediction =
 data.prediction_strength || {};
@@ -4610,6 +4839,22 @@ Number(powerBattle.confidence || 0).toFixed(0) +
 powerBattle.reason ||
 "Waiting for data..."
 )
+);
+
+const shiftBox = document.getElementById("shiftBox");
+const shiftDirection = shiftDetector.direction || "WAIT";
+shiftBox.className = "shiftBox " +
+(shiftDirection === "BEAR" ? "shiftBear" :
+ shiftDirection === "BULL" ? "shiftBull" : "shiftWait");
+setText(
+"shiftTitle",
+shiftDetector.label ||
+"🟡 BUILDING SHIFT HISTORY"
+);
+setText(
+"shiftDetail",
+shiftDetector.detail ||
+"Watching for a change in control..."
 );
 
 
