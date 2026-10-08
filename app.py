@@ -4325,6 +4325,12 @@ def collect_state():
         "candles":
             len(candles),
 
+        "candle_history":
+            [
+                {"time": ts, "price": close}
+                for ts, close in candles
+            ],
+
         "signal":
             signal,
 
@@ -4660,6 +4666,22 @@ text-align:center;
 margin-top:14px
 }
 
+.strikeHero{margin-top:14px;padding:16px;background:#0b151e;border:1px solid #263845;border-radius:16px}
+.strikeTop{display:flex;justify-content:space-between;gap:12px}
+.strikePrice{font-size:32px;font-weight:900;margin-top:5px}
+.strikeTime{text-align:right;font-size:27px;font-weight:900}
+.strikeStatus{display:inline-block;margin-top:7px;padding:5px 9px;border-radius:8px;font-size:12px;font-weight:900}
+.strikeAbove{color:#43d184;background:#092b1a;border:1px solid #1b9b5c}
+.strikeBelow{color:#ff6570;background:#321014;border:1px solid #d44754}
+.strikeWait{color:#e0c45b;background:#30280b;border:1px solid #c4a63a}
+.strikeStats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
+.strikeStat{background:#101f2b;border:1px solid #20323f;border-radius:10px;padding:10px}
+.strikeStat span{display:block;color:#91a3b0;font-size:10px;font-weight:800}
+.strikeStat strong{display:block;font-size:17px;margin-top:4px}
+.strikeChartBox{height:280px;margin-top:12px;background:#071019;border:1px solid #1c2c38;border-radius:12px;overflow:hidden}
+#strikeChart{width:100%;height:100%;display:block}
+.strikeLegend{display:flex;justify-content:space-between;margin-top:9px;color:#91a3b0;font-size:11px;font-weight:700}
+@media(max-width:520px){.strikeHero{padding:12px}.strikePrice{font-size:27px}.strikeTime{font-size:23px}.strikeChartBox{height:250px}.strikeStat strong{font-size:15px}.strikeLegend{font-size:10px}}
 .shiftBox{
 margin-top:14px;
 padding:14px;
@@ -4857,6 +4879,27 @@ min-width:3px
 
 <div class="small">
 KXBTC15M • Binance Live • Signal Memory 🧠
+</div>
+
+<div class="strikeHero">
+  <div class="strikeTop">
+    <div>
+      <div class="small">₿ BTC 15 MIN • LIVE STRIKE</div>
+      <div id="strikePrice" class="strikePrice">--</div>
+      <div id="strikeStatus" class="strikeStatus strikeWait">WAITING FOR TARGET</div>
+    </div>
+    <div>
+      <div class="small">TIME LEFT</div>
+      <div id="strikeCountdown" class="strikeTime">--:--</div>
+    </div>
+  </div>
+  <div class="strikeStats">
+    <div class="strikeStat"><span>TARGET / STRIKE</span><strong id="strikeTarget">--</strong></div>
+    <div class="strikeStat"><span>NOW</span><strong id="strikeNow">--</strong></div>
+    <div class="strikeStat"><span>DIFFERENCE</span><strong id="strikeDiff">--</strong></div>
+  </div>
+  <div class="strikeChartBox"><canvas id="strikeChart"></canvas></div>
+  <div class="strikeLegend"><span style="color:#ff6570">🔴 BELOW TARGET</span><span style="color:#e0c45b">🎯 TARGET</span><span style="color:#43d184">🟢 ABOVE TARGET</span></div>
 </div>
 
 <div id="ensembleForecast" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.16);">
@@ -5520,6 +5563,84 @@ let countdownRefreshPending =
 false;
 
 
+
+const strikeChartState={ticker:null,target:null,history:[],live:[]};
+
+function strikeMoney(v){
+  if(v==null || !Number.isFinite(Number(v))) return "--";
+  return "$"+Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+}
+
+function updateStrikeHero(price,target){
+  const p=Number(price), t=Number(target);
+  if(Number.isFinite(t)) document.getElementById("strikeTarget").textContent=strikeMoney(t);
+  if(!Number.isFinite(p)) return;
+  document.getElementById("strikePrice").textContent=strikeMoney(p);
+  document.getElementById("strikeNow").textContent=strikeMoney(p);
+  const st=document.getElementById("strikeStatus"), d=document.getElementById("strikeDiff");
+  if(!Number.isFinite(t)){d.textContent="--";return;}
+  const diff=p-t;
+  d.textContent=(diff>=0?"+":"")+strikeMoney(diff);
+  if(diff>0){st.className="strikeStatus strikeAbove";st.textContent="🟢 ABOVE TARGET";}
+  else if(diff<0){st.className="strikeStatus strikeBelow";st.textContent="🔴 BELOW TARGET";}
+  else{st.className="strikeStatus strikeWait";st.textContent="🎯 AT TARGET";}
+}
+
+function drawStrikeChart(){
+  const c=document.getElementById("strikeChart"); if(!c)return;
+  const box=c.parentElement,r=box.getBoundingClientRect(),dpr=window.devicePixelRatio||1;
+  if(r.width<20)return;
+  c.width=r.width*dpr;c.height=r.height*dpr;
+  const ctx=c.getContext("2d");ctx.setTransform(dpr,0,0,dpr,0,0);
+  const W=r.width,H=r.height;ctx.clearRect(0,0,W,H);
+  const target=Number(strikeChartState.target);
+  if(!Number.isFinite(target)){ctx.fillStyle="#91a3b0";ctx.font="700 13px Arial";ctx.textAlign="center";ctx.fillText("Waiting for Kalshi target...",W/2,H/2);return;}
+  let pts=[...strikeChartState.history,...strikeChartState.live].filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.price)).sort((a,b)=>a.time-b.time);
+  const cutoff=Date.now()/1000-15*60;pts=pts.filter(p=>p.time>=cutoff);
+  const clean=[];for(const p of pts){const q=clean[clean.length-1];if(q&&Math.abs(q.time-p.time)<.2)q.price=p.price;else clean.push({...p});}pts=clean;
+  let vals=pts.map(p=>p.price);if(!vals.length)vals=[target];
+  let min=Math.min(...vals,target),max=Math.max(...vals,target),range=max-min||Math.max(target*.001,1),pad=Math.max(range*.16,target*.00015);min-=pad;max+=pad;
+  const L=10,R=70,T=16,B=25,PW=W-L-R,PH=H-T-B;
+  const t0=pts.length?pts[0].time:Date.now()/1000-900,t1=pts.length?Math.max(pts[pts.length-1].time,Date.now()/1000):Date.now()/1000,tr=Math.max(1,t1-t0);
+  const X=t=>L+(t-t0)/tr*PW,Y=v=>T+(max-v)/(max-min)*PH,ty=Y(target);
+  ctx.strokeStyle="rgba(145,163,176,.10)";ctx.lineWidth=1;
+  for(let i=0;i<=4;i++){let gy=T+PH*i/4;ctx.beginPath();ctx.moveTo(L,gy);ctx.lineTo(L+PW,gy);ctx.stroke();}
+  if(pts.length>1){
+    for(let i=1;i<pts.length;i++){
+      let a=pts[i-1],b=pts[i],x1=X(a.time),x2=X(b.time),y1=Y(a.price),y2=Y(b.price);
+      const fill=(xA,yA,xB,yB,col)=>{ctx.beginPath();ctx.moveTo(xA,yA);ctx.lineTo(xB,yB);ctx.lineTo(xB,ty);ctx.lineTo(xA,ty);ctx.closePath();ctx.fillStyle=col;ctx.fill();};
+      if((a.price-target)*(b.price-target)>=0) fill(x1,y1,x2,y2,a.price>=target?"rgba(27,155,92,.18)":"rgba(212,71,84,.18)");
+      else {let f=(target-a.price)/(b.price-a.price),xc=x1+(x2-x1)*f;if(a.price>=target){fill(x1,y1,xc,ty,"rgba(27,155,92,.18)");fill(xc,ty,x2,y2,"rgba(212,71,84,.18)");}else{fill(x1,y1,xc,ty,"rgba(212,71,84,.18)");fill(xc,ty,x2,y2,"rgba(27,155,92,.18)");}}
+    }
+    ctx.beginPath();pts.forEach((p,i)=>i?ctx.lineTo(X(p.time),Y(p.price)):ctx.moveTo(X(p.time),Y(p.price)));
+    ctx.strokeStyle=pts[pts.length-1].price>=target?"#43d184":"#ff6570";ctx.lineWidth=2.7;ctx.lineJoin="round";ctx.lineCap="round";ctx.stroke();
+  }
+  ctx.save();ctx.setLineDash([7,5]);ctx.strokeStyle="#e0c45b";ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(L,ty);ctx.lineTo(L+PW,ty);ctx.stroke();ctx.restore();
+  ctx.fillStyle="#e0c45b";ctx.font="800 11px Arial";ctx.textAlign="left";ctx.fillText("TARGET "+strikeMoney(target),L+PW+5,Math.max(12,Math.min(H-8,ty+4)));
+  if(pts.length){let p=pts[pts.length-1],cx=X(p.time),cy=Y(p.price);ctx.beginPath();ctx.arc(cx,cy,5,0,Math.PI*2);ctx.fillStyle=p.price>=target?"#43d184":"#ff6570";ctx.fill();ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.stroke();ctx.fillStyle=p.price>=target?"#43d184":"#ff6570";ctx.font="900 11px Arial";ctx.textAlign="right";ctx.fillText(strikeMoney(p.price),Math.min(W-5,cx+62),Math.max(12,cy-9));}
+}
+
+function setStrikeHistory(data){
+  const m=data.market||{},ticker=m.ticker||null,target=Number(m.target);
+  if(strikeChartState.ticker!==ticker || strikeChartState.target!==target){
+    strikeChartState.ticker=ticker;strikeChartState.target=Number.isFinite(target)?target:null;strikeChartState.live=[];
+  }
+  strikeChartState.history=(Array.isArray(data.candle_history)?data.candle_history:[]).map(p=>({time:Number(p.time),price:Number(p.price)})).filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.price));
+  updateStrikeHero(data.btc,target);
+  if(data.btc!=null) strikeChartState.live.push({time:Date.now()/1000,price:Number(data.btc)});
+  const cut=Date.now()/1000-900;strikeChartState.live=strikeChartState.live.filter(p=>p.time>=cut);
+  drawStrikeChart();
+}
+
+function pushStrikeLive(price,time){
+  if(price==null)return;
+  const p=Number(price),t=Number(time)||Date.now()/1000;
+  const last=strikeChartState.live[strikeChartState.live.length-1];
+  if(last&&Math.abs(t-last.time)<.2)last.price=p;else strikeChartState.live.push({time:t,price:p});
+  const cut=Date.now()/1000-900;strikeChartState.live=strikeChartState.live.filter(x=>x.time>=cut);
+  updateStrikeHero(p,strikeChartState.target);drawStrikeChart();
+}
+
 function tickCountdown(){
 
 const el =
@@ -5552,6 +5673,12 @@ el.textContent =
 clock(
 remaining
 );
+
+const heroCountdown =
+document.getElementById("strikeCountdown");
+if(heroCountdown){
+  heroCountdown.textContent = clock(remaining);
+}
 
 if(
 remaining <= 0
@@ -5598,6 +5725,11 @@ setText(
 money(
 live.price
 )
+);
+
+pushStrikeLive(
+live.price,
+live.received_at
 );
 
 }
@@ -5655,6 +5787,7 @@ data.signal || {};
 const market =
 data.market || {};
 
+setStrikeHistory(data);
 
 if(
 data.market_close_ts != null
@@ -6665,6 +6798,8 @@ setInterval(
 refreshLive,
 250
 );
+
+window.addEventListener("resize", drawStrikeChart);
 
 </script>
 
