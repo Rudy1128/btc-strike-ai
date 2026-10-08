@@ -866,6 +866,223 @@ def get_order_book_pressure():
     return result
 
 
+
+# =========================================================
+# 2 vs 2 BUYER / BEARER POWER ENGINE
+# =========================================================
+
+def clamp(value, low=0.0, high=100.0):
+    return max(low, min(high, float(value)))
+
+
+def pressure_score(buy_sell, order_book):
+    """
+    Combines executed trade pressure and visible order-book pressure.
+    Returns independent BUY and SELL power scores from 0-100.
+    """
+    buy_pct = buy_sell.get("buy_pct")
+    sell_pct = buy_sell.get("sell_pct")
+    bid_pct = order_book.get("bid_pct")
+    ask_pct = order_book.get("ask_pct")
+
+    trade_buy = float(buy_pct) if buy_pct is not None else None
+    trade_sell = float(sell_pct) if sell_pct is not None else None
+    book_buy = float(bid_pct) if bid_pct is not None else None
+    book_sell = float(ask_pct) if ask_pct is not None else None
+
+    buy_parts = [v for v in (trade_buy, book_buy) if v is not None]
+    sell_parts = [v for v in (trade_sell, book_sell) if v is not None]
+
+    buy_power = (
+        sum(buy_parts) / len(buy_parts)
+        if buy_parts else None
+    )
+    sell_power = (
+        sum(sell_parts) / len(sell_parts)
+        if sell_parts else None
+    )
+
+    return buy_power, sell_power
+
+
+def momentum_power(signal):
+    """
+    Converts the existing 1m/5m/15m momentum and structure into
+    a directional 0-100 momentum score.
+    """
+    values = [
+        (signal.get("m1"), 0.03),
+        (signal.get("m5"), 0.08),
+        (signal.get("m15"), 0.15),
+    ]
+
+    directional = []
+
+    for value, scale in values:
+        if value is None:
+            continue
+
+        try:
+            ratio = clamp(abs(float(value)) / scale, 0.0, 1.0)
+
+            if float(value) > 0:
+                directional.append(50.0 + ratio * 50.0)
+            elif float(value) < 0:
+                directional.append(50.0 - ratio * 50.0)
+            else:
+                directional.append(50.0)
+        except Exception:
+            continue
+
+    if not directional:
+        base = 50.0
+    else:
+        base = sum(directional) / len(directional)
+
+    structure = str(signal.get("structure") or "")
+
+    if structure.startswith("HIGHER"):
+        base += 10.0
+    elif structure.startswith("LOWER"):
+        base -= 10.0
+
+    return clamp(base)
+
+
+def build_power_battle(signal, buy_sell, order_book, quality):
+    """
+    Four-signal battle:
+
+      BULL #1 = Buying Power
+      BULL #2 = Bullish Momentum
+
+      BEAR #1 = Selling Power
+      BEAR #2 = Bearish Momentum
+
+    The final winner is based on power, not simply counting 2 vs 2.
+    """
+    result = {
+        "available": False,
+        "bullish": {
+            "buying_power": None,
+            "momentum_power": None,
+            "active": False,
+        },
+        "bearish": {
+            "selling_power": None,
+            "momentum_power": None,
+            "active": False,
+        },
+        "bull_power": None,
+        "bear_power": None,
+        "winner": "WAIT",
+        "label": "🟡 WAIT — BUILDING DATA",
+        "confidence": 0,
+        "reason": "Waiting for buying/selling pressure and momentum data.",
+    }
+
+    if quality < 50:
+        result["reason"] = "Data quality is too low to choose a side."
+        return result
+
+    buy_power, sell_power = pressure_score(
+        buy_sell,
+        order_book
+    )
+
+    momentum = momentum_power(signal)
+
+    if buy_power is None and sell_power is None:
+        result["reason"] = "No reliable trade/order-book pressure data."
+        return result
+
+    # If one pressure source is unavailable, use the available source.
+    if buy_power is None:
+        buy_power = 50.0
+
+    if sell_power is None:
+        sell_power = 50.0
+
+    bull_momentum = momentum
+    bear_momentum = 100.0 - momentum
+
+    bull_power = (
+        buy_power * 0.60
+        +
+        bull_momentum * 0.40
+    )
+
+    bear_power = (
+        sell_power * 0.60
+        +
+        bear_momentum * 0.40
+    )
+
+    bull_power = clamp(bull_power)
+    bear_power = clamp(bear_power)
+
+    # Require an actual edge. Small differences are WAIT.
+    difference = abs(bull_power - bear_power)
+
+    if difference < 7:
+        winner = "WAIT"
+        label = "🟡 WAIT — BATTLE TOO CLOSE"
+        confidence = 50
+        reason = "Buying and selling power are too close to call."
+
+    elif bull_power > bear_power:
+        winner = "BULLS"
+        label = "🟢 BULLS WINNING"
+        confidence = round(
+            clamp(50 + difference * 1.25, 50, 96)
+        )
+        reason = "Buying power and bullish momentum have the stronger combined score."
+
+    else:
+        winner = "BEARS"
+        label = "🔴 BEARS WINNING"
+        confidence = round(
+            clamp(50 + difference * 1.25, 50, 96)
+        )
+        reason = "Selling power and bearish momentum have the stronger combined score."
+
+    # A stale/missing pressure feed should never create a strong verdict.
+    pressure_available = (
+        buy_sell.get("available")
+        or
+        order_book.get("available")
+    )
+
+    if not pressure_available:
+        winner = "WAIT"
+        label = "🟡 WAIT — NO PRESSURE DATA"
+        confidence = 0
+        reason = "Pressure feeds are unavailable."
+
+    result.update({
+        "available": bool(pressure_available),
+        "bullish": {
+            "buying_power": round(buy_power, 1),
+            "momentum_power": round(bull_momentum, 1),
+            "active": bull_power > 50,
+        },
+        "bearish": {
+            "selling_power": round(sell_power, 1),
+            "momentum_power": round(bear_momentum, 1),
+            "active": bear_power > 50,
+        },
+        "bull_power": round(bull_power, 1),
+        "bear_power": round(bear_power, 1),
+        "winner": winner,
+        "label": label,
+        "confidence": confidence,
+        "reason": reason,
+    })
+
+    return result
+
+
+
 # =========================================================
 # PREDICTION STRENGTH
 # =========================================================
@@ -2687,6 +2904,13 @@ def collect_state():
         quality_score
     )
 
+    power_battle = build_power_battle(
+        signal,
+        buy_sell,
+        order_book,
+        quality_score
+    )
+
     target = (
         market.get(
             "target"
@@ -2825,6 +3049,9 @@ def collect_state():
 
         "order_book":
             order_book,
+
+        "power_battle":
+            power_battle,
 
         "prediction_strength":
             strength,
@@ -3046,6 +3273,70 @@ margin-top:10px
 .battleBuy{
 height:100%;
 background:#1b9b5c
+}
+
+.powerGrid{
+display:grid;
+grid-template-columns:1fr 1fr;
+gap:12px;
+margin-top:12px
+}
+
+.powerSide{
+background:#101f2b;
+border:1px solid #243847;
+border-radius:12px;
+padding:14px
+}
+
+.powerSide.bull{
+border-color:#1b9b5c
+}
+
+.powerSide.bear{
+border-color:#d44754
+}
+
+.powerTitle{
+font-size:18px;
+font-weight:900
+}
+
+.powerValue{
+font-size:25px;
+font-weight:900;
+margin-top:7px
+}
+
+.powerBar{
+height:10px;
+background:#182632;
+border-radius:8px;
+overflow:hidden;
+margin-top:7px
+}
+
+.powerBullFill{
+height:100%;
+background:#1b9b5c
+}
+
+.powerBearFill{
+height:100%;
+background:#d44754
+}
+
+.powerWinner{
+font-size:28px;
+font-weight:900;
+text-align:center;
+margin-top:14px
+}
+
+@media(max-width:520px){
+.powerGrid{
+grid-template-columns:1fr
+}
 }
 
 @media(max-width:800px){
@@ -3334,6 +3625,105 @@ Delta: --
 <div id="battleTrades"
 class="small">
 Trades: --
+</div>
+
+</div>
+
+<div class="card wide">
+
+<div class="small">
+⚔️ 2 vs 2 POWER BATTLE
+</div>
+
+<div class="powerGrid">
+
+<div class="powerSide bull">
+
+<div class="powerTitle">
+🟢 BULLISH
+</div>
+
+<div class="small">
+#1 Buying Power
+</div>
+
+<div id="bullBuying" class="powerValue">
+--
+</div>
+
+<div class="powerBar">
+<div id="bullBuyingBar"
+class="powerBullFill"
+style="width:50%">
+</div>
+</div>
+
+<div class="small">
+#2 Bullish Momentum
+</div>
+
+<div id="bullMomentum" class="powerValue">
+--
+</div>
+
+<div class="powerBar">
+<div id="bullMomentumBar"
+class="powerBullFill"
+style="width:50%">
+</div>
+</div>
+
+</div>
+
+<div class="powerSide bear">
+
+<div class="powerTitle">
+🔴 BEARISH
+</div>
+
+<div class="small">
+#1 Selling Power
+</div>
+
+<div id="bearSelling" class="powerValue">
+--
+</div>
+
+<div class="powerBar">
+<div id="bearSellingBar"
+class="powerBearFill"
+style="width:50%">
+</div>
+</div>
+
+<div class="small">
+#2 Bearish Momentum
+</div>
+
+<div id="bearMomentum" class="powerValue">
+--
+</div>
+
+<div class="powerBar">
+<div id="bearMomentumBar"
+class="powerBearFill"
+style="width:50%">
+</div>
+</div>
+
+</div>
+
+</div>
+
+<div id="powerWinner"
+class="powerWinner">
+🟡 WAIT
+</div>
+
+<div id="powerDetail"
+class="small"
+style="text-align:center">
+Waiting for data...
 </div>
 
 </div>
@@ -3712,6 +4102,9 @@ data.buy_sell || {};
 
 const orderBook =
 data.order_book || {};
+
+const powerBattle =
+data.power_battle || {};
 
 const prediction =
 data.prediction_strength || {};
@@ -4116,6 +4509,108 @@ orderBook.winner ||
 );
 
 }
+
+
+setText(
+"bullBuying",
+powerBattle.bullish &&
+powerBattle.bullish.buying_power != null
+?
+Number(powerBattle.bullish.buying_power).toFixed(1) + "%"
+:
+"--"
+);
+
+setText(
+"bullMomentum",
+powerBattle.bullish &&
+powerBattle.bullish.momentum_power != null
+?
+Number(powerBattle.bullish.momentum_power).toFixed(1) + "%"
+:
+"--"
+);
+
+setText(
+"bearSelling",
+powerBattle.bearish &&
+powerBattle.bearish.selling_power != null
+?
+Number(powerBattle.bearish.selling_power).toFixed(1) + "%"
+:
+"--"
+);
+
+setText(
+"bearMomentum",
+powerBattle.bearish &&
+powerBattle.bearish.momentum_power != null
+?
+Number(powerBattle.bearish.momentum_power).toFixed(1) + "%"
+:
+"--"
+);
+
+if(
+powerBattle.bullish &&
+powerBattle.bullish.buying_power != null
+){
+document.getElementById("bullBuyingBar").style.width =
+Number(powerBattle.bullish.buying_power) + "%";
+}
+
+if(
+powerBattle.bullish &&
+powerBattle.bullish.momentum_power != null
+){
+document.getElementById("bullMomentumBar").style.width =
+Number(powerBattle.bullish.momentum_power) + "%";
+}
+
+if(
+powerBattle.bearish &&
+powerBattle.bearish.selling_power != null
+){
+document.getElementById("bearSellingBar").style.width =
+Number(powerBattle.bearish.selling_power) + "%";
+}
+
+if(
+powerBattle.bearish &&
+powerBattle.bearish.momentum_power != null
+){
+document.getElementById("bearMomentumBar").style.width =
+Number(powerBattle.bearish.momentum_power) + "%";
+}
+
+setText(
+"powerWinner",
+powerBattle.label ||
+"🟡 WAIT"
+);
+
+setText(
+"powerDetail",
+(
+powerBattle.bull_power != null &&
+powerBattle.bear_power != null
+)
+?
+(
+"Bull Power " +
+Number(powerBattle.bull_power).toFixed(1) +
+"% • Bear Power " +
+Number(powerBattle.bear_power).toFixed(1) +
+"% • " +
+Number(powerBattle.confidence || 0).toFixed(0) +
+"% confidence"
+)
+:
+(
+powerBattle.reason ||
+"Waiting for data..."
+)
+);
 
 
 setText(
