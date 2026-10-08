@@ -3958,19 +3958,30 @@ def statistical_15m_model(price, target, candles, close_time):
     p_up = 0.5 + (p_up - 0.5) * history_factor * (1.0 - vol_penalty)
     p_up = max(0.05, min(0.95, p_up))
 
-    probability = int(round(p_up * 100))
-    edge = abs(probability - 50)
+    # p_up is always the probability that BTC finishes AT/ABOVE the strike.
+    # The dashboard, however, should display the probability of the SELECTED
+    # direction.  Otherwise a DOWN call could incorrectly show a low number
+    # such as 11%, even though 89% of the model probability is DOWN.
+    up_probability = int(round(p_up * 100))
+    up_probability = max(5, min(95, up_probability))
+    edge = abs(up_probability - 50)
     confidence = int(round(min(95, edge * 2.2)))
 
     # Near expiry, require a meaningful edge instead of forcing a direction.
     if remaining <= 60 and edge < 12:
         direction = "WAIT"
-    elif probability >= 55:
+    elif up_probability >= 55:
         direction = "UP"
-    elif probability <= 45:
+    elif up_probability <= 45:
         direction = "DOWN"
     else:
         direction = "WAIT"
+
+    directional_probability = (
+        up_probability if direction == "UP"
+        else 100 - up_probability if direction == "DOWN"
+        else 50
+    )
 
     reason = (
         f"Strike distance {distance*100:+.3f}% • {minutes:.1f}m remaining • "
@@ -3979,7 +3990,8 @@ def statistical_15m_model(price, target, candles, close_time):
 
     return {
         "direction": direction,
-        "probability": probability,
+        "probability": directional_probability,
+        "up_probability": up_probability,
         "confidence": confidence,
         "reason": reason,
         "samples": len(returns),
@@ -4017,10 +4029,18 @@ def ensemble_15m_forecast(stat_model, winner_forecast, signal, market_heat, qual
     agreement = int(round(100 * max(up_weight, down_weight) / total)) if total else 0
     direction = "UP" if up_weight > down_weight else "DOWN" if down_weight > up_weight else "WAIT"
 
-    raw_prob = 50 + (up_weight - down_weight) * 50
-    probability = int(round(max(5, min(95, raw_prob))))
+    # raw_up_probability is always the UP probability.  Convert it to the
+    # probability of the selected direction before displaying it.
+    raw_up_probability = 50 + (up_weight - down_weight) * 50
+    raw_up_probability = max(5, min(95, raw_up_probability))
+    directional_probability = (
+        raw_up_probability if direction == "UP"
+        else 100 - raw_up_probability if direction == "DOWN"
+        else 50
+    )
+    probability = int(round(directional_probability))
     quality_factor = max(0.45, min(1.0, float(quality_score or 0) / 100.0))
-    confidence = int(round(min(95, abs(probability-50) * 2.0 * quality_factor)))
+    confidence = int(round(min(95, abs(raw_up_probability-50) * 2.0 * quality_factor)))
 
     # A split between the independent statistical model and the trajectory model
     # is exactly where we want to avoid pretending certainty.
@@ -4036,7 +4056,7 @@ def ensemble_15m_forecast(stat_model, winner_forecast, signal, market_heat, qual
         probability = 50
         reason = "Evidence is too weak or balanced for a clean 15-minute call."
     else:
-        reason = f"{len(models)} model layers agree; ensemble edge is {abs(probability-50)} points."
+        reason = f"{len(models)} model layers agree; directional edge is {abs(probability-50)} points."
 
     return {
         "direction": direction,
@@ -4782,6 +4802,7 @@ KXBTC15M • Binance Live • Signal Memory 🧠
 <div class="small">🤖 INDEPENDENT 15-MINUTE ENSEMBLE</div>
 <div id="ensembleLabel" class="big">⚪ WAIT</div>
 <div id="ensembleProbability" style="font-size:32px;font-weight:800;">50%</div>
+<div id="ensembleProbabilityLabel" class="small">Directional probability</div>
 <div id="ensembleMeta" class="small">Waiting for model agreement...</div>
 <div id="ensembleReason" class="small" style="margin-top:8px;opacity:.85;">Waiting for enough data.</div>
 </div>
@@ -5664,8 +5685,11 @@ if(ensembleDir === "UP"){
   setText("ensembleLabel", "🟡 ENSEMBLE: WAIT");
   ensembleBox.style.borderColor = "rgba(196,166,58,.65)";
 }
-setText("ensembleProbability", (ensemble.probability == null ? 50 : ensemble.probability) + "%");
-setText("ensembleMeta", "Confidence " + (ensemble.confidence || 0) + "% • agreement " + (ensemble.agreement || 0) + "% • " + (ensemble.models_used || 0) + " models");
+const ensembleProb = ensemble.probability == null ? 50 : Number(ensemble.probability);
+const ensembleDirText = ensembleDir === "UP" ? "UP probability" : ensembleDir === "DOWN" ? "DOWN probability" : "Directional probability";
+setText("ensembleProbability", ensembleProb + "%");
+setText("ensembleProbabilityLabel", ensembleDirText);
+setText("ensembleMeta", "Confidence " + (ensemble.confidence || 0) + "% • agreement " + (ensemble.agreement || 0) + "% • " + (ensemble.models_used || 0) + "/3 models");
 setText("ensembleReason", ensemble.reason || "Waiting for model agreement.");
 
 
