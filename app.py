@@ -63,6 +63,23 @@ heat_history = []
 heat_lock = threading.Lock()
 HEAT_HISTORY_MAX = 60
 
+# Stateful 15-minute winner-forecast history. Unlike the live signal, this
+# engine evaluates the path the market has taken and requires persistence
+# before changing its projected settlement direction.
+forecast_history = []
+forecast_lock = threading.Lock()
+FORECAST_HISTORY_MAX = 1800
+forecast_state = {
+    "ticker": None,
+    "direction": "WAIT",
+    "probability": 50,
+    "locked": False,
+    "locked_at": None,
+    "last_change": 0.0,
+    "reason": "Building trajectory history...",
+    "opposite_samples": 0,
+}
+
 # =========================================================
 # REAL-TIME BINANCE STREAM
 # =========================================================
@@ -2664,8 +2681,7 @@ def update_memory(
     market,
     price,
     signal,
-    distance_pct,
-    winner_prediction=None
+    distance_pct
 ):
 
     global active_market
@@ -2796,42 +2812,7 @@ def update_memory(
                 ),
 
             "last_price":
-                price,
-
-            # Separate live winner forecast. This is scored independently
-            # from the older signal-memory prediction.
-            "winner_forecast_direction":
-                (
-                    winner_prediction.get("direction")
-                    if winner_prediction
-                    and winner_prediction.get("direction") in ("UP", "DOWN")
-                    and winner_prediction.get("probability", 0) >= 60
-                    else "WAIT"
-                ),
-
-            "winner_forecast_probability":
-                (
-                    winner_prediction.get("probability")
-                    if winner_prediction
-                    and winner_prediction.get("direction") in ("UP", "DOWN")
-                    else None
-                ),
-
-            "winner_forecast_locked":
-                bool(
-                    winner_prediction
-                    and winner_prediction.get("direction") in ("UP", "DOWN")
-                    and winner_prediction.get("probability", 0) >= 60
-                ),
-
-            "winner_forecast_locked_at":
-                (
-                    datetime.now(timezone.utc).isoformat()
-                    if winner_prediction
-                    and winner_prediction.get("direction") in ("UP", "DOWN")
-                    and winner_prediction.get("probability", 0) >= 60
-                    else None
-                )
+                price
         }
 
     else:
@@ -2869,20 +2850,6 @@ def update_memory(
         ] = signal.get(
             "structure"
         )
-
-        # Lock the first actionable Winner Prediction for this market.
-        # Later dashboard changes remain live on-screen, but the scored
-        # forecast is not rewritten.
-        if (
-            not active_market.get("winner_forecast_locked")
-            and winner_prediction
-            and winner_prediction.get("direction") in ("UP", "DOWN")
-            and float(winner_prediction.get("probability", 0) or 0) >= 60
-        ):
-            active_market["winner_forecast_direction"] = winner_prediction.get("direction")
-            active_market["winner_forecast_probability"] = winner_prediction.get("probability")
-            active_market["winner_forecast_locked"] = True
-            active_market["winner_forecast_locked_at"] = datetime.now(timezone.utc).isoformat()
 
         if (
             signal.get(
@@ -3019,22 +2986,9 @@ def update_memory(
                 result = "UNSCORED"
                 scored = False
 
-            forecast_direction = record.get("winner_forecast_direction")
-            forecast_result = "UNSCORED"
-            forecast_scored = False
-            if forecast_direction in ("UP", "DOWN") and outcome in ("UP", "DOWN"):
-                forecast_result = "WIN" if forecast_direction == outcome else "LOSS"
-                forecast_scored = True
-
             signal_memory.append({
 
                 **record,
-
-                "winner_forecast_result":
-                    forecast_result,
-
-                "winner_forecast_scored":
-                    forecast_scored,
 
                 "outcome":
                     outcome,
@@ -3299,40 +3253,7 @@ def performance_stats():
                 )
         }
 
-    # Separate performance of the new Winner Prediction Engine.
-    forecast_wins = 0
-    forecast_losses = 0
-    forecast_unscored = 0
-    forecast_results = []
-    for record in signal_memory:
-        fr = record.get("winner_forecast_result")
-        if fr == "WIN":
-            forecast_wins += 1
-            forecast_results.append("WIN")
-        elif fr == "LOSS":
-            forecast_losses += 1
-            forecast_results.append("LOSS")
-        else:
-            forecast_unscored += 1
-
-    forecast_decided = forecast_wins + forecast_losses
-    forecast_accuracy = (
-        forecast_wins / forecast_decided * 100
-        if forecast_decided else None
-    )
-
     return {
-
-        "winner_forecast": {
-            "decided": forecast_decided,
-            "wins": forecast_wins,
-            "losses": forecast_losses,
-            "unscored": forecast_unscored,
-            "accuracy": forecast_accuracy,
-            "enough_data": forecast_decided >= 20,
-            "minimum_sample": 20,
-            "last10": forecast_results[-10:],
-        },
 
         "total_records":
             len(signal_memory),
@@ -3745,233 +3666,224 @@ def build_market_heat(
     }
 
 
-
 # =========================================================
-# 15-MINUTE WINNER PREDICTION ENGINE
+# STATEFUL 15-MINUTE WINNER FORECAST
 # =========================================================
 
-def build_winner_prediction(
+def build_winner_forecast(
     signal,
-    price,
     market,
     buy_sell,
     order_book,
     power_battle,
     shift_detector,
     market_heat,
-    quality,
-    memory_rate=None,
-    memory_matches=0,
+    price,
+    target,
 ):
     """
-    Convert the existing dashboard evidence into one live forecast for the
-    eventual KXBTC15M direction.
+    Forecast the likely SETTLEMENT direction, not the latest candle.
 
-    This is a probabilistic forecast, not a guarantee.  It deliberately
-    requires multiple independent confirmations and can return NO CLEAR
-    WINNER when the evidence is too mixed.
+    The engine deliberately uses a stateful trajectory:
+      1. Build a composite state from the existing independent signals.
+      2. Store the state through time.
+      3. Compare recent state with the preceding state (trajectory).
+      4. Require persistence before declaring a direction.
+      5. Use hysteresis so a single noisy update cannot flip the forecast.
+      6. Allow a reversal only after sustained opposing evidence.
+
+    This is a forecast, not a guarantee of the final Kalshi outcome.
     """
-    result = {
-        "direction": "WAIT",
-        "label": "⚪ NO CLEAR WINNER",
-        "probability": 50,
-        "score": 0,
-        "status": "BUILDING",
-        "reasons": [],
-        "historical_support": memory_rate,
-        "historical_matches": memory_matches,
-        "time_remaining": None,
-        "quality": quality,
-    }
+    global forecast_state
 
-    if not market or price is None or market.get("target") is None:
-        result["reasons"] = ["Waiting for BTC price and Kalshi strike."]
-        return result
+    now = time.time()
+    ticker = market.get("ticker") if market else None
+    close_ts = None
+    if market:
+        close_dt = parse_time(market.get("close_time"))
+        if close_dt:
+            close_ts = close_dt.timestamp()
+    remaining = max(0.0, close_ts - now) if close_ts else None
 
-    target = market.get("target")
-    score = 0.0
-    reasons = []
+    # A new KXBTC15M contract starts a new forecasting episode.
+    with forecast_lock:
+        if ticker != forecast_state.get("ticker"):
+            forecast_history.clear()
+            forecast_state = {
+                "ticker": ticker,
+                "direction": "WAIT",
+                "probability": 50,
+                "locked": False,
+                "locked_at": None,
+                "last_change": now,
+                "reason": "Building a fresh market trajectory...",
+                "opposite_samples": 0,
+            }
 
-    def add(value, reason=None):
-        nonlocal score
+    if not market or price is None or target is None:
+        return {
+            "available": False,
+            "direction": "WAIT",
+            "label": "⚪ BUILDING FORECAST",
+            "probability": 50,
+            "locked": False,
+            "persistence": 0,
+            "trajectory": 0.0,
+            "current_edge": 0.0,
+            "time_remaining": remaining,
+            "reason": "Waiting for enough live market data.",
+        }
+
+    def centered(value):
         try:
-            score += float(value)
-            if reason:
-                reasons.append(reason)
+            return max(-1.0, min(1.0, (float(value) - 50.0) / 50.0))
         except Exception:
-            pass
+            return 0.0
 
-    # Price vs strike.
-    if price > target:
-        add(12, "BTC is above the strike.")
-    elif price < target:
-        add(-12, "BTC is below the strike.")
+    # Existing signals are inputs; the forecast is based on their evolution.
+    heat_edge = centered(market_heat.get("buyer_heat", 50.0))
+    flow_edge = centered(buy_sell.get("buy_pct", 50.0)) if buy_sell.get("available") else 0.0
+    book_edge = centered(order_book.get("bid_pct", 50.0)) if order_book.get("available") else 0.0
 
-    # Multi-timeframe momentum.
-    for value, weight, name in (
-        (signal.get("m1"), 10, "1m momentum"),
-        (signal.get("m5"), 9, "5m momentum"),
-        (signal.get("m15"), 8, "15m momentum"),
-    ):
-        try:
-            if value is not None:
-                v = float(value)
-                # Momentum values are percentages; saturate extreme readings.
-                contribution = max(-1.0, min(1.0, v / (0.20 if name == "1m momentum" else 0.40))) * weight
-                add(contribution, f"{name} {'UP' if contribution > 0 else 'DOWN'}")
-        except Exception:
-            pass
-
-    structure = str(signal.get("structure") or "")
-    if structure.startswith("HIGHER"):
-        add(8, "Price structure is making higher highs/lows.")
-    elif structure.startswith("LOWER"):
-        add(-8, "Price structure is making lower highs/lows.")
-
-    # Executed trade flow.
-    if buy_sell.get("available"):
-        try:
-            buy_pct = float(buy_sell.get("buy_pct", 50))
-            flow_edge = max(-1.0, min(1.0, (buy_pct - 50.0) / 30.0))
-            add(flow_edge * 12, f"Executed flow is {buy_pct:.1f}% buyer-side.")
-        except Exception:
-            pass
-
-    # Resting order-book pressure.
-    if order_book.get("available"):
-        try:
-            bid_pct = float(order_book.get("bid_pct", 50))
-            book_edge = max(-1.0, min(1.0, (bid_pct - 50.0) / 30.0))
-            add(book_edge * 10, f"Order book is {bid_pct:.1f}% bid-side.")
-        except Exception:
-            pass
-
-    # Existing 2-vs-2 battle.
+    battle_edge = 0.0
     try:
-        bull_power = float(power_battle.get("bull_power"))
-        bear_power = float(power_battle.get("bear_power"))
-        battle_edge = max(-1.0, min(1.0, (bull_power - bear_power) / 40.0))
-        add(battle_edge * 10, f"Power Battle favors {'buyers' if battle_edge > 0 else 'sellers'}.")
+        bull = power_battle.get("bullish") or {}
+        bear = power_battle.get("bearish") or {}
+        bp = float(bull.get("buying_power", 50.0))
+        bm = float(bull.get("momentum_power", 50.0))
+        bs = float(bear.get("selling_power", 50.0))
+        bsm = float(bear.get("momentum_power", 50.0))
+        battle_edge = max(-1.0, min(1.0, ((bp + bm) - (bs + bsm)) / 200.0))
     except Exception:
         pass
 
-    # Market-control heat.
-    try:
-        buyer_heat = float(market_heat.get("buyer_heat", 50))
-        heat_edge = max(-1.0, min(1.0, (buyer_heat - 50.0) / 30.0))
-        add(heat_edge * 12, f"Market heat favors {'buyers' if heat_edge > 0 else 'sellers'}.")
-    except Exception:
-        pass
+    momentum_values = [signal.get("m1"), signal.get("m5"), signal.get("m15")]
+    momentum_values = [float(x) for x in momentum_values if isinstance(x, (int, float))]
+    momentum_edge = max(-1.0, min(1.0, sum(momentum_values) / 0.15)) if momentum_values else 0.0
 
-    # Rapid control shift.
-    shift_direction = shift_detector.get("direction")
-    try:
-        shift_score = abs(float(shift_detector.get("score", 0)))
-    except Exception:
-        shift_score = 0.0
+    signal_edge = max(-1.0, min(1.0, float(signal.get("score", 0)) / 10.0))
+    distance_edge = 1.0 if price > target else -1.0 if price < target else 0.0
+    shift_edge = 0.0
+    if shift_detector.get("direction") == "BULL":
+        shift_edge = min(1.0, abs(float(shift_detector.get("score") or 0)) / 10.0)
+    elif shift_detector.get("direction") == "BEAR":
+        shift_edge = -min(1.0, abs(float(shift_detector.get("score") or 0)) / 10.0)
 
-    shift_points = min(8.0, shift_score * 2.0)
-    if shift_direction == "BULL":
-        add(shift_points, "Rapid battle-shift detector favors buyers.")
-    elif shift_direction == "BEAR":
-        add(-shift_points, "Rapid battle-shift detector favors sellers.")
-
-    # Kalshi YES market price is a secondary confirmation only.
-    yes = yes_mid(market)
-    if yes is not None:
-        try:
-            yes = float(yes)
-            if yes >= 0.60:
-                add(5, "Kalshi YES is favoring UP.")
-            elif yes <= 0.40:
-                add(-5, "Kalshi YES is favoring DOWN.")
-        except Exception:
-            pass
-
-    score = max(-100.0, min(100.0, score))
-
-    # Convert evidence strength into a probability-like forecast.
-    # It is intentionally not presented as guaranteed odds.
-    base_probability = 50.0 + abs(score) * 0.42
-
-    # More time means more opportunity for the current edge to reverse.
-    remaining = seconds_left(market.get("close_time"))
-    result["time_remaining"] = remaining
-    if remaining is not None:
-        if remaining > 720:
-            max_probability = 78.0
-        elif remaining > 300:
-            max_probability = 85.0
-        elif remaining > 120:
-            max_probability = 90.0
-        else:
-            max_probability = 94.0
-    else:
-        max_probability = 78.0
-
-    probability = min(base_probability, max_probability)
-
-    # Poor data quality should prevent false precision.
-    try:
-        if float(quality) < 50:
-            probability = min(probability, 65.0)
-        elif float(quality) < 65:
-            probability = min(probability, 72.0)
-    except Exception:
-        pass
-
-    # Historical completed setups can calibrate the forecast when there is
-    # enough matching history.  We do not let a tiny sample dominate.
-    if memory_matches >= 5 and memory_rate is not None:
-        try:
-            hist_edge = max(-20.0, min(20.0, float(memory_rate) - 50.0))
-            probability = max(50.0, min(max_probability, probability + hist_edge * 0.25))
-            reasons.append(
-                f"{memory_matches} similar completed setups show {float(memory_rate):.0f}% support."
-            )
-        except Exception:
-            pass
-
-    direction = "UP" if score > 0 else "DOWN" if score < 0 else "WAIT"
-
-    # Require a meaningful lead before calling a winner.
-    if abs(score) < 18 or probability < 60:
-        direction = "WAIT"
-        probability = max(50, round(min(probability, 59)))
-        label = "⚪ NO CLEAR WINNER"
-        status = "WAIT"
-    else:
-        probability = int(round(probability))
-        if direction == "UP":
-            label = "🟢 PROJECTED WINNER: UP"
-        else:
-            label = "🔴 PROJECTED WINNER: DOWN"
-        status = "LIVE FORECAST"
-
-    # Do not show a fake high-confidence prediction with no pressure data.
-    pressure_available = (
-        buy_sell.get("available")
-        or order_book.get("available")
+    current_edge = (
+        heat_edge * 0.24
+        + flow_edge * 0.20
+        + book_edge * 0.14
+        + battle_edge * 0.14
+        + momentum_edge * 0.10
+        + signal_edge * 0.08
+        + distance_edge * 0.06
+        + shift_edge * 0.04
     )
-    if not pressure_available:
-        direction = "WAIT"
-        label = "⚪ NO CLEAR WINNER"
-        probability = 50
-        status = "WAIT — PRESSURE DATA MISSING"
-        reasons = ["Pressure feeds are unavailable; prediction held back."]
 
-    # Keep the reason list concise for the top card.
-    result.update({
+    with forecast_lock:
+        forecast_history.append({
+            "time": now,
+            "edge": current_edge,
+            "heat": heat_edge,
+            "flow": flow_edge,
+            "book": book_edge,
+            "battle": battle_edge,
+            "price": price,
+        })
+        if len(forecast_history) > FORECAST_HISTORY_MAX:
+            del forecast_history[:-FORECAST_HISTORY_MAX]
+        hist = list(forecast_history)
+
+    # Compare the current regime with the immediately preceding regime.
+    # This is what stops the engine from simply echoing the newest candle.
+    recent = hist[-8:]
+    prior = hist[-16:-8]
+    recent_avg = sum(x["edge"] for x in recent) / len(recent)
+    prior_avg = sum(x["edge"] for x in prior) / len(prior) if prior else recent_avg
+    trajectory = recent_avg - prior_avg
+
+    bull_samples = sum(1 for x in recent if x["edge"] > 0.06)
+    bear_samples = sum(1 for x in recent if x["edge"] < -0.06)
+    persistence = max(bull_samples, bear_samples)
+    candidate = "UP" if bull_samples > bear_samples else "DOWN" if bear_samples > bull_samples else "WAIT"
+
+    # Convert evidence + trajectory into a probability-like score.
+    strength = abs(current_edge) * 100.0
+    trend_bonus = min(18.0, abs(trajectory) * 180.0)
+    persistence_bonus = min(15.0, max(0, persistence - 3) * 3.0)
+    raw_conf = 50.0 + strength * 0.34 + trend_bonus + persistence_bonus
+    probability = int(round(max(50.0, min(96.0, raw_conf))))
+
+    # A forecast is not allowed to lock immediately. It needs both direction
+    # and persistence, then remains sticky until a genuine sustained reversal.
+    with forecast_lock:
+        old_direction = forecast_state.get("direction", "WAIT")
+        old_locked = bool(forecast_state.get("locked"))
+        opposite_samples = int(forecast_state.get("opposite_samples", 0))
+
+        if candidate in ("UP", "DOWN") and persistence >= 5 and abs(current_edge) >= 0.12:
+            if old_locked and candidate != old_direction:
+                opposite_samples += 1
+                forecast_state["opposite_samples"] = opposite_samples
+                # Require sustained opposing evidence rather than one update.
+                if opposite_samples >= 15 and abs(trajectory) >= 0.015:
+                    forecast_state["direction"] = candidate
+                    forecast_state["probability"] = probability
+                    forecast_state["locked"] = True
+                    forecast_state["locked_at"] = now
+                    forecast_state["last_change"] = now
+                    forecast_state["opposite_samples"] = 0
+            else:
+                forecast_state["direction"] = candidate
+                forecast_state["probability"] = probability
+                if persistence >= 8 and probability >= 65:
+                    forecast_state["locked"] = True
+                    if not forecast_state.get("locked_at"):
+                        forecast_state["locked_at"] = now
+                forecast_state["last_change"] = now if candidate != old_direction else forecast_state.get("last_change", now)
+                forecast_state["opposite_samples"] = 0
+        else:
+            # Weak/noisy evidence never flips an existing locked forecast.
+            if not old_locked:
+                forecast_state["direction"] = "WAIT"
+                forecast_state["probability"] = 50
+
+        direction = forecast_state.get("direction", "WAIT")
+        locked = bool(forecast_state.get("locked"))
+        final_probability = int(forecast_state.get("probability", 50))
+
+    if direction == "UP":
+        label = "🟢 PROJECTED WINNER: UP"
+    elif direction == "DOWN":
+        label = "🔴 PROJECTED WINNER: DOWN"
+    else:
+        label = "⚪ NO CLEAR WINNER"
+
+    if locked:
+        reason = (
+            f"Forecast held by {persistence}/8 recent samples; "
+            f"trajectory {trajectory:+.3f}. Opposing evidence must persist before reversal."
+        )
+    elif persistence < 5:
+        reason = "Building persistence; not enough agreement to force a settlement forecast."
+    else:
+        reason = f"Trajectory {trajectory:+.3f}; waiting for stronger persistence before locking."
+
+    return {
+        "available": True,
         "direction": direction,
         "label": label,
-        "probability": probability,
-        "score": round(score, 1),
-        "status": status,
-        "reasons": reasons[:6],
-        "historical_support": memory_rate,
-        "historical_matches": memory_matches,
-    })
-    return result
+        "probability": final_probability,
+        "locked": locked,
+        "persistence": persistence,
+        "trajectory": round(trajectory, 4),
+        "current_edge": round(current_edge, 4),
+        "time_remaining": remaining,
+        "opposite_samples": int(forecast_state.get("opposite_samples", 0)),
+        "samples": len(hist),
+        "reason": reason,
+        "method": "Stateful trajectory + persistence + reversal hysteresis",
+    }
 
 
 # =========================================================
@@ -4064,6 +3976,31 @@ def collect_state():
         target
     )
 
+    winner_forecast = build_winner_forecast(
+        signal,
+        market,
+        buy_sell,
+        order_book,
+        power_battle,
+        shift_detector,
+        market_heat,
+        price,
+        target
+    )
+
+    if (
+        market
+        and
+        price is not None
+    ):
+
+        update_memory(
+            market,
+            price,
+            signal,
+            distance_pct
+        )
+
     matches = 0
     rate = None
 
@@ -4083,34 +4020,6 @@ def collect_state():
                 signal,
                 distance_pct
             )
-        )
-
-    winner_prediction = build_winner_prediction(
-        signal,
-        price,
-        market,
-        buy_sell,
-        order_book,
-        power_battle,
-        shift_detector,
-        market_heat,
-        quality_score,
-        rate,
-        matches
-    )
-
-    if (
-        market
-        and
-        price is not None
-    ):
-
-        update_memory(
-            market,
-            price,
-            signal,
-            distance_pct,
-            winner_prediction
         )
 
     strength = prediction_strength(
@@ -4201,8 +4110,8 @@ def collect_state():
         "market_heat":
             market_heat,
 
-        "winner_prediction":
-            winner_prediction,
+        "winner_forecast":
+            winner_forecast,
 
         "prediction_strength":
             strength,
@@ -4352,60 +4261,6 @@ padding:16px
 
 .wide{
 grid-column:1/-1
-}
-
-.winnerPrediction{
-background:#0b1722;
-border:2px solid #314454;
-border-radius:18px;
-padding:20px;
-margin:18px 0 14px;
-text-align:center;
-box-shadow:0 8px 30px rgba(0,0,0,.22)
-}
-.winnerPrediction.up{
-background:#082b1a;
-border-color:#1b9b5c
-}
-.winnerPrediction.down{
-background:#321014;
-border-color:#d44754
-}
-.winnerPrediction.wait{
-background:#30280b;
-border-color:#c4a63a
-}
-.winnerTitle{
-font-size:13px;
-font-weight:900;
-letter-spacing:.08em;
-color:#9db0bc
-}
-.winnerLabel{
-font-size:30px;
-font-weight:950;
-margin-top:8px
-}
-.winnerProbability{
-font-size:48px;
-font-weight:950;
-margin-top:2px
-}
-.winnerMeta{
-font-size:14px;
-color:#a9b9c4;
-margin-top:6px
-}
-.winnerReasons{
-font-size:13px;
-color:#d6e0e6;
-margin-top:12px;
-line-height:1.5
-}
-.winnerStatus{
-font-size:12px;
-color:#91a3b0;
-margin-top:10px
 }
 
 .verdict{
@@ -4741,14 +4596,12 @@ min-width:3px
 KXBTC15M • Binance Live • Signal Memory 🧠
 </div>
 
-<!-- FINAL UPGRADE: 15-MINUTE WINNER PREDICTION -->
-<div id="winnerPrediction" class="winnerPrediction wait">
-  <div class="winnerTitle">🎯 15-MINUTE WINNER PREDICTION</div>
-  <div id="winnerLabel" class="winnerLabel">⚪ NO CLEAR WINNER</div>
-  <div id="winnerProbability" class="winnerProbability">50%</div>
-  <div id="winnerMeta" class="winnerMeta">Building live forecast...</div>
-  <div id="winnerReasons" class="winnerReasons">Waiting for enough evidence...</div>
-  <div id="winnerStatus" class="winnerStatus">This is a probability forecast, not a guarantee.</div>
+<div id="winnerForecast" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.16);">
+<div class="small">🎯 15-MINUTE WINNER PREDICTION</div>
+<div id="winnerLabel" class="big">⚪ BUILDING FORECAST</div>
+<div id="winnerProbability" style="font-size:32px;font-weight:800;">50%</div>
+<div id="winnerMeta" class="small">Building trajectory...</div>
+<div id="winnerReason" class="small" style="margin-top:8px;opacity:.85;">Waiting for enough market history.</div>
 </div>
 
 <div id="verdict"
@@ -5591,59 +5444,22 @@ data.shift_detector || {};
 const prediction =
 data.prediction_strength || {};
 
-const winnerPrediction =
-data.winner_prediction || {};
+const winnerForecast = data.winner_forecast || {};
 
-// ---------------------------------------------------------
-// 15-MINUTE WINNER PREDICTION — TOP OF DASHBOARD
-// ---------------------------------------------------------
-const winnerPanel = document.getElementById("winnerPrediction");
-const winnerDirection = winnerPrediction.direction || "WAIT";
-winnerPanel.className = "winnerPrediction " +
-  (winnerDirection === "UP" ? "up" :
-   winnerDirection === "DOWN" ? "down" : "wait");
+if(winnerForecast.direction === "UP"){
+  setText("winnerLabel", "🟢 PROJECTED WINNER: UP");
+  document.getElementById("winnerForecast").style.borderColor = "rgba(60,220,120,.65)";
+}else if(winnerForecast.direction === "DOWN"){
+  setText("winnerLabel", "🔴 PROJECTED WINNER: DOWN");
+  document.getElementById("winnerForecast").style.borderColor = "rgba(255,70,70,.65)";
+}else{
+  setText("winnerLabel", "⚪ NO CLEAR WINNER");
+  document.getElementById("winnerForecast").style.borderColor = "rgba(255,255,255,.16)";
+}
 
-setText(
-  "winnerLabel",
-  winnerPrediction.label || "⚪ NO CLEAR WINNER"
-);
-
-setText(
-  "winnerProbability",
-  (winnerPrediction.probability == null ? 50 : Number(winnerPrediction.probability).toFixed(0)) + "%"
-);
-
-const remainingText =
-  winnerPrediction.time_remaining == null
-  ? "--"
-  : clock(Math.max(0, Number(winnerPrediction.time_remaining)));
-
-const historyText =
-  winnerPrediction.historical_matches >= 5 && winnerPrediction.historical_support != null
-  ? " • " + winnerPrediction.historical_matches + " similar setups • " +
-    Number(winnerPrediction.historical_support).toFixed(0) + "% historical support"
-  : "";
-
-setText(
-  "winnerMeta",
-  "Time remaining: " + remainingText +
-  " • Evidence score: " +
-  Number(winnerPrediction.score || 0).toFixed(1) +
-  historyText
-);
-
-setText(
-  "winnerReasons",
-  (winnerPrediction.reasons || ["Waiting for enough evidence..."])
-    .map(reason => "• " + reason)
-    .join("\n")
-);
-
-setText(
-  "winnerStatus",
-  (winnerPrediction.status || "BUILDING") +
-  " • Forecast is separate from the existing signal and is scored against completed markets."
-);
+setText("winnerProbability", (winnerForecast.probability == null ? 50 : winnerForecast.probability) + "%");
+setText("winnerMeta", (winnerForecast.locked ? "🔒 FORECAST LOCKED" : "🧠 BUILDING FORECAST") + " • persistence " + (winnerForecast.persistence || 0) + "/8 • trajectory " + (winnerForecast.trajectory == null ? "--" : Number(winnerForecast.trajectory).toFixed(3)) + " • " + clock(Math.max(0, Math.ceil(winnerForecast.time_remaining || 0))) + " remaining");
+setText("winnerReason", winnerForecast.reason || "Waiting for enough market history.");
 
 
 const verdict =
