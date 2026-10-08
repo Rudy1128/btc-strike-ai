@@ -1,4 +1,4 @@
-import os, time, json, statistics, threading
+import os, time, json, statistics, threading, math
 from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, jsonify, render_template_string
@@ -3890,6 +3890,167 @@ def build_winner_forecast(
 # COLLECT STATE
 # =========================================================
 
+
+# =========================================================
+# INDEPENDENT 15-MINUTE STATISTICAL MODEL
+# =========================================================
+
+def normal_cdf(x):
+    try:
+        return 0.5 * (1.0 + math.erf(float(x) / math.sqrt(2.0)))
+    except Exception:
+        return 0.5
+
+
+def statistical_15m_model(price, target, candles, close_time):
+    """Estimate P(final BTC price >= Kalshi strike) from recent 1m returns.
+
+    This is deliberately independent of the existing signal/heat engines.
+    It is a statistical estimate, not a guarantee and not a broker signal.
+    """
+    now = time.time()
+    if price is None or target is None:
+        return {"direction":"WAIT", "probability":50, "confidence":0,
+                "reason":"Waiting for live BTC price and Kalshi strike.", "samples":0}
+
+    try:
+        remaining = max(0.0, parse_time(close_time).timestamp() - now) if close_time else 900.0
+    except Exception:
+        remaining = 900.0
+
+    closes = [float(x[1]) for x in (candles or []) if isinstance(x, (list, tuple)) and len(x) >= 2 and number(x[1]) is not None]
+    if len(closes) < 8:
+        return {"direction":"WAIT", "probability":50, "confidence":0,
+                "reason":"Not enough 1-minute history for the statistical model.", "samples":len(closes),
+                "time_remaining":remaining}
+
+    returns = []
+    for a,b in zip(closes[:-1], closes[1:]):
+        if a > 0 and b > 0:
+            returns.append(math.log(b/a))
+    if len(returns) < 6:
+        return {"direction":"WAIT", "probability":50, "confidence":0,
+                "reason":"Not enough valid returns for the statistical model.", "samples":len(returns),
+                "time_remaining":remaining}
+
+    # Recent-return volatility, annualization is intentionally avoided.
+    vol_1m = statistics.pstdev(returns[-20:]) if len(returns[-20:]) > 1 else 0.0
+    recent_mean = statistics.mean(returns[-5:]) if returns[-5:] else 0.0
+    medium_mean = statistics.mean(returns[-15:]) if returns[-15:] else recent_mean
+
+    # Blend recent drift with a weaker medium-term drift and shrink aggressively
+    # so one unusually large candle cannot dominate the 15-minute estimate.
+    drift_1m = max(-0.0008, min(0.0008, 0.65*recent_mean + 0.35*medium_mean))
+    minutes = max(0.25, min(15.0, remaining / 60.0))
+    sigma = max(vol_1m * math.sqrt(minutes), 0.00025)
+
+    # Mean-reverting drift when the strike is far away, which keeps the model
+    # from becoming unrealistically certain during noisy periods.
+    distance = (float(price) - float(target)) / float(target)
+    distance = max(-0.02, min(0.02, distance))
+    expected_log_return = drift_1m * minutes
+    z = (math.log(float(price)/float(target)) + expected_log_return) / sigma
+    p_up = normal_cdf(z)
+
+    # Uncertainty penalty for very short history and very high volatility.
+    history_factor = min(1.0, len(returns) / 20.0)
+    vol_penalty = min(0.35, max(0.0, vol_1m / 0.003) * 0.10)
+    p_up = 0.5 + (p_up - 0.5) * history_factor * (1.0 - vol_penalty)
+    p_up = max(0.05, min(0.95, p_up))
+
+    probability = int(round(p_up * 100))
+    edge = abs(probability - 50)
+    confidence = int(round(min(95, edge * 2.2)))
+
+    # Near expiry, require a meaningful edge instead of forcing a direction.
+    if remaining <= 60 and edge < 12:
+        direction = "WAIT"
+    elif probability >= 55:
+        direction = "UP"
+    elif probability <= 45:
+        direction = "DOWN"
+    else:
+        direction = "WAIT"
+
+    reason = (
+        f"Strike distance {distance*100:+.3f}% • {minutes:.1f}m remaining • "
+        f"1m volatility {vol_1m*100:.3f}% • drift {drift_1m*100:+.3f}%/m"
+    )
+
+    return {
+        "direction": direction,
+        "probability": probability,
+        "confidence": confidence,
+        "reason": reason,
+        "samples": len(returns),
+        "time_remaining": round(remaining, 1),
+        "strike_distance_pct": round(distance * 100, 4),
+        "volatility_1m_pct": round(vol_1m * 100, 4),
+        "drift_1m_pct": round(drift_1m * 100, 4),
+        "z_score": round(z, 3),
+    }
+
+
+def ensemble_15m_forecast(stat_model, winner_forecast, signal, market_heat, quality_score):
+    """Combine independent model families; WAIT when evidence is weak or split."""
+    models = []
+    if stat_model and stat_model.get("direction") in ("UP", "DOWN"):
+        models.append((stat_model["direction"], float(stat_model.get("probability",50)), 0.45))
+    if winner_forecast and winner_forecast.get("direction") in ("UP", "DOWN"):
+        models.append((winner_forecast["direction"], float(winner_forecast.get("probability",50)), 0.35))
+    if signal and signal.get("verdict") in ("UP", "DOWN"):
+        models.append((signal["verdict"], float(signal.get("confidence",50)), 0.20))
+
+    if not models:
+        return {"direction":"WAIT", "probability":50, "confidence":0, "agreement":0,
+                "reason":"No independent model has enough evidence yet."}
+
+    up_weight = down_weight = 0.0
+    for direction, prob, weight in models:
+        strength = abs(prob - 50) / 50.0
+        if direction == "UP":
+            up_weight += weight * strength
+        else:
+            down_weight += weight * strength
+
+    total = up_weight + down_weight
+    agreement = int(round(100 * max(up_weight, down_weight) / total)) if total else 0
+    direction = "UP" if up_weight > down_weight else "DOWN" if down_weight > up_weight else "WAIT"
+
+    raw_prob = 50 + (up_weight - down_weight) * 50
+    probability = int(round(max(5, min(95, raw_prob))))
+    quality_factor = max(0.45, min(1.0, float(quality_score or 0) / 100.0))
+    confidence = int(round(min(95, abs(probability-50) * 2.0 * quality_factor)))
+
+    # A split between the independent statistical model and the trajectory model
+    # is exactly where we want to avoid pretending certainty.
+    stat_dir = stat_model.get("direction") if stat_model else "WAIT"
+    winner_dir = winner_forecast.get("direction") if winner_forecast else "WAIT"
+    if stat_dir in ("UP","DOWN") and winner_dir in ("UP","DOWN") and stat_dir != winner_dir:
+        direction = "WAIT"
+        probability = 50
+        confidence = min(confidence, 35)
+        reason = "Independent models disagree — waiting for confirmation."
+    elif confidence < 25 or agreement < 58:
+        direction = "WAIT"
+        probability = 50
+        reason = "Evidence is too weak or balanced for a clean 15-minute call."
+    else:
+        reason = f"{len(models)} model layers agree; ensemble edge is {abs(probability-50)} points."
+
+    return {
+        "direction": direction,
+        "probability": probability,
+        "confidence": confidence,
+        "agreement": agreement,
+        "reason": reason,
+        "models_used": len(models),
+        "statistical": stat_dir,
+        "trajectory": winner_dir,
+        "signal": signal.get("verdict", "WAIT") if signal else "WAIT",
+        "heat": (market_heat or {}).get("label", "") if isinstance(market_heat, dict) else "",
+    }
+
 def collect_state():
 
     load_memory()
@@ -4033,6 +4194,21 @@ def collect_state():
         matches
     )
 
+    stat_model = statistical_15m_model(
+        price,
+        target,
+        candles,
+        market.get("close_time") if market else None
+    )
+
+    ensemble_forecast = ensemble_15m_forecast(
+        stat_model,
+        winner_forecast,
+        signal,
+        market_heat,
+        quality_score
+    )
+
     close_dt = (
         parse_time(
             market.get(
@@ -4112,6 +4288,12 @@ def collect_state():
 
         "winner_forecast":
             winner_forecast,
+
+        "statistical_model":
+            stat_model,
+
+        "ensemble_forecast":
+            ensemble_forecast,
 
         "prediction_strength":
             strength,
@@ -4594,6 +4776,14 @@ min-width:3px
 
 <div class="small">
 KXBTC15M • Binance Live • Signal Memory 🧠
+</div>
+
+<div id="ensembleForecast" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.16);">
+<div class="small">🤖 INDEPENDENT 15-MINUTE ENSEMBLE</div>
+<div id="ensembleLabel" class="big">⚪ WAIT</div>
+<div id="ensembleProbability" style="font-size:32px;font-weight:800;">50%</div>
+<div id="ensembleMeta" class="small">Waiting for model agreement...</div>
+<div id="ensembleReason" class="small" style="margin-top:8px;opacity:.85;">Waiting for enough data.</div>
 </div>
 
 <div id="winnerForecast" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.16);">
@@ -5460,6 +5650,24 @@ if(winnerForecast.direction === "UP"){
 setText("winnerProbability", (winnerForecast.probability == null ? 50 : winnerForecast.probability) + "%");
 setText("winnerMeta", (winnerForecast.locked ? "🔒 FORECAST LOCKED" : "🧠 BUILDING FORECAST") + " • persistence " + (winnerForecast.persistence || 0) + "/8 • trajectory " + (winnerForecast.trajectory == null ? "--" : Number(winnerForecast.trajectory).toFixed(3)) + " • " + clock(Math.max(0, Math.ceil(winnerForecast.time_remaining || 0))) + " remaining");
 setText("winnerReason", winnerForecast.reason || "Waiting for enough market history.");
+
+const ensemble = data.ensemble_forecast || {};
+const ensembleBox = document.getElementById("ensembleForecast");
+const ensembleDir = ensemble.direction || "WAIT";
+if(ensembleDir === "UP"){
+  setText("ensembleLabel", "🟢 ENSEMBLE: UP");
+  ensembleBox.style.borderColor = "rgba(60,220,120,.75)";
+}else if(ensembleDir === "DOWN"){
+  setText("ensembleLabel", "🔴 ENSEMBLE: DOWN");
+  ensembleBox.style.borderColor = "rgba(255,70,70,.75)";
+}else{
+  setText("ensembleLabel", "🟡 ENSEMBLE: WAIT");
+  ensembleBox.style.borderColor = "rgba(196,166,58,.65)";
+}
+setText("ensembleProbability", (ensemble.probability == null ? 50 : ensemble.probability) + "%");
+setText("ensembleMeta", "Confidence " + (ensemble.confidence || 0) + "% • agreement " + (ensemble.agreement || 0) + "% • " + (ensemble.models_used || 0) + " models");
+setText("ensembleReason", ensemble.reason || "Waiting for model agreement.");
+
 
 
 const verdict =
