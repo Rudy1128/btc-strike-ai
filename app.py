@@ -6002,13 +6002,21 @@ function strikeMoney(v){
 }
 
 function updateStrikeHero(price,target){
-  const p=Number(price), t=Number(target);
-  if(Number.isFinite(t)) document.getElementById("strikeTarget").textContent=strikeMoney(t);
+  // Do not coerce null/empty target values to numeric zero.
+  const p=(price===null || price===undefined || price==="")?NaN:Number(price);
+  const t=(target===null || target===undefined || target==="")?NaN:Number(target);
+  const targetEl=document.getElementById("strikeTarget");
+  const st=document.getElementById("strikeStatus"), d=document.getElementById("strikeDiff");
+  if(targetEl) targetEl.textContent=Number.isFinite(t) && t>0 ? strikeMoney(t) : "TARGET UNAVAILABLE";
   if(!Number.isFinite(p)) return;
   document.getElementById("strikePrice").textContent=strikeMoney(p);
   document.getElementById("strikeNow").textContent=strikeMoney(p);
-  const st=document.getElementById("strikeStatus"), d=document.getElementById("strikeDiff");
-  if(!Number.isFinite(t)){d.textContent="--";return;}
+  if(!Number.isFinite(t) || t<=0){
+    d.textContent="--";
+    st.className="strikeStatus strikeWait";
+    st.textContent="🟡 WAITING FOR VALID KALSHI TARGET";
+    return;
+  }
   const diff=p-t;
   d.textContent=(diff>=0?"+":"")+strikeMoney(diff);
   if(diff>0){st.className="strikeStatus strikeAbove";st.textContent="🟢 ABOVE TARGET";}
@@ -6023,8 +6031,8 @@ function drawStrikeChart(){
   c.width=r.width*dpr;c.height=r.height*dpr;
   const ctx=c.getContext("2d");ctx.setTransform(dpr,0,0,dpr,0,0);
   const W=r.width,H=r.height;ctx.clearRect(0,0,W,H);
-  const target=Number(strikeChartState.target);
-  if(!Number.isFinite(target)){ctx.fillStyle="#91a3b0";ctx.font="700 13px Arial";ctx.textAlign="center";ctx.fillText("Waiting for Kalshi target...",W/2,H/2);return;}
+  const target=(strikeChartState.target===null || strikeChartState.target===undefined || strikeChartState.target==="")?NaN:Number(strikeChartState.target);
+  if(!Number.isFinite(target) || target<=0){ctx.fillStyle="#91a3b0";ctx.font="700 13px Arial";ctx.textAlign="center";ctx.fillText("Waiting for valid Kalshi target...",W/2,H/2);return;}
   let pts=[...strikeChartState.history,...strikeChartState.live].filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.price)).sort((a,b)=>a.time-b.time);
   const cutoff=Date.now()/1000-15*60;pts=pts.filter(p=>p.time>=cutoff);
   const clean=[];for(const p of pts){const q=clean[clean.length-1];if(q&&Math.abs(q.time-p.time)<.2)q.price=p.price;else clean.push({...p});}pts=clean;
@@ -6051,12 +6059,15 @@ function drawStrikeChart(){
 }
 
 function setStrikeHistory(data){
-  const m=data.market||{},ticker=m.ticker||null,target=Number(m.target);
-  if(strikeChartState.ticker!==ticker || strikeChartState.target!==target){
-    strikeChartState.ticker=ticker;strikeChartState.target=Number.isFinite(target)?target:null;strikeChartState.live=[];
+  const m=data.market||{},ticker=m.ticker||null;
+  // Number(null) is 0 in JavaScript; preserve a missing target as null.
+  const target=(m.target===null || m.target===undefined || m.target==="")?null:Number(m.target);
+  const validTarget=Number.isFinite(target) && target>0 ? target : null;
+  if(strikeChartState.ticker!==ticker || strikeChartState.target!==validTarget){
+    strikeChartState.ticker=ticker;strikeChartState.target=validTarget;strikeChartState.live=[];
   }
   strikeChartState.history=(Array.isArray(data.candle_history)?data.candle_history:[]).map(p=>({time:Number(p.time),price:Number(p.price)})).filter(p=>Number.isFinite(p.time)&&Number.isFinite(p.price));
-  updateStrikeHero(data.btc,target);
+  updateStrikeHero(data.btc,validTarget);
   if(data.btc!=null) strikeChartState.live.push({time:Date.now()/1000,price:Number(data.btc)});
   const cut=Date.now()/1000-900;strikeChartState.live=strikeChartState.live.filter(p=>p.time>=cut);
   drawStrikeChart();
