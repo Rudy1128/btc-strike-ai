@@ -462,59 +462,125 @@ def get_binance_price():
 # =========================================================
 
 def get_spot_feeds():
-    """Collect independent spot feeds concurrently and return a robust median."""
+
+    binance_price, binance_name = (
+        get_binance_price()
+    )
+
     feeds = {}
 
-    def fetch_coinbase():
-        data = get_json("https://api.coinbase.com/v2/prices/BTC-USD/spot")
-        try:
-            return number(data["data"]["amount"])
-        except Exception:
-            return None
+    feeds["Binance"] = record_feed(
+        "Binance",
+        binance_price
+    )
 
-    def fetch_kraken():
-        data = get_json("https://api.kraken.com/0/public/Ticker", {"pair": "XBTUSD"})
-        try:
-            pair = next(iter(data["result"]))
-            return number(data["result"][pair]["c"][0])
-        except Exception:
-            return None
-
-    def fetch_bitstamp():
-        data = get_json("https://www.bitstamp.net/api/v2/ticker/btcusd/")
-        return number(data.get("last")) if isinstance(data, dict) else None
-
-    # The WebSocket price is preferred; REST is used only if it is stale.
-    # Other exchange REST calls run in parallel so one slow provider does not
-    # force the whole spot-feed stage to wait for every provider in sequence.
-    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="spot-feed") as pool:
-        f_binance = pool.submit(get_binance_price)
-        f_coinbase = pool.submit(fetch_coinbase)
-        f_kraken = pool.submit(fetch_kraken)
-        f_bitstamp = pool.submit(fetch_bitstamp)
-        try:
-            binance_price, binance_name = f_binance.result()
-        except Exception:
-            binance_price, binance_name = None, "unavailable"
-        for name, future in (("Coinbase", f_coinbase), ("Kraken", f_kraken), ("Bitstamp", f_bitstamp)):
-            try:
-                value = future.result()
-            except Exception:
-                value = None
-            feeds[name] = record_feed(name, value)
-
-    feeds["Binance"] = record_feed("Binance", binance_price)
     if binance_name == "Binance Live":
-        record_feed("Binance Live", binance_price)
 
-    values = [v for v in feeds.values() if v is not None and v > 0]
+        record_feed(
+            "Binance Live",
+            binance_price
+        )
+
+    data = get_json(
+        "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+    )
+
+    try:
+
+        coinbase = number(
+            data["data"]["amount"]
+        )
+
+    except:
+
+        coinbase = None
+
+    feeds["Coinbase"] = record_feed(
+        "Coinbase",
+        coinbase
+    )
+
+    data = get_json(
+        "https://api.kraken.com/0/public/Ticker",
+        {
+            "pair": "XBTUSD"
+        }
+    )
+
+    try:
+
+        pair = next(
+            iter(
+                data["result"]
+            )
+        )
+
+        kraken = number(
+            data["result"][pair]["c"][0]
+        )
+
+    except:
+
+        kraken = None
+
+    feeds["Kraken"] = record_feed(
+        "Kraken",
+        kraken
+    )
+
+    data = get_json(
+        "https://www.bitstamp.net/api/v2/ticker/btcusd/"
+    )
+
+    if isinstance(data, dict):
+
+        bitstamp = number(
+            data.get("last")
+        )
+
+    else:
+
+        bitstamp = None
+
+    feeds["Bitstamp"] = record_feed(
+        "Bitstamp",
+        bitstamp
+    )
+
+    values = [
+        value
+        for value in feeds.values()
+        if value is not None
+        and value > 0
+    ]
+
     if not values:
-        return None, feeds
 
-    med = statistics.median(values)
-    filtered = [v for v in values if abs(v - med) / med <= 0.0035]
-    reference = statistics.median(filtered or values)
-    return reference, feeds
+        return (
+            None,
+            feeds
+        )
+
+    med = statistics.median(
+        values
+    )
+
+    filtered = [
+        value
+        for value in values
+        if abs(
+            value - med
+        ) / med <= 0.0035
+    ]
+
+    reference = statistics.median(
+        filtered or values
+    )
+
+    return (
+        reference,
+        feeds
+    )
 
 
 # =========================================================
@@ -3985,59 +4051,94 @@ def statistical_15m_model(price, target, candles, close_time):
 
 
 def ensemble_15m_forecast(stat_model, winner_forecast, signal, market_heat, quality_score):
-    """Combine independent model families; WAIT when evidence is weak or split."""
+    """Combine model families without treating a rule-strength score as a probability.
+
+    IMPORTANT: displayed probabilities are still heuristic estimates until the
+    app has enough clean, independently resolved outcomes to calibrate them.
+    """
     models = []
-    if stat_model and stat_model.get("direction") in ("UP", "DOWN"):
-        models.append((stat_model["direction"], float(stat_model.get("probability",50)), 0.45))
+
+    # Statistical model: use its directional probability only when it has
+    # enough observations to be meaningful.
+    if (stat_model and stat_model.get("direction") in ("UP", "DOWN")
+            and int(stat_model.get("samples", 0) or 0) >= 6):
+        try:
+            p = max(50.0, min(95.0, float(stat_model.get("probability", 50))))
+            models.append({"name": "statistical", "direction": stat_model["direction"],
+                           "probability": p, "weight": 0.45})
+        except (TypeError, ValueError):
+            pass
+
+    # Stateful trajectory forecast.
     if winner_forecast and winner_forecast.get("direction") in ("UP", "DOWN"):
-        models.append((winner_forecast["direction"], float(winner_forecast.get("probability",50)), 0.35))
+        try:
+            p = max(50.0, min(95.0, float(winner_forecast.get("probability", 50))))
+            models.append({"name": "trajectory", "direction": winner_forecast["direction"],
+                           "probability": p, "weight": 0.35})
+        except (TypeError, ValueError):
+            pass
+
+    # FIX: signal['confidence'] is a rule-strength score, NOT a probability.
+    # Convert the signed signal score into a conservative heuristic strength.
+    # Only include it if its sign agrees with the signal's stated direction.
     if signal and signal.get("verdict") in ("UP", "DOWN"):
-        models.append((signal["verdict"], float(signal.get("confidence",50)), 0.20))
+        try:
+            signed_score = float(signal.get("score", 0) or 0)
+            direction = signal["verdict"]
+            sign_matches = (signed_score > 0 if direction == "UP" else signed_score < 0)
+            if sign_matches and abs(signed_score) > 0:
+                p = 50.0 + min(20.0, abs(signed_score) * 2.0)
+                models.append({"name": "price_signal", "direction": direction,
+                               "probability": p, "weight": 0.20})
+        except (TypeError, ValueError):
+            pass
 
     if not models:
-        return {"direction":"WAIT", "probability":50, "confidence":0, "agreement":0,
-                "reason":"No independent model has enough evidence yet."}
+        return {"direction": "WAIT", "probability": 50, "confidence": 0, "agreement": 0,
+                "reason": "No independent model has enough evidence yet.", "models_used": 0,
+                "probability_type": "HEURISTIC — NOT CALIBRATED"}
 
     up_weight = down_weight = 0.0
-    for direction, prob, weight in models:
-        strength = abs(prob - 50) / 50.0
-        if direction == "UP":
-            up_weight += weight * strength
+    votes = {"UP": [], "DOWN": []}
+    for model in models:
+        # Strength is distance from neutral, never the raw displayed confidence.
+        strength = min(0.50, abs(model["probability"] - 50.0) / 50.0)
+        contribution = model["weight"] * strength
+        if model["direction"] == "UP":
+            up_weight += contribution
         else:
-            down_weight += weight * strength
+            down_weight += contribution
+        votes[model["direction"]].append(model["name"])
 
     total = up_weight + down_weight
     agreement = int(round(100 * max(up_weight, down_weight) / total)) if total else 0
     direction = "UP" if up_weight > down_weight else "DOWN" if down_weight > up_weight else "WAIT"
 
-    # raw_up_probability is always the UP probability.  Convert it to the
-    # probability of the selected direction before displaying it.
-    raw_up_probability = 50 + (up_weight - down_weight) * 50
-    raw_up_probability = max(5, min(95, raw_up_probability))
-    directional_probability = (
-        raw_up_probability if direction == "UP"
-        else 100 - raw_up_probability if direction == "DOWN"
-        else 50
-    )
+    raw_up_probability = 50.0 + (up_weight - down_weight) * 50.0
+    raw_up_probability = max(5.0, min(95.0, raw_up_probability))
+    directional_probability = (raw_up_probability if direction == "UP" else
+                                100.0 - raw_up_probability if direction == "DOWN" else 50.0)
     probability = int(round(directional_probability))
-    quality_factor = max(0.45, min(1.0, float(quality_score or 0) / 100.0))
-    confidence = int(round(min(95, abs(raw_up_probability-50) * 2.0 * quality_factor)))
+    quality = max(0.0, min(100.0, float(quality_score or 0)))
+    quality_factor = max(0.0, min(1.0, quality / 100.0))
+    confidence = int(round(min(85.0, abs(raw_up_probability - 50.0) * 2.0 * quality_factor)))
 
-    # A split between the independent statistical model and the trajectory model
-    # is exactly where we want to avoid pretending certainty.
     stat_dir = stat_model.get("direction") if stat_model else "WAIT"
     winner_dir = winner_forecast.get("direction") if winner_forecast else "WAIT"
-    if stat_dir in ("UP","DOWN") and winner_dir in ("UP","DOWN") and stat_dir != winner_dir:
-        direction = "WAIT"
-        probability = 50
-        confidence = min(confidence, 35)
-        reason = "Independent models disagree — waiting for confirmation."
-    elif confidence < 25 or agreement < 58:
-        direction = "WAIT"
-        probability = 50
+    conflict = (stat_dir in ("UP", "DOWN") and winner_dir in ("UP", "DOWN")
+                and stat_dir != winner_dir)
+
+    if quality < 45:
+        direction, probability, confidence = "WAIT", 50, min(confidence, 20)
+        reason = "Data quality is too low; do not force a directional call."
+    elif conflict:
+        direction, probability, confidence = "WAIT", 50, min(confidence, 35)
+        reason = "Statistical and trajectory models disagree — waiting for confirmation."
+    elif confidence < 20 or agreement < 58:
+        direction, probability = "WAIT", 50
         reason = "Evidence is too weak or balanced for a clean 15-minute call."
     else:
-        reason = f"{len(models)} model layers agree; directional edge is {abs(probability-50)} points."
+        reason = f"{len(models)} model inputs evaluated; {agreement}% of weighted directional evidence favors the leading side."
 
     return {
         "direction": direction,
@@ -4046,10 +4147,14 @@ def ensemble_15m_forecast(stat_model, winner_forecast, signal, market_heat, qual
         "agreement": agreement,
         "reason": reason,
         "models_used": len(models),
+        "model_votes": {"UP": votes["UP"], "DOWN": votes["DOWN"]},
         "statistical": stat_dir,
         "trajectory": winner_dir,
         "signal": signal.get("verdict", "WAIT") if signal else "WAIT",
         "heat": (market_heat or {}).get("label", "") if isinstance(market_heat, dict) else "",
+        "data_quality": round(quality),
+        "probability_type": "HEURISTIC — NOT CALIBRATED",
+        "warning": "This is not a verified win probability. Validate against completed market outcomes before relying on it.",
     }
 
 
@@ -4213,12 +4318,8 @@ def build_benchmark_proxy():
     ]
     rows = []
     errors = []
-    # Public books are independent; fetch them concurrently to avoid adding
-    # three REST timeouts together to the dashboard refresh time.
-    with ThreadPoolExecutor(max_workers=len(endpoints), thread_name_prefix="book-proxy") as pool:
-        futures = [(name, pool.submit(get_json, url, params)) for name, url, params in endpoints]
-        fetched = [(name, future.result()) for name, future in futures]
-    for name, data in fetched:
+    for name, url, params in endpoints:
+        data = get_json(url, params)
         try:
             if name == "Kraken":
                 result = data.get("result", {})
@@ -6224,7 +6325,7 @@ const ensembleDirText = ensembleDir === "UP" ? "UP probability" : ensembleDir ==
 setText("ensembleProbability", ensembleProb + "%");
 setText("ensembleProbabilityLabel", ensembleDirText);
 setText("ensembleMeta", "Confidence " + (ensemble.confidence || 0) + "% • agreement " + (ensemble.agreement || 0) + "% • " + (ensemble.models_used || 0) + "/3 models");
-setText("ensembleReason", ensemble.reason || "Waiting for model agreement.");
+setText("ensembleReason", (ensemble.reason || "Waiting for model agreement.") + " • HEURISTIC SCORE — NOT A VERIFIED WIN PROBABILITY");
 
 const adaptive = data.adaptive_mode || {};
 const adaptiveCard = document.getElementById("adaptiveModeCard");
