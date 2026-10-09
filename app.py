@@ -1923,26 +1923,40 @@ def normalize_market(market):
 
         return None
 
+    # Kalshi market schemas differ by market type/version. Check all
+    # documented strike fields, and reject zero/negative placeholders.
     target = None
+    target_source = None
 
     for key in (
         "floor_strike",
         "strike_price",
         "strike",
         "target",
-        "cap_strike"
+        "functional_strike",
+        "custom_strike",
+        "cap_strike",
     ):
-
-        value = number(
-            market.get(
-                key
-            )
-        )
-
-        if value is not None:
-
+        value = number(market.get(key))
+        if value is not None and math.isfinite(value) and value > 0:
             target = value
+            target_source = key
             break
+
+    # Some responses expose structured strike metadata rather than a
+    # top-level scalar. Only accept an explicitly numeric strike value.
+    if target is None:
+        for container_key in ("strike", "strike_details", "price_level"):
+            details = market.get(container_key)
+            if isinstance(details, dict):
+                for key in ("value", "price", "strike_price", "target", "floor_strike"):
+                    value = number(details.get(key))
+                    if value is not None and math.isfinite(value) and value > 0:
+                        target = value
+                        target_source = f"{container_key}.{key}"
+                        break
+            if target is not None:
+                break
 
     return {
 
@@ -1953,6 +1967,9 @@ def normalize_market(market):
 
         "target":
             target,
+
+        "target_source":
+            target_source,
 
         "yes_bid":
             probability(
