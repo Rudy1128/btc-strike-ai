@@ -4967,6 +4967,23 @@ border-radius:16px;
 margin-bottom:14px
 }
 
+/* Prominent top-level readout mirrors the existing engine verdict. */
+.systemDecision{
+  text-align:center;
+  padding:20px 16px;
+  border-radius:16px;
+  margin:16px 0 14px;
+  border:2px solid rgba(255,255,255,.18);
+  box-shadow:0 8px 28px rgba(0,0,0,.22);
+}
+.systemDecision.up{background:linear-gradient(135deg,#07351e,#0b241a);border-color:#27c777}
+.systemDecision.down{background:linear-gradient(135deg,#421016,#251015);border-color:#f05260}
+.systemDecision.wait{background:linear-gradient(135deg,#3b3109,#211d0b);border-color:#d6b83e}
+.systemDecisionEyebrow{font-size:12px;font-weight:800;letter-spacing:1.8px;color:#b7c5ce}
+.systemDecisionLabel{font-size:clamp(30px,6vw,48px);font-weight:950;line-height:1.12;margin:9px 0}
+.systemDecisionMeta{display:flex;justify-content:center;gap:10px 22px;flex-wrap:wrap;font-size:14px;color:#d4e0e7}
+.systemDecisionMeta strong{color:#fff}
+
 .up{
 background:#092b1a;
 border:1px solid #1b9b5c
@@ -5307,6 +5324,17 @@ min-width:3px
 
 <div class="small">
 KXBTC15M • Binance Live • Signal Memory 🧠
+</div>
+
+<!-- This board mirrors the existing primary signal; it does not create a second prediction. -->
+<div id="systemDecisionBoard" class="systemDecision wait" role="status" aria-live="polite">
+  <div class="systemDecisionEyebrow">LIVE SYSTEM DECISION</div>
+  <div id="systemDecisionLabel" class="systemDecisionLabel">🟡 WAIT — BUILDING SIGNAL</div>
+  <div class="systemDecisionMeta">
+    <span>System confidence: <strong id="systemDecisionConfidence">--%</strong></span>
+    <span>Time left: <strong id="systemDecisionCountdown">--:--</strong></span>
+  </div>
+  <div id="systemDecisionDetail" class="small" style="margin-top:10px;color:#d4e0e7">Waiting for the existing engine verdict...</div>
 </div>
 
 <div class="strikeHero">
@@ -6131,6 +6159,8 @@ el.textContent =
 clock(
 remaining
 );
+const topCountdown = document.getElementById("systemDecisionCountdown");
+if (topCountdown) topCountdown.textContent = clock(remaining);
 
 const heroCountdown =
 document.getElementById("strikeCountdown");
@@ -6396,6 +6426,22 @@ const verdict =
 document.getElementById(
 "verdict"
 );
+
+// Keep the top decision board tied to the same primary signal as the existing verdict.
+const primaryDirection = String(signal.verdict || "WAIT").toUpperCase();
+const topBoard = document.getElementById("systemDecisionBoard");
+if (topBoard) {
+  const topClass = primaryDirection === "UP" ? "up" : primaryDirection === "DOWN" ? "down" : "wait";
+  topBoard.className = "systemDecision " + topClass;
+  setText("systemDecisionLabel",
+    primaryDirection === "UP" ? "🟢 SYSTEM CHOOSES UP" :
+    primaryDirection === "DOWN" ? "🔴 SYSTEM CHOOSES DOWN" :
+    "🟡 SYSTEM CHOOSES WAIT"
+  );
+  setText("systemDecisionConfidence", (signal.confidence == null ? 0 : signal.confidence) + "%");
+  const directionCounts = (signal.bullish || 0) + " bullish / " + (signal.bearish || 0) + " bearish signals";
+  setText("systemDecisionDetail", (signal.label || "Waiting for a clear signal") + " • " + directionCounts);
+}
 
 verdict.className =
 "verdict "
