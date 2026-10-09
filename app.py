@@ -4252,6 +4252,156 @@ def build_adaptive_mode(signal, ensemble, winner_forecast, power_battle,
     }
 
 
+
+# =========================================================
+# CROSS-EXCHANGE BENCHMARK PROXY (NOT OFFICIAL CF BENCHMARKS BRTI)
+# Uses public spot order books as a transparent proxy.  Official BRTI is
+# a separate benchmark feed; never label this proxy as the official index.
+# =========================================================
+
+benchmark_proxy_cache = {"at": 0.0, "data": None}
+benchmark_proxy_lock = threading.Lock()
+benchmark_proxy_history = []
+
+
+def build_benchmark_proxy():
+    """Estimate cross-exchange midprice and near-book pressure from public books."""
+    now = time.time()
+    with benchmark_proxy_lock:
+        if benchmark_proxy_cache["data"] is not None and now - benchmark_proxy_cache["at"] < 2.0:
+            return dict(benchmark_proxy_cache["data"])
+
+    endpoints = [
+        ("Coinbase", "https://api.exchange.coinbase.com/products/BTC-USD/book", {"level": 2}),
+        ("Kraken", "https://api.kraken.com/0/public/Depth", {"pair": "XBTUSD", "count": 20}),
+        ("Bitstamp", "https://www.bitstamp.net/api/v2/order_book/btcusd/", {"limit": 20}),
+    ]
+    rows = []
+    errors = []
+    for name, url, params in endpoints:
+        data = get_json(url, params)
+        try:
+            if name == "Kraken":
+                result = data.get("result", {})
+                book = result[next(iter(result))]
+                bids, asks = book.get("bids", []), book.get("asks", [])
+            else:
+                bids, asks = data.get("bids", []), data.get("asks", [])
+            # Normalize exchange rows into (price, BTC quantity).
+            bids = [(float(x[0]), float(x[1])) for x in bids[:20] if len(x) >= 2 and float(x[0]) > 0 and float(x[1]) > 0]
+            asks = [(float(x[0]), float(x[1])) for x in asks[:20] if len(x) >= 2 and float(x[0]) > 0 and float(x[1]) > 0]
+            if not bids or not asks:
+                raise ValueError("empty order book")
+            best_bid, best_ask = bids[0][0], asks[0][0]
+            if best_bid <= 0 or best_ask <= best_bid:
+                raise ValueError("invalid spread")
+            mid = (best_bid + best_ask) / 2.0
+            # USD notional, weighted toward nearer levels to avoid distant spoof-like depth.
+            bid_usd = sum(px * qty / (1 + i * 0.12) for i, (px, qty) in enumerate(bids))
+            ask_usd = sum(px * qty / (1 + i * 0.12) for i, (px, qty) in enumerate(asks))
+            imbalance = (bid_usd - ask_usd) / max(1.0, bid_usd + ask_usd)
+            rows.append({"exchange": name, "mid": mid, "bid": best_bid, "ask": best_ask,
+                         "spread_bps": (best_ask - best_bid) / mid * 10000,
+                         "bid_usd": bid_usd, "ask_usd": ask_usd,
+                         "imbalance": imbalance})
+        except Exception as exc:
+            errors.append(name + ": unavailable/invalid book")
+
+    if rows:
+        mids = [x["mid"] for x in rows]
+        proxy = statistics.median(mids)
+        # Exclude an exchange whose mid deviates materially from the cross-exchange median.
+        good = [x for x in rows if abs(x["mid"] - proxy) / proxy <= 0.002]
+        if good:
+            proxy = statistics.median([x["mid"] for x in good])
+            rows = good
+        imbalance = statistics.mean(x["imbalance"] for x in rows)
+        spread = statistics.mean(x["spread_bps"] for x in rows)
+        benchmark_proxy_history.append({"t": now, "price": proxy, "imbalance": imbalance})
+        del benchmark_proxy_history[:-90]
+        recent = [x for x in benchmark_proxy_history if now - x["t"] <= 15]
+        move_bps = ((proxy / recent[0]["price"] - 1) * 10000) if len(recent) >= 2 and recent[0]["price"] else 0.0
+        # Pressure only counts as control when price response is aligned.
+        book_side = "UP" if imbalance >= 0.08 else "DOWN" if imbalance <= -0.08 else "NEUTRAL"
+        price_side = "UP" if move_bps >= 1.0 else "DOWN" if move_bps <= -1.0 else "FLAT"
+        if book_side == price_side and book_side in ("UP", "DOWN"):
+            control = book_side
+            status = "ALIGNED"
+        elif book_side in ("UP", "DOWN") and price_side in ("UP", "DOWN") and book_side != price_side:
+            control = "CONTESTED"
+            status = "ABSORPTION / DIVERGENCE"
+        elif price_side in ("UP", "DOWN") and (book_side == "NEUTRAL" or book_side == price_side):
+            control = price_side
+            status = "PRICE-LED"
+        else:
+            control = "WAIT"
+            status = "NO CLEAR CONTROL"
+        result = {
+            "available": True, "label": "CROSS-EXCHANGE BOOK PROXY",
+            "official_brtI": False, "price": round(proxy, 2),
+            "exchange_count": len(rows), "exchanges": rows,
+            "book_imbalance_pct": round(imbalance * 100, 1),
+            "price_move_bps_15s": round(move_bps, 2),
+            "book_side": book_side, "price_side": price_side,
+            "control": control, "status": status,
+            "avg_spread_bps": round(spread, 2), "updated_at": now,
+            "note": "Public-exchange proxy, not the official CF Benchmarks BRTI settlement feed."
+        }
+    else:
+        result = {"available": False, "label": "CROSS-EXCHANGE BOOK PROXY", "official_brtI": False,
+                  "control": "WAIT", "status": "BOOK DATA UNAVAILABLE", "exchanges": [],
+                  "note": "Could not read enough public exchange order books."}
+    with benchmark_proxy_lock:
+        benchmark_proxy_cache["at"] = now
+        benchmark_proxy_cache["data"] = result
+    return dict(result)
+
+
+def build_control_read(proxy, buy_sell, order_book, signal, adaptive):
+    """Summarize who appears in control and flag pressure/price disagreement."""
+    if not isinstance(proxy, dict) or not proxy.get("available"):
+        return {"direction": "WAIT", "status": "INSUFFICIENT DATA", "score": 0,
+                "detail": "Cross-exchange order-book proxy is unavailable."}
+    votes = {"UP": 0.0, "DOWN": 0.0}
+    details = []
+    bside = proxy.get("book_side")
+    pside = proxy.get("price_side")
+    if bside in votes:
+        votes[bside] += 1.5
+        details.append("Cross-exchange book pressure: " + bside)
+    if pside in votes:
+        votes[pside] += 2.0
+        details.append("Observed price response: " + pside)
+    flow = str((buy_sell or {}).get("winner", "WAIT")).upper()
+    if flow in votes:
+        votes[flow] += 1.0
+        details.append("Executed trade flow: " + flow)
+    local_book = str((order_book or {}).get("winner", "WAIT")).upper()
+    if local_book in votes:
+        votes[local_book] += 0.5
+        details.append("Primary-exchange book: " + local_book)
+    sig = str((signal or {}).get("verdict", "WAIT")).upper()
+    if sig in votes:
+        votes[sig] += 0.75
+        details.append("Price/momentum signal: " + sig)
+    if proxy.get("status") == "ABSORPTION / DIVERGENCE":
+        return {"direction": "WAIT", "status": "CONTESTED — PRESSURE NOT WINNING YET", "score": 0,
+                "up_score": round(votes["UP"], 2), "down_score": round(votes["DOWN"], 2),
+                "detail": "Order-book pressure and actual price movement disagree. This can indicate absorption, a trap, or a fast transition. " + "; ".join(details)}
+    diff = votes["UP"] - votes["DOWN"]
+    if abs(diff) < 1.0:
+        direction = "WAIT"
+        status = "MIXED EVIDENCE"
+    else:
+        direction = "UP" if diff > 0 else "DOWN"
+        status = "UP CONTROL" if direction == "UP" else "DOWN CONTROL"
+    total = max(1.0, votes["UP"] + votes["DOWN"])
+    score = int(min(85, 50 + abs(diff) / total * 35)) if direction != "WAIT" else 50
+    return {"direction": direction, "status": status, "score": score,
+            "up_score": round(votes["UP"], 2), "down_score": round(votes["DOWN"], 2),
+            "detail": "; ".join(details) if details else "Waiting for independent evidence."}
+
+
 def collect_state():
 
     load_memory()
@@ -4263,6 +4413,8 @@ def collect_state():
     candles = get_history()
 
     market = get_kalshi()
+
+    benchmark_proxy = build_benchmark_proxy()
 
     buy_sell = (
         get_buy_sell_pressure()
@@ -4423,6 +4575,10 @@ def collect_state():
         target
     )
 
+    control_read = build_control_read(
+        benchmark_proxy, buy_sell, order_book, signal, adaptive_mode
+    )
+
     close_dt = (
         parse_time(
             market.get(
@@ -4517,6 +4673,12 @@ def collect_state():
 
         "adaptive_mode":
             adaptive_mode,
+
+        "benchmark_proxy":
+            benchmark_proxy,
+
+        "control_read":
+            control_read,
 
         "prediction_strength":
             strength,
@@ -5069,6 +5231,16 @@ KXBTC15M • Binance Live • Signal Memory 🧠
   <div id="adaptiveModeDetail" class="small" style="margin-top:8px;">The adaptive read will appear when data is available.</div>
   <div id="adaptiveEvidence" class="small" style="margin-top:8px;white-space:pre-wrap;"></div>
   <div class="small" style="margin-top:8px;opacity:.7;">Signals are decision aids, not guaranteed outcomes or calibrated probabilities.</div>
+</div>
+
+<div id="benchmarkProxyCard" class="card" style="margin-top:14px;border:2px solid rgba(255,255,255,.16);">
+  <div class="small">🌐 CROSS-EXCHANGE PRESSURE • BENCHMARK PROXY</div>
+  <div id="benchmarkProxyLabel" class="big" style="text-align:center;margin-top:8px;">WAITING FOR BOOKS</div>
+  <div id="benchmarkProxyMeta" class="small" style="text-align:center;">Checking multiple exchange order books...</div>
+  <div id="benchmarkProxyDetail" class="small" style="margin-top:8px;">This is a public-exchange proxy, not the official CF Benchmarks BRTI feed.</div>
+  <div id="controlReadLabel" class="big" style="text-align:center;margin-top:12px;">🟡 CONTROL: WAIT</div>
+  <div id="controlReadDetail" class="small" style="margin-top:8px;">Waiting for independent price and pressure evidence.</div>
+  <div class="small" style="margin-top:8px;opacity:.72;">Important: a large bid/ask wall alone is not proof of direction. This panel checks whether price actually responds to pressure.</div>
 </div>
 
 <div id="winnerForecast" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.16);">
@@ -6073,6 +6245,25 @@ const upEvidence = (adaptive.up_evidence || []).map(x => "🟢 " + x);
 const downEvidence = (adaptive.down_evidence || []).map(x => "🔴 " + x);
 setText("adaptiveEvidence", [...upEvidence, ...downEvidence].join("\n") || "No directional evidence groups yet.");
 
+
+const proxy = data.benchmark_proxy || {};
+const proxyCard = document.getElementById("benchmarkProxyCard");
+const proxyControl = proxy.control || "WAIT";
+if (proxyControl === "UP") proxyCard.style.borderColor = "rgba(60,220,120,.8)";
+else if (proxyControl === "DOWN") proxyCard.style.borderColor = "rgba(255,70,70,.8)";
+else proxyCard.style.borderColor = "rgba(196,166,58,.65)";
+if (proxy.available) {
+  setText("benchmarkProxyLabel", "$" + Number(proxy.price).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2}) + " • " + (proxy.status || "BOOK DATA"));
+  setText("benchmarkProxyMeta", (proxy.exchange_count || 0) + " exchanges • book imbalance " + (proxy.book_imbalance_pct == null ? "--" : proxy.book_imbalance_pct + "%") + " • 15s move " + (proxy.price_move_bps_15s == null ? "--" : proxy.price_move_bps_15s + " bps") + " • avg spread " + (proxy.avg_spread_bps == null ? "--" : proxy.avg_spread_bps + " bps"));
+} else {
+  setText("benchmarkProxyLabel", "🟡 BOOK DATA UNAVAILABLE");
+  setText("benchmarkProxyMeta", "Waiting for valid order books from multiple exchanges.");
+}
+setText("benchmarkProxyDetail", proxy.note || "Proxy data is not the official CF Benchmarks BRTI feed.");
+const control = data.control_read || {};
+const controlDir = control.direction || "WAIT";
+setText("controlReadLabel", (controlDir === "UP" ? "🟢 CONTROL: UP" : controlDir === "DOWN" ? "🔴 CONTROL: DOWN" : "🟡 CONTROL: WAIT") + " • score " + (control.score == null ? "--" : control.score + "/100"));
+setText("controlReadDetail", (control.status || "INSUFFICIENT DATA") + " • " + (control.detail || "Waiting for evidence."));
 
 
 const verdict =
