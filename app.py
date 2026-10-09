@@ -2752,6 +2752,25 @@ def update_memory(
         "ticker"
     )
 
+    # Resolve an expired previous market BEFORE replacing its tracking
+    # record with the next ticker. The old implementation could silently
+    # discard that record on market rollover.
+    if (
+        active_market is not None
+        and active_market.get("ticker") != ticker
+        and time.time() >= active_market.get("close_ts", float("inf"))
+    ):
+        _resolve_active_market(source="last_observed_price_estimate")
+
+    # If the same market is still active but its close time has passed,
+    # resolve it before updating its price with a post-close quote.
+    if (
+        active_market is not None
+        and active_market.get("ticker") == ticker
+        and time.time() >= active_market.get("close_ts", float("inf"))
+    ):
+        _resolve_active_market(source="last_observed_price_estimate")
+
     # Start tracking a new 15-minute market.
     if (
         active_market is None
@@ -2972,93 +2991,63 @@ def update_memory(
             )
 
     if (
-        time.time()
-        >=
-        active_market.get(
-            "close_ts",
-            0
-        )
+        active_market is not None
+        and time.time() >= active_market.get("close_ts", 0)
     ):
+        _resolve_active_market(source="last_observed_price_estimate")
 
-        record = active_market
 
-        target = record.get(
-            "target"
-        )
+def _resolve_active_market(source="last_observed_price_estimate"):
+    """Store one completed tracker record without silently losing it.
 
-        final_price = record.get(
-            "last_price"
-        )
+    Important: this app-side last observed spot price is an estimate, not
+    an official Kalshi/CF Benchmarks settlement result. Keep that provenance
+    in the record so scoreboard results are not mistaken for verified fills.
+    """
+    global active_market
 
-        direction = record.get(
-            "direction"
-        )
+    if not active_market:
+        return
 
-        if (
-            target is not None
-            and
-            final_price is not None
-        ):
+    record = active_market
+    target = record.get("target")
+    final_price = record.get("last_price")
+    direction = record.get("direction")
+    ticker = record.get("ticker")
 
-            if final_price > target:
-
-                outcome = "UP"
-
-            elif final_price < target:
-
-                outcome = "DOWN"
-
-            else:
-
-                outcome = "PUSH"
-
-            # Only UP/DOWN predictions are scored for win/loss.
-            # WAIT remains an unscored pass.
-            if direction in (
-                "UP",
-                "DOWN"
-            ):
-
-                result = (
-                    "WIN"
-                    if direction == outcome
-                    else
-                    "LOSS"
-                )
-
-                scored = True
-
-            else:
-
-                result = "UNSCORED"
-                scored = False
-
-            signal_memory.append({
-
-                **record,
-
-                "outcome":
-                    outcome,
-
-                "result":
-                    result,
-
-                "scored":
-                    scored,
-
-                "resolved":
-                    datetime.now(
-                        timezone.utc
-                    ).isoformat()
-            })
-
-            signal_memory[:] = (
-                signal_memory[-500:]
-            )
-
-            save_memory()
-
+    # Avoid duplicate records if the app retries the same rollover.
+    if any(item.get("ticker") == ticker for item in signal_memory):
         active_market = None
+        return
+
+    if target is not None and final_price is not None:
+        if final_price > target:
+            outcome = "UP"
+        elif final_price < target:
+            outcome = "DOWN"
+        else:
+            outcome = "PUSH"
+
+        if direction in ("UP", "DOWN"):
+            result = "WIN" if direction == outcome else "LOSS"
+            scored = True
+        else:
+            result = "UNSCORED"
+            scored = False
+
+        signal_memory.append({
+            **record,
+            "outcome": outcome,
+            "result": result,
+            "scored": scored,
+            "outcome_source": source,
+            "outcome_verified": False,
+            "resolved": datetime.now(timezone.utc).isoformat()
+        })
+        signal_memory[:] = signal_memory[-500:]
+        save_memory()
+
+    active_market = None
 
 
 def performance_stats():
