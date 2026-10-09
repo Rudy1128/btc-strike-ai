@@ -4358,48 +4358,83 @@ def build_benchmark_proxy():
 
 
 def build_control_read(proxy, buy_sell, order_book, signal, adaptive):
-    """Summarize who appears in control and flag pressure/price disagreement."""
+    """Quality-gated control read: require fresh, multi-source evidence and avoid treating a score as probability."""
     if not isinstance(proxy, dict) or not proxy.get("available"):
         return {"direction": "WAIT", "status": "INSUFFICIENT DATA", "score": 0,
                 "detail": "Cross-exchange order-book proxy is unavailable."}
+
+    now = time.time()
+    age = max(0.0, now - float(proxy.get("updated_at", now) or now))
+    exchange_count = int(proxy.get("exchange_count", 0) or 0)
+    spread = proxy.get("avg_spread_bps")
+    if age > 12:
+        return {"direction": "WAIT", "status": "STALE DATA", "score": 0,
+                "detail": f"Cross-exchange data is {age:.1f}s old. Waiting for fresh books."}
+    if exchange_count < 2:
+        return {"direction": "WAIT", "status": "TOO FEW EXCHANGES", "score": 0,
+                "detail": "At least two valid exchanges are required; one exchange is not enough to confirm control."}
+    if spread is not None and float(spread) > 20:
+        return {"direction": "WAIT", "status": "WIDE SPREAD / LOW QUALITY", "score": 0,
+                "detail": f"Average spread is {float(spread):.1f} bps. Thin or unstable books can distort pressure readings."}
+
     votes = {"UP": 0.0, "DOWN": 0.0}
+    sources = {"UP": set(), "DOWN": set()}
     details = []
+
+    def add_vote(side, weight, source, label):
+        side = str(side or "WAIT").upper()
+        if side in votes:
+            votes[side] += weight
+            sources[side].add(source)
+            details.append(label + ": " + side)
+
     bside = proxy.get("book_side")
     pside = proxy.get("price_side")
-    if bside in votes:
-        votes[bside] += 1.5
-        details.append("Cross-exchange book pressure: " + bside)
-    if pside in votes:
-        votes[pside] += 2.0
-        details.append("Observed price response: " + pside)
+    add_vote(bside, 1.0, "cross_book", "Cross-exchange book pressure")
+    add_vote(pside, 2.0, "price_response", "Observed cross-exchange price response")
+
     flow = str((buy_sell or {}).get("winner", "WAIT")).upper()
-    if flow in votes:
-        votes[flow] += 1.0
-        details.append("Executed trade flow: " + flow)
+    add_vote(flow, 1.25, "trade_flow", "Executed trade flow")
     local_book = str((order_book or {}).get("winner", "WAIT")).upper()
-    if local_book in votes:
-        votes[local_book] += 0.5
-        details.append("Primary-exchange book: " + local_book)
+    add_vote(local_book, 0.5, "local_book", "Primary-exchange book")
     sig = str((signal or {}).get("verdict", "WAIT")).upper()
-    if sig in votes:
-        votes[sig] += 0.75
-        details.append("Price/momentum signal: " + sig)
+    add_vote(sig, 0.75, "momentum", "Price/momentum signal")
+
     if proxy.get("status") == "ABSORPTION / DIVERGENCE":
-        return {"direction": "WAIT", "status": "CONTESTED — PRESSURE NOT WINNING YET", "score": 0,
+        return {"direction": "WAIT", "status": "CONTESTED — PRICE DISAGREES WITH PRESSURE", "score": 0,
                 "up_score": round(votes["UP"], 2), "down_score": round(votes["DOWN"], 2),
-                "detail": "Order-book pressure and actual price movement disagree. This can indicate absorption, a trap, or a fast transition. " + "; ".join(details)}
+                "detail": "Order-book pressure and price movement disagree. Treat this as a possible absorption/reversal zone, not a confirmed trade. " + "; ".join(details)}
+
     diff = votes["UP"] - votes["DOWN"]
-    if abs(diff) < 1.0:
-        direction = "WAIT"
-        status = "MIXED EVIDENCE"
-    else:
-        direction = "UP" if diff > 0 else "DOWN"
-        status = "UP CONTROL" if direction == "UP" else "DOWN CONTROL"
+    direction = "UP" if diff > 0 else "DOWN" if diff < 0 else "WAIT"
+    opposing = "DOWN" if direction == "UP" else "UP" if direction == "DOWN" else "WAIT"
     total = max(1.0, votes["UP"] + votes["DOWN"])
-    score = int(min(85, 50 + abs(diff) / total * 35)) if direction != "WAIT" else 50
+    margin = abs(diff) / total
+
+    # A directional call needs price response plus at least one independent confirmation.
+    has_price = "price_response" in sources[direction] if direction in votes else False
+    independent_confirmation = len(sources[direction] - {"price_response", "cross_book"}) if direction in votes else 0
+    if direction == "WAIT" or abs(diff) < 1.25 or not has_price or independent_confirmation < 1:
+        direction = "WAIT"
+        status = "WAIT — NEED INDEPENDENT CONFIRMATION"
+        score = int(min(59, 40 + margin * 30))
+        detail = "Price response plus independent trade-flow/momentum confirmation is required before calling control."
+    elif votes[opposing] >= votes[direction] * 0.72:
+        direction = "WAIT"
+        status = "WAIT — OPPOSING EVIDENCE TOO STRONG"
+        score = int(min(59, 40 + margin * 25))
+        detail = "Signals are too divided for a clean control read."
+    else:
+        status = "UP CONTROL — CONFIRMED BY MULTIPLE INPUTS" if direction == "UP" else "DOWN CONTROL — CONFIRMED BY MULTIPLE INPUTS"
+        # This is a rule-strength score, NOT a win probability.
+        score = int(min(88, 45 + margin * 28 + min(3, len(sources[direction])) * 5))
+        detail = "Multiple inputs lean the same way; this still does not guarantee the 15-minute settlement."
+
     return {"direction": direction, "status": status, "score": score,
             "up_score": round(votes["UP"], 2), "down_score": round(votes["DOWN"], 2),
-            "detail": "; ".join(details) if details else "Waiting for independent evidence."}
+            "source_count": len(sources.get(direction, set())) if direction in votes else 0,
+            "data_age_seconds": round(age, 1),
+            "detail": detail + (" Evidence: " + "; ".join(details) if details else " Waiting for independent evidence.")}
 
 
 def collect_state():
