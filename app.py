@@ -1,4 +1,5 @@
 import os, time, json, statistics, threading, math
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 import requests
 from flask import Flask, jsonify, render_template_string
@@ -461,125 +462,59 @@ def get_binance_price():
 # =========================================================
 
 def get_spot_feeds():
-
-    binance_price, binance_name = (
-        get_binance_price()
-    )
-
+    """Collect independent spot feeds concurrently and return a robust median."""
     feeds = {}
 
-    feeds["Binance"] = record_feed(
-        "Binance",
-        binance_price
-    )
+    def fetch_coinbase():
+        data = get_json("https://api.coinbase.com/v2/prices/BTC-USD/spot")
+        try:
+            return number(data["data"]["amount"])
+        except Exception:
+            return None
 
+    def fetch_kraken():
+        data = get_json("https://api.kraken.com/0/public/Ticker", {"pair": "XBTUSD"})
+        try:
+            pair = next(iter(data["result"]))
+            return number(data["result"][pair]["c"][0])
+        except Exception:
+            return None
+
+    def fetch_bitstamp():
+        data = get_json("https://www.bitstamp.net/api/v2/ticker/btcusd/")
+        return number(data.get("last")) if isinstance(data, dict) else None
+
+    # The WebSocket price is preferred; REST is used only if it is stale.
+    # Other exchange REST calls run in parallel so one slow provider does not
+    # force the whole spot-feed stage to wait for every provider in sequence.
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="spot-feed") as pool:
+        f_binance = pool.submit(get_binance_price)
+        f_coinbase = pool.submit(fetch_coinbase)
+        f_kraken = pool.submit(fetch_kraken)
+        f_bitstamp = pool.submit(fetch_bitstamp)
+        try:
+            binance_price, binance_name = f_binance.result()
+        except Exception:
+            binance_price, binance_name = None, "unavailable"
+        for name, future in (("Coinbase", f_coinbase), ("Kraken", f_kraken), ("Bitstamp", f_bitstamp)):
+            try:
+                value = future.result()
+            except Exception:
+                value = None
+            feeds[name] = record_feed(name, value)
+
+    feeds["Binance"] = record_feed("Binance", binance_price)
     if binance_name == "Binance Live":
+        record_feed("Binance Live", binance_price)
 
-        record_feed(
-            "Binance Live",
-            binance_price
-        )
-
-    data = get_json(
-        "https://api.coinbase.com/v2/prices/BTC-USD/spot"
-    )
-
-    try:
-
-        coinbase = number(
-            data["data"]["amount"]
-        )
-
-    except:
-
-        coinbase = None
-
-    feeds["Coinbase"] = record_feed(
-        "Coinbase",
-        coinbase
-    )
-
-    data = get_json(
-        "https://api.kraken.com/0/public/Ticker",
-        {
-            "pair": "XBTUSD"
-        }
-    )
-
-    try:
-
-        pair = next(
-            iter(
-                data["result"]
-            )
-        )
-
-        kraken = number(
-            data["result"][pair]["c"][0]
-        )
-
-    except:
-
-        kraken = None
-
-    feeds["Kraken"] = record_feed(
-        "Kraken",
-        kraken
-    )
-
-    data = get_json(
-        "https://www.bitstamp.net/api/v2/ticker/btcusd/"
-    )
-
-    if isinstance(data, dict):
-
-        bitstamp = number(
-            data.get("last")
-        )
-
-    else:
-
-        bitstamp = None
-
-    feeds["Bitstamp"] = record_feed(
-        "Bitstamp",
-        bitstamp
-    )
-
-    values = [
-        value
-        for value in feeds.values()
-        if value is not None
-        and value > 0
-    ]
-
+    values = [v for v in feeds.values() if v is not None and v > 0]
     if not values:
+        return None, feeds
 
-        return (
-            None,
-            feeds
-        )
-
-    med = statistics.median(
-        values
-    )
-
-    filtered = [
-        value
-        for value in values
-        if abs(
-            value - med
-        ) / med <= 0.0035
-    ]
-
-    reference = statistics.median(
-        filtered or values
-    )
-
-    return (
-        reference,
-        feeds
-    )
+    med = statistics.median(values)
+    filtered = [v for v in values if abs(v - med) / med <= 0.0035]
+    reference = statistics.median(filtered or values)
+    return reference, feeds
 
 
 # =========================================================
@@ -4278,8 +4213,12 @@ def build_benchmark_proxy():
     ]
     rows = []
     errors = []
-    for name, url, params in endpoints:
-        data = get_json(url, params)
+    # Public books are independent; fetch them concurrently to avoid adding
+    # three REST timeouts together to the dashboard refresh time.
+    with ThreadPoolExecutor(max_workers=len(endpoints), thread_name_prefix="book-proxy") as pool:
+        futures = [(name, pool.submit(get_json, url, params)) for name, url, params in endpoints]
+        fetched = [(name, future.result()) for name, future in futures]
+    for name, data in fetched:
         try:
             if name == "Kraken":
                 result = data.get("result", {})
@@ -4382,11 +4321,22 @@ def build_control_read(proxy, buy_sell, order_book, signal, adaptive):
     details = []
 
     def add_vote(side, weight, source, label):
-        side = str(side or "WAIT").upper()
+        # Normalize each feed's native vocabulary into the same UP/DOWN
+        # direction before voting. Without this mapping, BUYERS/SELLERS and
+        # BIDS/ASKS were silently discarded because only UP/DOWN were accepted.
+        raw_side = str(side or "WAIT").strip().upper()
+        aliases = {
+            "BUYERS": "UP", "BUY": "UP", "BIDS": "UP", "BID": "UP",
+            "BULL": "UP", "BULLISH": "UP", "LONG": "UP",
+            "SELLERS": "DOWN", "SELL": "DOWN", "ASKS": "DOWN", "ASK": "DOWN",
+            "BEAR": "DOWN", "BEARISH": "DOWN", "SHORT": "DOWN",
+            "NEUTRAL": "WAIT", "FLAT": "WAIT", "CONTESTED": "WAIT",
+        }
+        side = aliases.get(raw_side, raw_side)
         if side in votes:
             votes[side] += weight
             sources[side].add(source)
-            details.append(label + ": " + side)
+            details.append(label + ": " + side + (" (" + raw_side + ")" if raw_side != side else ""))
 
     bside = proxy.get("book_side")
     pside = proxy.get("price_side")
@@ -4441,23 +4391,44 @@ def collect_state():
 
     load_memory()
 
-    price, feeds = (
-        get_spot_feeds()
-    )
+    # Fetch independent market inputs concurrently. Previously each REST source
+    # waited for the prior source to finish, which made the dashboard lag when
+    # one provider was slow. Each function keeps its existing fallback behavior.
+    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="btc-feed") as pool:
+        future_price = pool.submit(get_spot_feeds)
+        future_candles = pool.submit(get_history)
+        future_market = pool.submit(get_kalshi)
+        future_proxy = pool.submit(build_benchmark_proxy)
+        future_flow = pool.submit(get_buy_sell_pressure)
+        future_book = pool.submit(get_order_book_pressure)
 
-    candles = get_history()
-
-    market = get_kalshi()
-
-    benchmark_proxy = build_benchmark_proxy()
-
-    buy_sell = (
-        get_buy_sell_pressure()
-    )
-
-    order_book = (
-        get_order_book_pressure()
-    )
+        # Resolve all six results. Individual feed functions already catch
+        # provider errors; this outer guard keeps one unexpected exception from
+        # crashing the complete dashboard refresh.
+        try:
+            price, feeds = future_price.result()
+        except Exception:
+            price, feeds = None, {}
+        try:
+            candles = future_candles.result()
+        except Exception:
+            candles = []
+        try:
+            market = future_market.result()
+        except Exception:
+            market = None
+        try:
+            benchmark_proxy = future_proxy.result()
+        except Exception:
+            benchmark_proxy = {"available": False, "control": "WAIT", "status": "PROXY ERROR", "exchanges": [], "official_brtI": False}
+        try:
+            buy_sell = future_flow.result()
+        except Exception:
+            buy_sell = {"available": False, "winner": "WAIT", "strength": "FEED ERROR"}
+        try:
+            order_book = future_book.result()
+        except Exception:
+            order_book = {"available": False, "winner": "WAIT", "strength": "FEED ERROR"}
 
     quality_score, quality_grade = (
         calculate_quality(
@@ -4631,6 +4602,8 @@ def collect_state():
             datetime.now(
                 timezone.utc
             ).isoformat(),
+
+        "refresh_mode": "PARALLEL FEED COLLECTION",
 
         "btc":
             price,
