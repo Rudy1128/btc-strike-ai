@@ -5326,15 +5326,14 @@ min-width:3px
 KXBTC15M • Binance Live • Signal Memory 🧠
 </div>
 
-<!-- This board mirrors the existing primary signal; it does not create a second prediction. -->
+<!-- Top-level prediction: estimated final position relative to the current Kalshi strike. -->
 <div id="systemDecisionBoard" class="systemDecision wait" role="status" aria-live="polite">
-  <div class="systemDecisionEyebrow">LIVE SYSTEM DECISION</div>
-  <div id="systemDecisionLabel" class="systemDecisionLabel">🟡 WAIT — BUILDING SIGNAL</div>
+  <div class="systemDecisionEyebrow">15-MINUTE TARGET PREDICTION</div>
+  <div id="systemDecisionLabel" class="systemDecisionLabel">🟡 NOT SURE YET</div>
   <div class="systemDecisionMeta">
-    <span>System confidence: <strong id="systemDecisionConfidence">--%</strong></span>
+    <span>Model confidence: <strong id="systemDecisionConfidence">--%</strong></span>
     <span>Time left: <strong id="systemDecisionCountdown">--:--</strong></span>
   </div>
-  <div id="systemDecisionDetail" class="small" style="margin-top:10px;color:#d4e0e7">Waiting for the existing engine verdict...</div>
 </div>
 
 <div class="strikeHero">
@@ -6427,20 +6426,20 @@ document.getElementById(
 "verdict"
 );
 
-// Keep the top decision board tied to the same primary signal as the existing verdict.
-const primaryDirection = String(signal.verdict || "WAIT").toUpperCase();
+// The top board predicts the final side of the target, not generic price direction.
+// The ensemble already considers strike distance, trajectory, model disagreement, and data quality.
+const targetForecast = data.ensemble_forecast || {};
+const targetDirection = String(targetForecast.direction || "WAIT").toUpperCase();
 const topBoard = document.getElementById("systemDecisionBoard");
 if (topBoard) {
-  const topClass = primaryDirection === "UP" ? "up" : primaryDirection === "DOWN" ? "down" : "wait";
-  topBoard.className = "systemDecision " + topClass;
+  const targetClass = targetDirection === "UP" ? "up" : targetDirection === "DOWN" ? "down" : "wait";
+  topBoard.className = "systemDecision " + targetClass;
   setText("systemDecisionLabel",
-    primaryDirection === "UP" ? "🟢 SYSTEM CHOOSES UP" :
-    primaryDirection === "DOWN" ? "🔴 SYSTEM CHOOSES DOWN" :
-    "🟡 SYSTEM CHOOSES WAIT"
+    targetDirection === "UP" ? "🟢 LIKELY ABOVE TARGET" :
+    targetDirection === "DOWN" ? "🔴 LIKELY BELOW TARGET" :
+    "🟡 NOT SURE — WAIT FOR EVIDENCE"
   );
-  setText("systemDecisionConfidence", (signal.confidence == null ? 0 : signal.confidence) + "%");
-  const directionCounts = (signal.bullish || 0) + " bullish / " + (signal.bearish || 0) + " bearish signals";
-  setText("systemDecisionDetail", (signal.label || "Waiting for a clear signal") + " • " + directionCounts);
+  setText("systemDecisionConfidence", (targetForecast.confidence == null ? 0 : targetForecast.confidence) + "%");
 }
 
 verdict.className =
