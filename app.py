@@ -5332,7 +5332,7 @@ KXBTC15M • Binance Live • Signal Memory 🧠
   <div id="systemDecisionLabel" class="systemDecisionLabel">🟡 NOT SURE YET</div>
   <div class="systemDecisionMeta">
     <span>Model confidence: <strong id="systemDecisionConfidence">--%</strong></span>
-    <span>BTC vs target: <strong id="systemDecisionDistancePct">--%</strong></span>
+    <span>BTC vs target: <strong id="systemDecisionDistanceDollars">--</strong> / <strong id="systemDecisionDistancePct">--%</strong></span>
     <span>Time left: <strong id="systemDecisionCountdown">--:--</strong></span>
   </div>
 </div>
@@ -6446,13 +6446,19 @@ if (topBoard) {
   const liveBtc = (data.btc === null || data.btc === undefined || data.btc === "") ? NaN : Number(data.btc);
   const liveTargetRaw = (data.market && data.market.target !== null && data.market.target !== undefined && data.market.target !== "") ? Number(data.market.target) : NaN;
   const distancePctEl = document.getElementById("systemDecisionDistancePct");
-  if (distancePctEl) {
-    if (Number.isFinite(liveBtc) && Number.isFinite(liveTargetRaw) && liveTargetRaw > 0) {
-      const distancePct = ((liveBtc - liveTargetRaw) / liveTargetRaw) * 100;
-      distancePctEl.textContent = (distancePct > 0 ? "+" : "") + distancePct.toFixed(3) + "%";
-    } else {
-      distancePctEl.textContent = "--%";
+  const distanceDollarsEl = document.getElementById("systemDecisionDistanceDollars");
+  if (Number.isFinite(liveBtc) && Number.isFinite(liveTargetRaw) && liveTargetRaw > 0) {
+    const distanceDollars = liveBtc - liveTargetRaw;
+    const distancePct = (distanceDollars / liveTargetRaw) * 100;
+    if (distanceDollarsEl) {
+      distanceDollarsEl.textContent = (distanceDollars > 0 ? "+$" : distanceDollars < 0 ? "-$" : "$" ) + Math.abs(distanceDollars).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
     }
+    if (distancePctEl) {
+      distancePctEl.textContent = (distancePct > 0 ? "+" : "") + distancePct.toFixed(3) + "%";
+    }
+  } else {
+    if (distanceDollarsEl) distanceDollarsEl.textContent = "--";
+    if (distancePctEl) distancePctEl.textContent = "--%";
   }
 }
 
