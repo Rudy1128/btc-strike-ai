@@ -5695,6 +5695,7 @@ KXBTC15M • Binance Live • Signal Memory 🧠
     <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">INDEX PRICE</div><div id="deribitIndex" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
     <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">OPEN INTEREST</div><div id="deribitOI" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
     <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">TOP-5 ORDER-BOOK IMBALANCE</div><div id="deribitImbalance" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
+    <div id="directionalPressureBox" style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.12);"><div class="small" style="opacity:.72;">BTC DIRECTIONAL PRESSURE</div><div id="directionalPressureValue" style="font-size:clamp(17px,4vw,22px);font-weight:900;margin-top:5px;">--</div><div id="directionalPressureLabel" class="small" style="margin-top:4px;">Waiting for ensemble signal</div></div>
     <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">8-HOUR FUNDING</div><div id="deribitFunding" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
   </div>
   <div id="deribitWarning" class="small" style="margin-top:14px;line-height:1.55;opacity:.82;">Order-book lean is supporting context, NOT a standalone UP/DOWN prediction.</div>
@@ -6744,6 +6745,26 @@ setText("liveUpProbability", Math.round(liveUpPct) + "%");
 setText("liveDownProbability", Math.round(liveDownPct) + "%");
 setText("liveDirectionMeta", "Model confidence " + (ensemble.confidence || 0) + "% • agreement " + (ensemble.agreement || 0) + "% • " + (ensemble.models_used || 0) + "/3 models");
 setText("liveDirectionReason", (ensemble.reason || "Waiting for model agreement.") + " • Updates automatically with the existing dashboard data.");
+
+// Signed directional pressure is derived from the existing ensemble's UP/DOWN
+// score, not from the order-book imbalance. Positive = UP lean; negative = DOWN lean.
+// This is a heuristic directional score, not a calibrated win probability.
+const pressureBox = document.getElementById("directionalPressureBox");
+const pressureValue = document.getElementById("directionalPressureValue");
+const pressureLabel = document.getElementById("directionalPressureLabel");
+if (ensembleDir === "UP" || ensembleDir === "DOWN") {
+  const netPressure = Math.max(0, Math.min(100, (ensembleProb - 50) * 2));
+  const signedPressure = ensembleDir === "UP" ? netPressure : -netPressure;
+  setText("directionalPressureValue", (signedPressure > 0 ? "+" : "") + Math.round(signedPressure) + "%");
+  setText("directionalPressureLabel", ensembleDir === "UP" ? "🟢 UP PRESSURE • model lean" : "🔴 DOWN PRESSURE • model lean");
+  pressureValue.style.color = ensembleDir === "UP" ? "#21ed82" : "#ff6570";
+  pressureBox.style.borderColor = ensembleDir === "UP" ? "rgba(60,220,120,.65)" : "rgba(255,70,70,.65)";
+} else {
+  setText("directionalPressureValue", "WAIT");
+  setText("directionalPressureLabel", "🟡 No confirmed directional lean");
+  pressureValue.style.color = "#f0c36a";
+  pressureBox.style.borderColor = "rgba(196,166,58,.65)";
+}
 liveDirectionBoard.style.borderColor = ensembleDir === "UP" ? "rgba(60,220,120,.75)" : ensembleDir === "DOWN" ? "rgba(255,70,70,.75)" : "rgba(196,166,58,.65)";
 
 // High-confidence panel: distinguish evidence strength from a calibrated win probability.
@@ -6807,7 +6828,7 @@ if (deribit.available) {
   const imbalanceText = deribit.book_imbalance_pct == null ? "--" : (deribit.book_imbalance_pct > 0 ? "+" : "") + deribit.book_imbalance_pct + "%";
   setText("deribitImbalance", imbalanceText);
   setText("deribitFunding", deribit.funding_8h == null ? "--" : (Number(deribit.funding_8h) * 100).toFixed(4) + "%");
-  setText("deribitWarning", "Deribit metrics are supporting context only; the large UP/DOWN/WAIT read comes from BTC Strike AI’s existing ensemble. Order-book imbalance can change quickly. " + (deribit.age_ms == null ? "" : " • data age " + deribit.age_ms + " ms"));
+  setText("deribitWarning", "Order-book imbalance is live order-book liquidity; BTC Directional Pressure is the signed score from the existing ensemble. Both can change quickly and neither guarantees the next 15-minute result. " + (deribit.age_ms == null ? "" : " • data age " + deribit.age_ms + " ms"));
 } else {
   deribitCard.style.borderColor = "rgba(196,166,58,.65)";
   setText("deribitLabel", "🟡 DERIBIT DATA UNAVAILABLE");
