@@ -5679,13 +5679,25 @@ KXBTC15M • Binance Live • Signal Memory 🧠
   <div class="small" style="margin-top:9px;color:#f0c36a;">90%–100% verified win probability: NOT ESTABLISHED YET. Displayed evidence strength is not a win probability.</div>
 </div>
 
-<div id="deribitCard" class="card" style="margin-top:14px;border:2px solid rgba(255,255,255,.16);">
-  <div class="small">₿ DERIBIT BTC FUTURES • FREE PUBLIC API</div>
-  <div id="deribitLabel" class="big" style="text-align:center;margin-top:8px;">🟡 CHECKING DERIBIT DATA</div>
-  <div id="deribitMeta" class="small" style="text-align:center;margin-top:6px;">BTC-PERPETUAL • waiting for public market data</div>
-  <div id="deribitMetrics" class="small" style="margin-top:8px;line-height:1.8;">Mark price -- • index price -- • open interest --</div>
-  <div id="deribitBook" class="small" style="margin-top:5px;line-height:1.8;">Top-5 book imbalance -- • funding --</div>
-  <div id="deribitWarning" class="small" style="margin-top:8px;opacity:.72;">Supplemental derivatives context only; not a standalone prediction and does not yet override the main signal.</div>
+<div id="deribitCard" class="card" style="margin-top:14px;border:2px solid rgba(255,255,255,.16);padding:18px;background:linear-gradient(160deg,rgba(5,20,29,.98),rgba(8,14,24,.98));">
+  <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+    <div class="small" style="font-weight:900;letter-spacing:.03em;">₿ DERIBIT BTC FUTURES</div>
+    <div id="deribitMeta" class="small" style="line-height:1.4;color:#8fc5ed;">LIVE PUBLIC DATA • BTC-PERPETUAL</div>
+  </div>
+  <div id="deribitDirectionHero" style="margin-top:14px;padding:18px 12px;border:2px solid rgba(196,166,58,.65);border-radius:18px;text-align:center;background:linear-gradient(135deg,rgba(20,35,35,.9),rgba(8,17,26,.98));">
+    <div id="deribitLabel" style="font-size:clamp(38px,9vw,64px);font-weight:950;line-height:1.08;letter-spacing:.02em;color:#f0c36a;">🟡 WAIT</div>
+    <div id="deribitPredictionScore" style="font-size:clamp(20px,5vw,30px);font-weight:900;margin-top:8px;">50% directional score</div>
+    <div style="font-size:13px;opacity:.78;margin-top:5px;">BTC STRIKE AI ENSEMBLE • heuristic score, not verified win probability</div>
+    <div id="deribitPredictionReason" class="small" style="margin-top:10px;line-height:1.45;">Waiting for the existing ensemble forecast.</div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(135px,1fr));gap:10px;margin-top:16px;">
+    <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">MARK PRICE</div><div id="deribitMark" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
+    <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">INDEX PRICE</div><div id="deribitIndex" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
+    <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">OPEN INTEREST</div><div id="deribitOI" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
+    <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">TOP-5 ORDER-BOOK IMBALANCE</div><div id="deribitImbalance" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
+    <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">8-HOUR FUNDING</div><div id="deribitFunding" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
+  </div>
+  <div id="deribitWarning" class="small" style="margin-top:14px;line-height:1.55;opacity:.82;">Order-book lean is supporting context, NOT a standalone UP/DOWN prediction.</div>
 </div>
 
 <div id="liveDirectionBoard" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.24);background:linear-gradient(135deg,rgba(10,34,28,.98),rgba(12,20,30,.98));">
@@ -6758,23 +6770,53 @@ setText("platformEdgeLocal", edgeLocalText);
 const deribit = data.deribit || {};
 const deribitCard = document.getElementById("deribitCard");
 const deribitRead = deribit.directional_read || "WAIT";
+// The large hero shows BTC Strike AI's existing ensemble forecast, not a
+// Deribit-only call. Deribit remains supporting market context.
+const deribitHero = document.getElementById("deribitDirectionHero");
+const deribitPredictionScore = ensembleDir === "WAIT" ? 50 : ensembleProb;
+if (ensembleDir === "UP") {
+  setText("deribitLabel", "🟢 UP");
+  setText("deribitPredictionScore", Math.round(deribitPredictionScore) + "% UP DIRECTIONAL SCORE");
+  deribitHero.style.borderColor = "rgba(60,220,120,.85)";
+  deribitHero.style.background = "linear-gradient(135deg,rgba(0,80,43,.55),rgba(8,17,26,.98))";
+  document.getElementById("deribitLabel").style.color = "#21ed82";
+} else if (ensembleDir === "DOWN") {
+  setText("deribitLabel", "🔴 DOWN");
+  setText("deribitPredictionScore", Math.round(deribitPredictionScore) + "% DOWN DIRECTIONAL SCORE");
+  deribitHero.style.borderColor = "rgba(255,70,70,.85)";
+  deribitHero.style.background = "linear-gradient(135deg,rgba(88,15,25,.5),rgba(8,17,26,.98))";
+  document.getElementById("deribitLabel").style.color = "#ff6570";
+} else {
+  setText("deribitLabel", "🟡 WAIT");
+  setText("deribitPredictionScore", "Insufficient confirmation");
+  deribitHero.style.borderColor = "rgba(196,166,58,.75)";
+  deribitHero.style.background = "linear-gradient(135deg,rgba(65,49,10,.32),rgba(8,17,26,.98))";
+  document.getElementById("deribitLabel").style.color = "#f0c36a";
+}
+setText("deribitPredictionReason", (ensemble.reason || "Waiting for model agreement.") + " • model confidence " + (ensemble.confidence || 0) + "% • agreement " + (ensemble.agreement || 0) + "%");
 if (deribit.available) {
-  if (deribitRead === "BID-SIDE LEAN") deribitCard.style.borderColor = "rgba(60,220,120,.65)";
-  else if (deribitRead === "ASK-SIDE LEAN") deribitCard.style.borderColor = "rgba(255,70,70,.65)";
-  else deribitCard.style.borderColor = "rgba(196,166,58,.65)";
-  setText("deribitLabel", (deribitRead === "BID-SIDE LEAN" ? "🟢 " : deribitRead === "ASK-SIDE LEAN" ? "🔴 " : "🟡 ") + deribitRead);
+  if (ensembleDir === "UP") deribitCard.style.borderColor = "rgba(60,220,120,.75)";
+  else if (ensembleDir === "DOWN") deribitCard.style.borderColor = "rgba(255,70,70,.75)";
+  else deribitCard.style.borderColor = "rgba(196,166,58,.75)";
   setText("deribitMeta", (deribit.status || "LIVE") + " • " + (deribit.instrument || "BTC-PERPETUAL") + " • request " + (deribit.latency_ms == null ? "--" : deribit.latency_ms + " ms"));
   const fmtUSD = v => v == null ? "--" : "$" + Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
   const fmtCompact = v => v == null ? "--" : Number(v).toLocaleString(undefined,{maximumFractionDigits:2});
-  setText("deribitMetrics", "Mark " + fmtUSD(deribit.mark_price) + " • Index " + fmtUSD(deribit.index_price) + " • Open interest " + fmtCompact(deribit.open_interest));
-  setText("deribitBook", "Top-5 notional imbalance " + (deribit.book_imbalance_pct == null ? "--" : (deribit.book_imbalance_pct > 0 ? "+" : "") + deribit.book_imbalance_pct + "%") + " • 8h funding " + (deribit.funding_8h == null ? "--" : (Number(deribit.funding_8h) * 100).toFixed(4) + "%"));
-  setText("deribitWarning", (deribit.note || "Derivatives context only.") + (deribit.age_ms == null ? "" : " • cached age " + deribit.age_ms + " ms"));
+  setText("deribitMark", fmtUSD(deribit.mark_price));
+  setText("deribitIndex", fmtUSD(deribit.index_price));
+  setText("deribitOI", fmtCompact(deribit.open_interest));
+  const imbalanceText = deribit.book_imbalance_pct == null ? "--" : (deribit.book_imbalance_pct > 0 ? "+" : "") + deribit.book_imbalance_pct + "%";
+  setText("deribitImbalance", imbalanceText);
+  setText("deribitFunding", deribit.funding_8h == null ? "--" : (Number(deribit.funding_8h) * 100).toFixed(4) + "%");
+  setText("deribitWarning", "Deribit metrics are supporting context only; the large UP/DOWN/WAIT read comes from BTC Strike AI’s existing ensemble. Order-book imbalance can change quickly. " + (deribit.age_ms == null ? "" : " • data age " + deribit.age_ms + " ms"));
 } else {
   deribitCard.style.borderColor = "rgba(196,166,58,.65)";
   setText("deribitLabel", "🟡 DERIBIT DATA UNAVAILABLE");
   setText("deribitMeta", "Public endpoint did not return usable BTC-PERPETUAL data.");
-  setText("deribitMetrics", "Mark -- • Index -- • Open interest --");
-  setText("deribitBook", "Top-5 notional imbalance -- • funding --");
+  setText("deribitMark", "--");
+  setText("deribitIndex", "--");
+  setText("deribitOI", "--");
+  setText("deribitImbalance", "--");
+  setText("deribitFunding", "--");
   setText("deribitWarning", (deribit.error || "Will retry automatically on the next refresh.") + " • Main signal remains based on existing sources.");
 }
 const trajectoryDirection = (data.winner_forecast || {}).direction || "WAIT";
