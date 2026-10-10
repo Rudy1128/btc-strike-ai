@@ -5332,6 +5332,7 @@ KXBTC15M • Binance Live • Signal Memory 🧠
   <div id="systemDecisionLabel" class="systemDecisionLabel">🟡 NOT SURE YET</div>
   <div class="systemDecisionMeta">
     <span>Model confidence: <strong id="systemDecisionConfidence">--%</strong></span>
+    <span>BTC vs target: <strong id="systemDecisionDistancePct">--%</strong></span>
     <span>Time left: <strong id="systemDecisionCountdown">--:--</strong></span>
   </div>
 </div>
@@ -6440,6 +6441,19 @@ if (topBoard) {
     "🟡 NOT SURE — WAIT FOR EVIDENCE"
   );
   setText("systemDecisionConfidence", (targetForecast.confidence == null ? 0 : targetForecast.confidence) + "%");
+  // Show the live percentage distance from the current strike/target.
+  // Positive means BTC is above target; negative means it is below target.
+  const liveBtc = (data.btc === null || data.btc === undefined || data.btc === "") ? NaN : Number(data.btc);
+  const liveTargetRaw = (data.market && data.market.target !== null && data.market.target !== undefined && data.market.target !== "") ? Number(data.market.target) : NaN;
+  const distancePctEl = document.getElementById("systemDecisionDistancePct");
+  if (distancePctEl) {
+    if (Number.isFinite(liveBtc) && Number.isFinite(liveTargetRaw) && liveTargetRaw > 0) {
+      const distancePct = ((liveBtc - liveTargetRaw) / liveTargetRaw) * 100;
+      distancePctEl.textContent = (distancePct > 0 ? "+" : "") + distancePct.toFixed(3) + "%";
+    } else {
+      distancePctEl.textContent = "--%";
+    }
+  }
 }
 
 verdict.className =
