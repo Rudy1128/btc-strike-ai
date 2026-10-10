@@ -34,6 +34,13 @@ KALSHI_SERIES = "KXBTC15M"
 session = requests.Session()
 session.headers["User-Agent"] = "BTC-Strike-AI/10.0-Heat"
 
+# Deribit public derivatives context. This is supplemental market data only;
+# it does not independently override the main UP/DOWN decision engine.
+DERIBIT_BASE = "https://www.deribit.com/api/v2"
+DERIBIT_CACHE_SECONDS = 3.0
+_deribit_cache = {"time": 0.0, "data": None}
+_deribit_lock = threading.Lock()
+
 cache = {
     "time": 0,
     "state": None
@@ -472,6 +479,135 @@ def get_json(url, params=None):
 
     except:
         return None
+
+def get_deribit_data(force=False):
+    """Read Deribit public BTC futures data; no API key is required.
+
+    Returned values are contextual, not a calibrated directional forecast.
+    Results are cached briefly to avoid unnecessary public API traffic.
+    """
+    now = time.time()
+    with _deribit_lock:
+        cached = _deribit_cache.get("data")
+        if (not force and cached is not None
+                and now - float(_deribit_cache.get("time", 0.0)) < DERIBIT_CACHE_SECONDS):
+            result = dict(cached)
+            result["age_ms"] = round(max(0.0, now - float(_deribit_cache.get("time", 0.0))) * 1000, 1)
+            return result
+
+    started = time.time()
+    def _deribit_request(path, params):
+        try:
+            response = session.get(
+                DERIBIT_BASE + path,
+                params=params,
+                timeout=2.2
+            )
+            response.raise_for_status()
+            payload = response.json()
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            return None
+
+    # Fetch in parallel with short timeouts so this optional source cannot
+    # hold up the existing dashboard refresh for a long time.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="deribit") as deribit_pool:
+        future_summary = deribit_pool.submit(
+            _deribit_request, "/public/get_book_summary_by_instrument",
+            {"instrument_name": "BTC-PERPETUAL"}
+        )
+        future_book = deribit_pool.submit(
+            _deribit_request, "/public/get_order_book",
+            {"instrument_name": "BTC-PERPETUAL", "depth": 5}
+        )
+        try:
+            summary_payload = future_summary.result(timeout=2.5)
+        except Exception:
+            summary_payload = None
+        try:
+            book_payload = future_book.result(timeout=2.5)
+        except Exception:
+            book_payload = None
+
+    summary = None
+    if isinstance(summary_payload, dict) and isinstance(summary_payload.get("result"), list):
+        summary = next((x for x in summary_payload["result"]
+                        if isinstance(x, dict) and x.get("instrument_name") == "BTC-PERPETUAL"), None)
+    book = book_payload.get("result") if isinstance(book_payload, dict) else None
+
+    if not isinstance(summary, dict) and not isinstance(book, dict):
+        # Cache failures briefly too, so an outage does not trigger two requests
+        # on every one-second dashboard refresh.
+        payload = {
+            "available": False,
+            "status": "UNAVAILABLE",
+            "source": "Deribit public API",
+            "instrument": "BTC-PERPETUAL",
+            "age_ms": 0,
+            "latency_ms": round((time.time() - started) * 1000, 1),
+            "error": "Could not retrieve Deribit public BTC futures data. Check network/API availability.",
+            "directional_read": "WAIT",
+            "note": "Supplemental derivatives context only; not a standalone prediction."
+        }
+        with _deribit_lock:
+            _deribit_cache["time"] = time.time()
+            _deribit_cache["data"] = dict(payload)
+        return payload
+
+    bid_levels = (book or {}).get("bids") or []
+    ask_levels = (book or {}).get("asks") or []
+    bid_notional = 0.0
+    ask_notional = 0.0
+    for level in bid_levels[:5]:
+        try:
+            bid_notional += float(level[0]) * float(level[1])
+        except (TypeError, ValueError, IndexError):
+            pass
+    for level in ask_levels[:5]:
+        try:
+            ask_notional += float(level[0]) * float(level[1])
+        except (TypeError, ValueError, IndexError):
+            pass
+
+    total_notional = bid_notional + ask_notional
+    imbalance_pct = ((bid_notional - ask_notional) / total_notional * 100.0) if total_notional > 0 else None
+    mark_price = number((book or {}).get("mark_price"))
+    index_price = number((book or {}).get("index_price"))
+    open_interest = number((summary or {}).get("open_interest"))
+    funding_8h = number((summary or {}).get("funding_8h"))
+    current_funding = number((summary or {}).get("current_funding"))
+
+    # This is intentionally a cautious order-book context label, not an entry call.
+    if imbalance_pct is not None and imbalance_pct >= 12:
+        directional_read = "BID-SIDE LEAN"
+    elif imbalance_pct is not None and imbalance_pct <= -12:
+        directional_read = "ASK-SIDE LEAN"
+    else:
+        directional_read = "BALANCED / UNCLEAR"
+
+    payload = {
+        "available": bool(isinstance(summary, dict) or isinstance(book, dict)),
+        "status": "LIVE PUBLIC DATA",
+        "source": "Deribit public API",
+        "instrument": "BTC-PERPETUAL",
+        "mark_price": mark_price,
+        "index_price": index_price,
+        "open_interest": open_interest,
+        "funding_8h": funding_8h,
+        "current_funding": current_funding,
+        "bid_notional_top5": round(bid_notional, 2) if total_notional else None,
+        "ask_notional_top5": round(ask_notional, 2) if total_notional else None,
+        "book_imbalance_pct": round(imbalance_pct, 2) if imbalance_pct is not None else None,
+        "directional_read": directional_read,
+        "age_ms": 0,
+        "latency_ms": round((time.time() - started) * 1000, 1),
+        "error": None,
+        "note": "Derivatives context only. A visible bid/ask imbalance can disappear and is not a reliable standalone prediction."
+    }
+    with _deribit_lock:
+        _deribit_cache["time"] = time.time()
+        _deribit_cache["data"] = dict(payload)
+    return payload
 
 
 def parse_time(value):
@@ -4686,15 +4822,16 @@ def collect_state():
     # Fetch independent market inputs concurrently. Previously each REST source
     # waited for the prior source to finish, which made the dashboard lag when
     # one provider was slow. Each function keeps its existing fallback behavior.
-    with ThreadPoolExecutor(max_workers=6, thread_name_prefix="btc-feed") as pool:
+    with ThreadPoolExecutor(max_workers=7, thread_name_prefix="btc-feed") as pool:
         future_price = pool.submit(get_spot_feeds)
         future_candles = pool.submit(get_history)
         future_market = pool.submit(get_kalshi)
         future_proxy = pool.submit(build_benchmark_proxy)
         future_flow = pool.submit(get_buy_sell_pressure)
         future_book = pool.submit(get_order_book_pressure)
+        future_deribit = pool.submit(get_deribit_data)
 
-        # Resolve all six results. Individual feed functions already catch
+        # Resolve all seven results. Individual feed functions already catch
         # provider errors; this outer guard keeps one unexpected exception from
         # crashing the complete dashboard refresh.
         try:
@@ -4721,6 +4858,12 @@ def collect_state():
             order_book = future_book.result()
         except Exception:
             order_book = {"available": False, "winner": "WAIT", "strength": "FEED ERROR"}
+        try:
+            deribit = future_deribit.result()
+        except Exception as exc:
+            deribit = {"available": False, "status": "ERROR", "source": "Deribit public API",
+                       "instrument": "BTC-PERPETUAL", "age_ms": None, "directional_read": "WAIT",
+                       "error": str(exc)[:180], "note": "Supplemental derivatives context only."}
 
     quality_score, quality_grade = (
         calculate_quality(
@@ -4976,6 +5119,9 @@ def collect_state():
 
         "benchmark_proxy":
             benchmark_proxy,
+
+        "deribit":
+            deribit,
 
         "control_read":
             control_read,
@@ -5564,6 +5710,15 @@ KXBTC15M • Binance Live • Signal Memory 🧠
     </div>
   </div>
   <div class="small" style="margin-top:12px;color:#f0c36a;">Important: this is not a claim that the four sites are API-connected. External signals must not be counted as confirmations until their data is actually retrieved, timestamped, and validated.</div>
+</div>
+
+<div id="deribitCard" class="card" style="margin-top:14px;border:2px solid rgba(255,255,255,.16);">
+  <div class="small">₿ DERIBIT BTC FUTURES • FREE PUBLIC API</div>
+  <div id="deribitLabel" class="big" style="text-align:center;margin-top:8px;">🟡 CHECKING DERIBIT DATA</div>
+  <div id="deribitMeta" class="small" style="text-align:center;margin-top:6px;">BTC-PERPETUAL • waiting for public market data</div>
+  <div id="deribitMetrics" class="small" style="margin-top:8px;line-height:1.8;">Mark price -- • index price -- • open interest --</div>
+  <div id="deribitBook" class="small" style="margin-top:5px;line-height:1.8;">Top-5 book imbalance -- • funding --</div>
+  <div id="deribitWarning" class="small" style="margin-top:8px;opacity:.72;">Supplemental derivatives context only; not a standalone prediction and does not yet override the main signal.</div>
 </div>
 
 <div id="ensembleForecast" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.16);">
@@ -6606,6 +6761,31 @@ const edgeLocalText = statModel.samples
     " • samples " + statModel.samples
   : "Local calculation waiting for enough valid candle history. The external Bitcoin Edge website is not connected.";
 setText("platformEdgeLocal", edgeLocalText);
+
+// Deribit public BTC futures context. This is displayed separately and is not
+// counted as an independent model vote until historical value is validated.
+const deribit = data.deribit || {};
+const deribitCard = document.getElementById("deribitCard");
+const deribitRead = deribit.directional_read || "WAIT";
+if (deribit.available) {
+  if (deribitRead === "BID-SIDE LEAN") deribitCard.style.borderColor = "rgba(60,220,120,.65)";
+  else if (deribitRead === "ASK-SIDE LEAN") deribitCard.style.borderColor = "rgba(255,70,70,.65)";
+  else deribitCard.style.borderColor = "rgba(196,166,58,.65)";
+  setText("deribitLabel", (deribitRead === "BID-SIDE LEAN" ? "🟢 " : deribitRead === "ASK-SIDE LEAN" ? "🔴 " : "🟡 ") + deribitRead);
+  setText("deribitMeta", (deribit.status || "LIVE") + " • " + (deribit.instrument || "BTC-PERPETUAL") + " • request " + (deribit.latency_ms == null ? "--" : deribit.latency_ms + " ms"));
+  const fmtUSD = v => v == null ? "--" : "$" + Number(v).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  const fmtCompact = v => v == null ? "--" : Number(v).toLocaleString(undefined,{maximumFractionDigits:2});
+  setText("deribitMetrics", "Mark " + fmtUSD(deribit.mark_price) + " • Index " + fmtUSD(deribit.index_price) + " • Open interest " + fmtCompact(deribit.open_interest));
+  setText("deribitBook", "Top-5 notional imbalance " + (deribit.book_imbalance_pct == null ? "--" : (deribit.book_imbalance_pct > 0 ? "+" : "") + deribit.book_imbalance_pct + "%") + " • 8h funding " + (deribit.funding_8h == null ? "--" : (Number(deribit.funding_8h) * 100).toFixed(4) + "%"));
+  setText("deribitWarning", (deribit.note || "Derivatives context only.") + (deribit.age_ms == null ? "" : " • cached age " + deribit.age_ms + " ms"));
+} else {
+  deribitCard.style.borderColor = "rgba(196,166,58,.65)";
+  setText("deribitLabel", "🟡 DERIBIT DATA UNAVAILABLE");
+  setText("deribitMeta", "Public endpoint did not return usable BTC-PERPETUAL data.");
+  setText("deribitMetrics", "Mark -- • Index -- • Open interest --");
+  setText("deribitBook", "Top-5 notional imbalance -- • funding --");
+  setText("deribitWarning", (deribit.error || "Will retry automatically on the next refresh.") + " • Main signal remains based on existing sources.");
+}
 const trajectoryDirection = (data.winner_forecast || {}).direction || "WAIT";
 const modelConflict = ["UP", "DOWN"].includes(statDirection) && ["UP", "DOWN"].includes(trajectoryDirection) && statDirection !== trajectoryDirection;
 const strongConfirmation = ["UP", "DOWN"].includes(highDirection) && highScore >= 60 && highAgreement >= 75 && highModels >= 2 && qualityScore >= 70 && !modelConflict;
