@@ -4967,23 +4967,6 @@ border-radius:16px;
 margin-bottom:14px
 }
 
-/* Prominent top-level readout mirrors the existing engine verdict. */
-.systemDecision{
-  text-align:center;
-  padding:20px 16px;
-  border-radius:16px;
-  margin:16px 0 14px;
-  border:2px solid rgba(255,255,255,.18);
-  box-shadow:0 8px 28px rgba(0,0,0,.22);
-}
-.systemDecision.up{background:linear-gradient(135deg,#07351e,#0b241a);border-color:#27c777}
-.systemDecision.down{background:linear-gradient(135deg,#421016,#251015);border-color:#f05260}
-.systemDecision.wait{background:linear-gradient(135deg,#3b3109,#211d0b);border-color:#d6b83e}
-.systemDecisionEyebrow{font-size:12px;font-weight:800;letter-spacing:1.8px;color:#b7c5ce}
-.systemDecisionLabel{font-size:clamp(30px,6vw,48px);font-weight:950;line-height:1.12;margin:9px 0}
-.systemDecisionMeta{display:flex;justify-content:center;gap:10px 22px;flex-wrap:wrap;font-size:14px;color:#d4e0e7}
-.systemDecisionMeta strong{color:#fff}
-
 .up{
 background:#092b1a;
 border:1px solid #1b9b5c
@@ -5324,17 +5307,6 @@ min-width:3px
 
 <div class="small">
 KXBTC15M • Binance Live • Signal Memory 🧠
-</div>
-
-<!-- Top-level prediction: estimated final position relative to the current Kalshi strike. -->
-<div id="systemDecisionBoard" class="systemDecision wait" role="status" aria-live="polite">
-  <div class="systemDecisionEyebrow">15-MINUTE TARGET PREDICTION</div>
-  <div id="systemDecisionLabel" class="systemDecisionLabel">🟡 NOT SURE YET</div>
-  <div class="systemDecisionMeta">
-    <span>Model confidence: <strong id="systemDecisionConfidence">--%</strong></span>
-    <span>BTC vs target: <strong id="systemDecisionDistanceDollars">--</strong> / <strong id="systemDecisionDistancePct">--%</strong></span>
-    <span>Time left: <strong id="systemDecisionCountdown">--:--</strong></span>
-  </div>
 </div>
 
 <div class="strikeHero">
@@ -6159,9 +6131,6 @@ el.textContent =
 clock(
 remaining
 );
-const topCountdown = document.getElementById("systemDecisionCountdown");
-if (topCountdown) topCountdown.textContent = clock(remaining);
-
 const heroCountdown =
 document.getElementById("strikeCountdown");
 if(heroCountdown){
@@ -6428,40 +6397,6 @@ document.getElementById(
 );
 
 // The top board predicts the final side of the target, not generic price direction.
-// The ensemble already considers strike distance, trajectory, model disagreement, and data quality.
-const targetForecast = data.ensemble_forecast || {};
-const targetDirection = String(targetForecast.direction || "WAIT").toUpperCase();
-const topBoard = document.getElementById("systemDecisionBoard");
-if (topBoard) {
-  const targetClass = targetDirection === "UP" ? "up" : targetDirection === "DOWN" ? "down" : "wait";
-  topBoard.className = "systemDecision " + targetClass;
-  setText("systemDecisionLabel",
-    targetDirection === "UP" ? "🟢 LIKELY ABOVE TARGET" :
-    targetDirection === "DOWN" ? "🔴 LIKELY BELOW TARGET" :
-    "🟡 NOT SURE — WAIT FOR EVIDENCE"
-  );
-  setText("systemDecisionConfidence", (targetForecast.confidence == null ? 0 : targetForecast.confidence) + "%");
-  // Show the live percentage distance from the current strike/target.
-  // Positive means BTC is above target; negative means it is below target.
-  const liveBtc = (data.btc === null || data.btc === undefined || data.btc === "") ? NaN : Number(data.btc);
-  const liveTargetRaw = (data.market && data.market.target !== null && data.market.target !== undefined && data.market.target !== "") ? Number(data.market.target) : NaN;
-  const distancePctEl = document.getElementById("systemDecisionDistancePct");
-  const distanceDollarsEl = document.getElementById("systemDecisionDistanceDollars");
-  if (Number.isFinite(liveBtc) && Number.isFinite(liveTargetRaw) && liveTargetRaw > 0) {
-    const distanceDollars = liveBtc - liveTargetRaw;
-    const distancePct = (distanceDollars / liveTargetRaw) * 100;
-    if (distanceDollarsEl) {
-      distanceDollarsEl.textContent = (distanceDollars > 0 ? "+$" : distanceDollars < 0 ? "-$" : "$" ) + Math.abs(distanceDollars).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
-    }
-    if (distancePctEl) {
-      distancePctEl.textContent = (distancePct > 0 ? "+" : "") + distancePct.toFixed(3) + "%";
-    }
-  } else {
-    if (distanceDollarsEl) distanceDollarsEl.textContent = "--";
-    if (distancePctEl) distancePctEl.textContent = "--%";
-  }
-}
-
 verdict.className =
 "verdict "
 +
