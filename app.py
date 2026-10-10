@@ -5524,6 +5524,15 @@ KXBTC15M • Binance Live • Signal Memory 🧠
   <div class="strikeLegend"><span style="color:#ff6570">🔴 BELOW TARGET</span><span style="color:#e0c45b">🎯 TARGET</span><span style="color:#43d184">🟢 ABOVE TARGET</span></div>
 </div>
 
+<div id="highConfidenceCard" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.22);background:linear-gradient(135deg,rgba(16,31,42,.98),rgba(9,20,28,.98));">
+  <div class="small">🎯 HIGH-CONFIDENCE TARGET SIGNAL</div>
+  <div id="highConfidenceLabel" class="big" style="margin-top:8px;">🟡 WAIT — CHECKING EVIDENCE</div>
+  <div id="highConfidenceScore" style="font-size:27px;font-weight:900;margin-top:5px;">Evidence strength: --</div>
+  <div id="highConfidenceMeta" class="small" style="margin-top:5px;">Waiting for independent models and reliable live data.</div>
+  <div id="highConfidenceReason" class="small" style="margin-top:8px;opacity:.88;">A strong signal requires agreement, data quality, and target-aware confirmation.</div>
+  <div class="small" style="margin-top:9px;color:#f0c36a;">90%–100% verified win probability: NOT ESTABLISHED YET. Displayed evidence strength is not a win probability.</div>
+</div>
+
 <div id="ensembleForecast" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.16);">
 <div class="small">🤖 INDEPENDENT 15-MINUTE ENSEMBLE</div>
 <div id="ensembleLabel" class="big">⚪ WAIT</div>
@@ -6545,6 +6554,39 @@ setText("ensembleProbability", ensembleProb + "%");
 setText("ensembleProbabilityLabel", ensembleDirText);
 setText("ensembleMeta", "Confidence " + (ensemble.confidence || 0) + "% • agreement " + (ensemble.agreement || 0) + "% • " + (ensemble.models_used || 0) + "/3 models");
 setText("ensembleReason", (ensemble.reason || "Waiting for model agreement.") + " • HEURISTIC SCORE — NOT A VERIFIED WIN PROBABILITY");
+
+// High-confidence panel: distinguish evidence strength from a calibrated win probability.
+const highCard = document.getElementById("highConfidenceCard");
+const highDirection = ensemble.direction || "WAIT";
+const highScore = Number(ensemble.confidence || 0);
+const highAgreement = Number(ensemble.agreement || 0);
+const highModels = Number(ensemble.models_used || 0);
+const qualityScore = Number((data.data_quality || {}).score || 0);
+const statDirection = (data.statistical_model || {}).direction || "WAIT";
+const trajectoryDirection = (data.winner_forecast || {}).direction || "WAIT";
+const modelConflict = ["UP", "DOWN"].includes(statDirection) && ["UP", "DOWN"].includes(trajectoryDirection) && statDirection !== trajectoryDirection;
+const strongConfirmation = ["UP", "DOWN"].includes(highDirection) && highScore >= 60 && highAgreement >= 75 && highModels >= 2 && qualityScore >= 70 && !modelConflict;
+if (strongConfirmation) {
+  setText("highConfidenceLabel", (highDirection === "UP" ? "🟢" : "🔴") + " STRONG CONFIRMATION: " + highDirection);
+  highCard.style.borderColor = highDirection === "UP" ? "rgba(60,220,120,.8)" : "rgba(255,70,70,.8)";
+  setText("highConfidenceReason", "Independent models agree and data quality passes the gate. This is a stronger setup, not a guarantee.");
+} else if (["UP", "DOWN"].includes(highDirection)) {
+  setText("highConfidenceLabel", "🟡 " + highDirection + " SIGNAL — NEEDS CONFIRMATION");
+  highCard.style.borderColor = "rgba(196,166,58,.7)";
+  let blockers = [];
+  if (highModels < 2) blockers.push("need 2+ models");
+  if (highAgreement < 75) blockers.push("model agreement below 75%");
+  if (highScore < 60) blockers.push("evidence strength below threshold");
+  if (qualityScore < 70) blockers.push("data quality below threshold");
+  if (modelConflict) blockers.push("statistical/trajectory disagreement");
+  setText("highConfidenceReason", blockers.length ? blockers.join(" • ") : "Waiting for sustained confirmation.");
+} else {
+  setText("highConfidenceLabel", "🟡 WAIT — NO CONFIRMED EDGE");
+  highCard.style.borderColor = "rgba(255,255,255,.22)";
+  setText("highConfidenceReason", ensemble.reason || "Signals are mixed or too weak. Waiting is intentional.");
+}
+setText("highConfidenceScore", "Evidence strength: " + highScore + "/100");
+setText("highConfidenceMeta", "Agreement " + highAgreement + "% • models " + highModels + "/3 • data quality " + Math.round(qualityScore) + "% • strike-aware direction");
 
 const adaptive = data.adaptive_mode || {};
 const adaptiveCard = document.getElementById("adaptiveModeCard");
