@@ -5688,6 +5688,16 @@ KXBTC15M • Binance Live • Signal Memory 🧠
   <div id="deribitWarning" class="small" style="margin-top:8px;opacity:.72;">Supplemental derivatives context only; not a standalone prediction and does not yet override the main signal.</div>
 </div>
 
+<div id="midnightTerminalCard" class="card" style="margin-top:14px;border:2px solid rgba(112,91,220,.45);background:linear-gradient(135deg,rgba(25,20,45,.96),rgba(10,20,30,.98));">
+  <div class="small">🌙 MIDNIGHT TERMINAL • EXTERNAL MARKET REFERENCE</div>
+  <div id="midnightTerminalLabel" class="big" style="text-align:center;margin-top:8px;">🔵 EXTERNAL PLATFORM</div>
+  <div class="small" style="margin-top:8px;line-height:1.6;">Open Midnight Terminal to compare its market view with BTC Strike AI. This card is a quick link only; the platform's private/live signals are not imported into this app.</div>
+  <div style="text-align:center;margin-top:12px;">
+    <a href="https://midnightterminal.com/terminal-lite" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:10px 16px;border-radius:9px;background:#6554c0;color:#fff;font-weight:800;text-decoration:none;">Open Midnight Terminal ↗</a>
+  </div>
+  <div id="midnightTerminalWarning" class="small" style="margin-top:10px;opacity:.78;line-height:1.5;">API status: no documented public signal API has been verified. Do not count this site as a live confirmation until an authorized data endpoint is available and validated.</div>
+</div>
+
 <div id="ensembleForecast" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.16);">
 <div class="small">🤖 INDEPENDENT 15-MINUTE ENSEMBLE</div>
 <div id="ensembleLabel" class="big">⚪ WAIT</div>
