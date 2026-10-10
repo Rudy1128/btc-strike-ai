@@ -5688,15 +5688,20 @@ KXBTC15M • Binance Live • Signal Memory 🧠
   <div id="deribitWarning" class="small" style="margin-top:8px;opacity:.72;">Supplemental derivatives context only; not a standalone prediction and does not yet override the main signal.</div>
 </div>
 
-<div id="externalWinRateResearchCard" class="card" style="margin-top:14px;border:2px solid rgba(90,160,220,.42);background:linear-gradient(135deg,rgba(12,29,43,.98),rgba(9,18,28,.98));">
-  <div class="small">📊 EXTERNAL BTC 15-MINUTE TRACK RECORDS • RESEARCH ONLY</div>
-  <div class="big" style="text-align:center;margin-top:8px;">91.2% REPORTED HISTORICAL WIN RATE</div>
-  <div class="small" style="text-align:center;margin-top:6px;line-height:1.6;">DegenHedge reports 91.2% wins across 11,906 graded BTC calls, at a 91.7¢ average entry (96¢ median). This is the provider's published historical record, not BTC Strike AI's accuracy and not a live UP/DOWN signal.</div>
-  <div style="text-align:center;margin-top:12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
-    <a href="https://degenhedge.com/results/?product=btc" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:10px 14px;border-radius:9px;background:#246c9c;color:#fff;font-weight:800;text-decoration:none;">View Graded BTC Calls ↗</a>
-    <a href="https://calipermarkets.com/" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:10px 14px;border-radius:9px;background:#3b5268;color:#fff;font-weight:800;text-decoration:none;">Compare Caliper Record ↗</a>
+<div id="liveDirectionBoard" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.24);background:linear-gradient(135deg,rgba(10,34,28,.98),rgba(12,20,30,.98));">
+  <div class="small">🎯 BTC STRIKE AI • LIVE 15-MINUTE DIRECTION</div>
+  <div id="liveDirectionLabel" class="big" style="margin-top:8px;">🟡 WAIT — CHECKING LIVE DATA</div>
+  <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:10px;">
+    <div style="min-width:110px;padding:10px 16px;border-radius:10px;background:rgba(48,190,112,.13);">
+      <div class="small">🟢 UP</div><div id="liveUpProbability" style="font-size:27px;font-weight:900;">--%</div>
+    </div>
+    <div style="min-width:110px;padding:10px 16px;border-radius:10px;background:rgba(230,65,75,.13);">
+      <div class="small">🔴 DOWN</div><div id="liveDownProbability" style="font-size:27px;font-weight:900;">--%</div>
+    </div>
   </div>
-  <div class="small" style="margin-top:10px;line-height:1.6;opacity:.88;">Important: at a 91.7¢ average entry, the reported 91.2% win rate is below the 91.7% break-even rate before fees, and fees make the result worse. Caliper has separately reported 90.5% versus 89.0% market accuracy at T−2 minutes in a 2,513-block sample as of Sep 7, 2026. These are external historical claims, not verified live integrations. No external signal is being fed into the BTC Strike AI prediction engine.</div>
+  <div id="liveDirectionMeta" class="small" style="margin-top:10px;">Waiting for the live ensemble forecast...</div>
+  <div id="liveDirectionReason" class="small" style="margin-top:7px;line-height:1.5;opacity:.88;">This is BTC Strike AI's own model output, not a live Caliper Markets signal.</div>
+  <div class="small" style="margin-top:8px;color:#f0c36a;">Percentages are heuristic model scores, not verified win probabilities. WAIT means the evidence is insufficient or conflicting.</div>
 </div>
 
 <div id="ensembleForecast" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.16);">
@@ -6716,6 +6721,18 @@ setText("ensembleProbability", ensembleProb + "%");
 setText("ensembleProbabilityLabel", ensembleDirText);
 setText("ensembleMeta", "Confidence " + (ensemble.confidence || 0) + "% • agreement " + (ensemble.agreement || 0) + "% • " + (ensemble.models_used || 0) + "/3 models");
 setText("ensembleReason", (ensemble.reason || "Waiting for model agreement.") + " • HEURISTIC SCORE — NOT A VERIFIED WIN PROBABILITY");
+
+// Prominent automatic UP/DOWN board. Mirrors the existing local ensemble;
+// it does not claim to import Caliper Markets' live forecasts.
+const liveDirectionBoard = document.getElementById("liveDirectionBoard");
+const liveUpPct = ensembleDir === "UP" ? ensembleProb : ensembleDir === "DOWN" ? 100 - ensembleProb : 50;
+const liveDownPct = 100 - liveUpPct;
+setText("liveDirectionLabel", ensembleDir === "UP" ? "🟢 CURRENT READ: UP" : ensembleDir === "DOWN" ? "🔴 CURRENT READ: DOWN" : "🟡 CURRENT READ: WAIT");
+setText("liveUpProbability", Math.round(liveUpPct) + "%");
+setText("liveDownProbability", Math.round(liveDownPct) + "%");
+setText("liveDirectionMeta", "Model confidence " + (ensemble.confidence || 0) + "% • agreement " + (ensemble.agreement || 0) + "% • " + (ensemble.models_used || 0) + "/3 models");
+setText("liveDirectionReason", (ensemble.reason || "Waiting for model agreement.") + " • Updates automatically with the existing dashboard data.");
+liveDirectionBoard.style.borderColor = ensembleDir === "UP" ? "rgba(60,220,120,.75)" : ensembleDir === "DOWN" ? "rgba(255,70,70,.75)" : "rgba(196,166,58,.65)";
 
 // High-confidence panel: distinguish evidence strength from a calibrated win probability.
 const highCard = document.getElementById("highConfidenceCard");
