@@ -5688,14 +5688,15 @@ KXBTC15M • Binance Live • Signal Memory 🧠
   <div id="deribitWarning" class="small" style="margin-top:8px;opacity:.72;">Supplemental derivatives context only; not a standalone prediction and does not yet override the main signal.</div>
 </div>
 
-<div id="midnightTerminalCard" class="card" style="margin-top:14px;border:2px solid rgba(112,91,220,.45);background:linear-gradient(135deg,rgba(25,20,45,.96),rgba(10,20,30,.98));">
-  <div class="small">🌙 MIDNIGHT TERMINAL • EXTERNAL MARKET REFERENCE</div>
-  <div id="midnightTerminalLabel" class="big" style="text-align:center;margin-top:8px;">🔵 EXTERNAL PLATFORM</div>
-  <div class="small" style="margin-top:8px;line-height:1.6;">Open Midnight Terminal to compare its market view with BTC Strike AI. This card is a quick link only; the platform's private/live signals are not imported into this app.</div>
-  <div style="text-align:center;margin-top:12px;">
-    <a href="https://midnightterminal.com/terminal-lite" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:10px 16px;border-radius:9px;background:#6554c0;color:#fff;font-weight:800;text-decoration:none;">Open Midnight Terminal ↗</a>
+<div id="externalWinRateResearchCard" class="card" style="margin-top:14px;border:2px solid rgba(90,160,220,.42);background:linear-gradient(135deg,rgba(12,29,43,.98),rgba(9,18,28,.98));">
+  <div class="small">📊 EXTERNAL BTC 15-MINUTE TRACK RECORDS • RESEARCH ONLY</div>
+  <div class="big" style="text-align:center;margin-top:8px;">91.2% REPORTED HISTORICAL WIN RATE</div>
+  <div class="small" style="text-align:center;margin-top:6px;line-height:1.6;">DegenHedge reports 91.2% wins across 11,906 graded BTC calls, at a 91.7¢ average entry (96¢ median). This is the provider's published historical record, not BTC Strike AI's accuracy and not a live UP/DOWN signal.</div>
+  <div style="text-align:center;margin-top:12px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+    <a href="https://degenhedge.com/results/?product=btc" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:10px 14px;border-radius:9px;background:#246c9c;color:#fff;font-weight:800;text-decoration:none;">View Graded BTC Calls ↗</a>
+    <a href="https://calipermarkets.com/" target="_blank" rel="noopener noreferrer" style="display:inline-block;padding:10px 14px;border-radius:9px;background:#3b5268;color:#fff;font-weight:800;text-decoration:none;">Compare Caliper Record ↗</a>
   </div>
-  <div id="midnightTerminalWarning" class="small" style="margin-top:10px;opacity:.78;line-height:1.5;">API status: no documented public signal API has been verified. Do not count this site as a live confirmation until an authorized data endpoint is available and validated.</div>
+  <div class="small" style="margin-top:10px;line-height:1.6;opacity:.88;">Important: at a 91.7¢ average entry, the reported 91.2% win rate is below the 91.7% break-even rate before fees, and fees make the result worse. Caliper has separately reported 90.5% versus 89.0% market accuracy at T−2 minutes in a 2,513-block sample as of Sep 7, 2026. These are external historical claims, not verified live integrations. No external signal is being fed into the BTC Strike AI prediction engine.</div>
 </div>
 
 <div id="ensembleForecast" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.16);">
