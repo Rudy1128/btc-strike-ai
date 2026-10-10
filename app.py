@@ -5679,39 +5679,6 @@ KXBTC15M • Binance Live • Signal Memory 🧠
   <div class="small" style="margin-top:9px;color:#f0c36a;">90%–100% verified win probability: NOT ESTABLISHED YET. Displayed evidence strength is not a win probability.</div>
 </div>
 
-<div id="platformBridgeCard" class="card" style="margin-top:14px;border:2px solid rgba(100,160,220,.35);">
-  <div class="small">🔌 FOUR-PLATFORM RESEARCH BRIDGE</div>
-  <div class="big" style="text-align:center;margin:8px 0;">SOURCE STATUS — HONEST MODE</div>
-  <div class="small" style="margin-bottom:12px;opacity:.82;">These links are included for quick reference. The external sites are NOT represented as connected feeds unless a supported data interface is verified. Your existing Binance/Coinbase/Kalshi inputs remain the live sources for this app.</div>
-  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;">
-    <div style="padding:12px;border:1px solid rgba(255,255,255,.14);border-radius:10px;">
-      <div style="font-weight:800;">Midnight Terminal</div>
-      <div class="small" style="margin:5px 0;">STATUS: EXTERNAL REFERENCE</div>
-      <a href="https://midnightterminal.com/" target="_blank" rel="noopener noreferrer">Open platform ↗</a>
-      <div class="small" style="margin-top:6px;opacity:.75;">No documented public data API verified for this integration.</div>
-    </div>
-    <div style="padding:12px;border:1px solid rgba(255,255,255,.14);border-radius:10px;">
-      <div style="font-weight:800;">Bitcoin UpDown</div>
-      <div class="small" style="margin:5px 0;">STATUS: EXTERNAL REFERENCE</div>
-      <a href="https://bitcoinupdown.com/" target="_blank" rel="noopener noreferrer">Open platform ↗</a>
-      <div class="small" style="margin-top:6px;opacity:.75;">Its published forecast is not imported into this app; no supported public signal API has been verified.</div>
-    </div>
-    <div style="padding:12px;border:1px solid rgba(255,255,255,.14);border-radius:10px;">
-      <div style="font-weight:800;">PM Countdown</div>
-      <div class="small" style="margin:5px 0;">STATUS: EXTERNAL REFERENCE</div>
-      <a href="https://pmcountdown.com/markets/crypto/btc/btc-15m?tf=1" target="_blank" rel="noopener noreferrer">Open BTC 15-Min ↗</a>
-      <div class="small" style="margin-top:6px;opacity:.75;">This app obtains its market/strike from Kalshi directly; PM Countdown is not treated as an independent live feed.</div>
-    </div>
-    <div style="padding:12px;border:1px solid rgba(255,255,255,.14);border-radius:10px;">
-      <div style="font-weight:800;">Bitcoin Edge 15-Min</div>
-      <div class="small" style="margin:5px 0;">STATUS: LOCAL MATH ACTIVE</div>
-      <a href="https://predictionmarketspicks.com/tools/bitcoin-edge-15m" target="_blank" rel="noopener noreferrer">Open Bitcoin Edge ↗</a>
-      <div id="platformEdgeLocal" class="small" style="margin-top:6px;">Local comparison warming up: strike distance, volatility, and time remaining.</div>
-    </div>
-  </div>
-  <div class="small" style="margin-top:12px;color:#f0c36a;">Important: this is not a claim that the four sites are API-connected. External signals must not be counted as confirmations until their data is actually retrieved, timestamped, and validated.</div>
-</div>
-
 <div id="deribitCard" class="card" style="margin-top:14px;border:2px solid rgba(255,255,255,.16);">
   <div class="small">₿ DERIBIT BTC FUTURES • FREE PUBLIC API</div>
   <div id="deribitLabel" class="big" style="text-align:center;margin-top:8px;">🟡 CHECKING DERIBIT DATA</div>
@@ -6395,12 +6362,8 @@ seconds%60
 
 
 function setText(id,value){
-
-document.getElementById(
-id
-).textContent =
-value;
-
+const element = document.getElementById(id);
+if (element) element.textContent = value;
 }
 
 
