@@ -5695,7 +5695,7 @@ KXBTC15M • Binance Live • Signal Memory 🧠
     <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">INDEX PRICE</div><div id="deribitIndex" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
     <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">OPEN INTEREST</div><div id="deribitOI" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
     <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">TOP-5 ORDER-BOOK IMBALANCE</div><div id="deribitImbalance" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
-    <div id="directionalPressureBox" style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.12);"><div class="small" style="opacity:.72;">BTC DIRECTIONAL PRESSURE</div><div id="directionalPressureValue" style="font-size:clamp(17px,4vw,22px);font-weight:900;margin-top:5px;">--</div><div id="directionalPressureLabel" class="small" style="margin-top:4px;">Waiting for ensemble signal</div></div>
+    <div id="directionalPressureBox" style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.12);"><div class="small" style="opacity:.72;">BTC TARGET DIFFERENCE</div><div id="directionalPressureValue" style="font-size:clamp(17px,4vw,22px);font-weight:900;margin-top:5px;">--</div><div id="directionalPressureLabel" class="small" style="margin-top:4px;">Waiting for live BTC price and strike</div></div>
     <div style="padding:12px;border-radius:12px;background:rgba(255,255,255,.045);"><div class="small" style="opacity:.72;">8-HOUR FUNDING</div><div id="deribitFunding" style="font-size:clamp(17px,4vw,22px);font-weight:800;margin-top:5px;">--</div></div>
   </div>
   <div id="deribitWarning" class="small" style="margin-top:14px;line-height:1.55;opacity:.82;">Order-book lean is supporting context, NOT a standalone UP/DOWN prediction.</div>
@@ -6422,15 +6422,39 @@ function updateStrikeHero(price,target){
   document.getElementById("strikeNow").textContent=strikeMoney(p);
   if(!Number.isFinite(t) || t<=0){
     d.textContent="--";
+    setText("directionalPressureValue","--");
+    setText("directionalPressureLabel","Waiting for live BTC price and strike");
+    const pressureValue=document.getElementById("directionalPressureValue");
+    const pressureBox=document.getElementById("directionalPressureBox");
+    if(pressureValue)pressureValue.style.color="#f0c36a";
+    if(pressureBox)pressureBox.style.borderColor="rgba(196,166,58,.65)";
     st.className="strikeStatus strikeWait";
     st.textContent="🟡 WAITING FOR VALID KALSHI TARGET";
     return;
   }
   const diff=p-t;
-  d.textContent=(diff>=0?"+":"")+strikeMoney(diff);
-  if(diff>0){st.className="strikeStatus strikeAbove";st.textContent="🟢 ABOVE TARGET";}
-  else if(diff<0){st.className="strikeStatus strikeBelow";st.textContent="🔴 BELOW TARGET";}
-  else{st.className="strikeStatus strikeWait";st.textContent="🎯 AT TARGET";}
+  const signedDiff=(diff>=0?"+":"−")+"$"+Math.abs(diff).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+  d.textContent=(diff>=0?"+":"−")+strikeMoney(Math.abs(diff));
+  // Mirror the simple, target-aware DIFFERENCE display in the main strike card.
+  setText("directionalPressureValue", signedDiff);
+  const pressureBox=document.getElementById("directionalPressureBox");
+  const pressureValue=document.getElementById("directionalPressureValue");
+  if(diff>0){
+    st.className="strikeStatus strikeAbove";st.textContent="🟢 ABOVE TARGET";
+    setText("directionalPressureLabel","🟢 ABOVE TARGET • BTC is over strike");
+    if(pressureValue)pressureValue.style.color="#21ed82";
+    if(pressureBox)pressureBox.style.borderColor="rgba(60,220,120,.65)";
+  } else if(diff<0){
+    st.className="strikeStatus strikeBelow";st.textContent="🔴 BELOW TARGET";
+    setText("directionalPressureLabel","🔴 BELOW TARGET • BTC is under strike");
+    if(pressureValue)pressureValue.style.color="#ff6570";
+    if(pressureBox)pressureBox.style.borderColor="rgba(255,70,70,.65)";
+  } else {
+    st.className="strikeStatus strikeWait";st.textContent="🎯 AT TARGET";
+    setText("directionalPressureLabel","🎯 BTC is exactly at strike");
+    if(pressureValue)pressureValue.style.color="#f0c36a";
+    if(pressureBox)pressureBox.style.borderColor="rgba(196,166,58,.65)";
+  }
 }
 
 function drawStrikeChart(){
@@ -6746,25 +6770,8 @@ setText("liveDownProbability", Math.round(liveDownPct) + "%");
 setText("liveDirectionMeta", "Model confidence " + (ensemble.confidence || 0) + "% • agreement " + (ensemble.agreement || 0) + "% • " + (ensemble.models_used || 0) + "/3 models");
 setText("liveDirectionReason", (ensemble.reason || "Waiting for model agreement.") + " • Updates automatically with the existing dashboard data.");
 
-// Signed directional pressure is derived from the existing ensemble's UP/DOWN
-// score, not from the order-book imbalance. Positive = UP lean; negative = DOWN lean.
-// This is a heuristic directional score, not a calibrated win probability.
-const pressureBox = document.getElementById("directionalPressureBox");
-const pressureValue = document.getElementById("directionalPressureValue");
-const pressureLabel = document.getElementById("directionalPressureLabel");
-if (ensembleDir === "UP" || ensembleDir === "DOWN") {
-  const netPressure = Math.max(0, Math.min(100, (ensembleProb - 50) * 2));
-  const signedPressure = ensembleDir === "UP" ? netPressure : -netPressure;
-  setText("directionalPressureValue", (signedPressure > 0 ? "+" : "") + Math.round(signedPressure) + "%");
-  setText("directionalPressureLabel", ensembleDir === "UP" ? "🟢 UP PRESSURE • model lean" : "🔴 DOWN PRESSURE • model lean");
-  pressureValue.style.color = ensembleDir === "UP" ? "#21ed82" : "#ff6570";
-  pressureBox.style.borderColor = ensembleDir === "UP" ? "rgba(60,220,120,.65)" : "rgba(255,70,70,.65)";
-} else {
-  setText("directionalPressureValue", "WAIT");
-  setText("directionalPressureLabel", "🟡 No confirmed directional lean");
-  pressureValue.style.color = "#f0c36a";
-  pressureBox.style.borderColor = "rgba(196,166,58,.65)";
-}
+// The target-difference box is updated from live BTC price versus the actual
+// Kalshi strike inside updateStrikeHero(). It is intentionally not an ensemble score.
 liveDirectionBoard.style.borderColor = ensembleDir === "UP" ? "rgba(60,220,120,.75)" : ensembleDir === "DOWN" ? "rgba(255,70,70,.75)" : "rgba(196,166,58,.65)";
 
 // High-confidence panel: distinguish evidence strength from a calibrated win probability.
