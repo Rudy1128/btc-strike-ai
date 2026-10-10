@@ -1,4 +1,5 @@
 import os, time, json, statistics, threading, math
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 import requests
@@ -108,6 +109,17 @@ live_coinbase = {
 STREAM_MAX_AGE = 1.5
 active_btc_source = "REST fallback"
 kalshi_last_update = 0.0
+
+# Real-time microstructure feed: executed trade flow + best bid/ask sizes.
+# This is a market-pressure observer, not an order-placement engine.
+MICRO_LOCK = threading.Lock()
+MICRO_TRADES = deque(maxlen=5000)   # (received_ts, signed_notional, notional, price)
+MICRO_PRICES = deque(maxlen=2000)   # (received_ts, price)
+MICRO_BOOK = {
+    "bid": None, "bid_qty": None, "ask": None, "ask_qty": None,
+    "received_at": 0.0, "connected": False, "last_error": None, "reconnects": 0
+}
+MICRO_MAX_AGE = 3.0
 
 
 def _binance_stream_loop():
@@ -254,6 +266,179 @@ def _coinbase_stream_loop():
                     ws.close()
             except Exception:
                 pass
+
+def _market_microstructure_stream_loop():
+    """Consume Binance trades and best bid/ask updates for a fast pressure read."""
+    if websocket is None:
+        return
+
+    url = "wss://stream.binance.com:9443/stream?streams=btcusdt@trade/btcusdt@bookTicker"
+    while True:
+        ws = None
+        try:
+            ws = websocket.create_connection(
+                url, timeout=5, http_proxy_host=None, http_proxy_port=None,
+                http_no_proxy=["stream.binance.com"], suppress_origin=True,
+                enable_multithread=True
+            )
+            with MICRO_LOCK:
+                MICRO_BOOK["connected"] = True
+                MICRO_BOOK["last_error"] = None
+
+            while True:
+                raw = ws.recv()
+                if not raw:
+                    raise RuntimeError("Empty Binance microstructure message")
+                packet = json.loads(raw)
+                data = packet.get("data", packet)
+                event = data.get("e", "")
+                received = time.time()
+
+                if event == "trade":
+                    price = number(data.get("p"))
+                    qty = number(data.get("q"))
+                    if price is None or qty is None or price <= 0 or qty <= 0:
+                        continue
+                    notional = price * qty
+                    # m=True means buyer was maker, so the aggressor was a seller.
+                    signed = -notional if data.get("m") is True else notional
+                    with MICRO_LOCK:
+                        MICRO_TRADES.append((received, signed, notional, price))
+                        MICRO_PRICES.append((received, price))
+
+                elif event == "bookTicker" or ("b" in data and "a" in data and "B" in data and "A" in data):
+                    bid = number(data.get("b"))
+                    bid_qty = number(data.get("B"))
+                    ask = number(data.get("a"))
+                    ask_qty = number(data.get("A"))
+                    if (bid is None or ask is None or bid_qty is None or ask_qty is None
+                            or bid <= 0 or ask <= 0 or ask < bid):
+                        continue
+                    with MICRO_LOCK:
+                        MICRO_BOOK.update({
+                            "bid": bid, "bid_qty": bid_qty, "ask": ask,
+                            "ask_qty": ask_qty, "received_at": received,
+                            "connected": True, "last_error": None
+                        })
+        except Exception as exc:
+            with MICRO_LOCK:
+                MICRO_BOOK["connected"] = False
+                MICRO_BOOK["last_error"] = str(exc)[:180]
+                MICRO_BOOK["reconnects"] = int(MICRO_BOOK.get("reconnects", 0)) + 1
+            time.sleep(0.5)
+        finally:
+            try:
+                if ws is not None:
+                    ws.close()
+            except Exception:
+                pass
+
+
+def build_market_maker_read(now=None):
+    """Summarize short-window trade flow and top-of-book pressure.
+
+    Scores are rule-based pressure scores, not calibrated probabilities.
+    """
+    now = now or time.time()
+    with MICRO_LOCK:
+        trades = [x for x in MICRO_TRADES if now - x[0] <= 10.0]
+        prices = [x for x in MICRO_PRICES if now - x[0] <= 10.0]
+        book = dict(MICRO_BOOK)
+
+    age = now - book.get("received_at", 0.0) if book.get("received_at") else None
+    if age is not None and age > MICRO_MAX_AGE:
+        book_fresh = False
+    else:
+        book_fresh = bool(book.get("bid") and book.get("ask")) and age is not None
+
+    signed_flow = sum(x[1] for x in trades)
+    total_flow = sum(x[2] for x in trades)
+    trade_delta_pct = (signed_flow / total_flow * 100.0) if total_flow > 0 else None
+    buy_notional = sum(x[2] for x in trades if x[1] > 0)
+    sell_notional = sum(x[2] for x in trades if x[1] < 0)
+    total_aggressive = buy_notional + sell_notional
+    buy_pct = buy_notional / total_aggressive * 100.0 if total_aggressive > 0 else None
+
+    bid_qty = book.get("bid_qty") if book_fresh else None
+    ask_qty = book.get("ask_qty") if book_fresh else None
+    qty_total = (bid_qty + ask_qty) if bid_qty is not None and ask_qty is not None else 0.0
+    book_imbalance = ((bid_qty - ask_qty) / qty_total * 100.0) if qty_total > 0 else None
+
+    bid, ask = book.get("bid"), book.get("ask")
+    mid = (bid + ask) / 2.0 if book_fresh else None
+    microprice = None
+    micro_edge_bps = None
+    spread_bps = None
+    if book_fresh and qty_total > 0 and mid and mid > 0:
+        # Queue-size-weighted midpoint: larger bid size tilts it upward.
+        microprice = (ask * bid_qty + bid * ask_qty) / qty_total
+        micro_edge_bps = (microprice - mid) / mid * 10000.0
+        spread_bps = (ask - bid) / mid * 10000.0
+
+    price_move_bps = None
+    if len(prices) >= 2:
+        first_price = prices[0][1]
+        last_price = prices[-1][1]
+        if first_price > 0:
+            price_move_bps = (last_price - first_price) / first_price * 10000.0
+
+    up_votes = 0
+    down_votes = 0
+    evidence = []
+    if trade_delta_pct is not None and len(trades) >= 5:
+        if trade_delta_pct >= 12:
+            up_votes += 1; evidence.append("10s aggressive trade flow favors buyers")
+        elif trade_delta_pct <= -12:
+            down_votes += 1; evidence.append("10s aggressive trade flow favors sellers")
+    if book_imbalance is not None:
+        if book_imbalance >= 15:
+            up_votes += 1; evidence.append("best-quote size favors bids")
+        elif book_imbalance <= -15:
+            down_votes += 1; evidence.append("best-quote size favors asks")
+    if micro_edge_bps is not None:
+        if micro_edge_bps >= 0.08:
+            up_votes += 1; evidence.append("microprice tilts upward")
+        elif micro_edge_bps <= -0.08:
+            down_votes += 1; evidence.append("microprice tilts downward")
+    if price_move_bps is not None:
+        if price_move_bps >= 0.8:
+            up_votes += 1; evidence.append("10s price response is positive")
+        elif price_move_bps <= -0.8:
+            down_votes += 1; evidence.append("10s price response is negative")
+
+    feed_ready = book_fresh and len(trades) >= 5 and total_flow > 0
+    if not feed_ready:
+        direction, label, score = "WAIT", "⚪ WAIT — BUILDING LIVE DATA", 0
+        reason = "Waiting for a fresh best-bid/ask stream and enough recent trades."
+    elif up_votes >= 2 and up_votes > down_votes:
+        direction, label = "UP", "🟢 EARLY UP PRESSURE"
+        score = min(85, 50 + 9 * (up_votes - down_votes))
+        reason = "Multiple short-window inputs lean upward; this is not a settlement prediction."
+    elif down_votes >= 2 and down_votes > up_votes:
+        direction, label = "DOWN", "🔴 EARLY DOWN PRESSURE"
+        score = min(85, 50 + 9 * (down_votes - up_votes))
+        reason = "Multiple short-window inputs lean downward; this is not a settlement prediction."
+    else:
+        direction, label, score = "WAIT", "🟡 WAIT — PRESSURE MIXED", 0
+        reason = "Short-window inputs do not agree strongly enough."
+
+    return {
+        "available": feed_ready, "direction": direction, "label": label,
+        "rule_score": score, "up_votes": up_votes, "down_votes": down_votes,
+        "trade_count_10s": len(trades),
+        "trade_delta_pct_10s": round(trade_delta_pct, 2) if trade_delta_pct is not None else None,
+        "aggressive_buy_pct_10s": round(buy_pct, 2) if buy_pct is not None else None,
+        "book_imbalance_pct": round(book_imbalance, 2) if book_imbalance is not None else None,
+        "microprice_edge_bps": round(micro_edge_bps, 3) if micro_edge_bps is not None else None,
+        "spread_bps": round(spread_bps, 3) if spread_bps is not None else None,
+        "price_move_bps_10s": round(price_move_bps, 3) if price_move_bps is not None else None,
+        "book_age_ms": round(age * 1000, 1) if age is not None else None,
+        "stream_connected": bool(book.get("connected")),
+        "reconnects": int(book.get("reconnects", 0)),
+        "evidence": evidence, "reason": reason,
+        "warning": "Market-pressure estimate only; no participant identity or guaranteed future move."
+    }
+
 
 def safe_event_time(value):
     try:
@@ -4798,6 +4983,9 @@ def collect_state():
         "prediction_strength":
             strength,
 
+        "market_maker":
+            build_market_maker_read(),
+
         "latency":
             {
 
@@ -4908,6 +5096,12 @@ if websocket is not None:
     threading.Thread(
         target=_coinbase_stream_loop,
         name="coinbase-live-stream",
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=_market_microstructure_stream_loop,
+        name="binance-market-microstructure",
         daemon=True
     ).start()
 
@@ -5356,6 +5550,15 @@ KXBTC15M • Binance Live • Signal Memory 🧠
   <div id="controlReadLabel" class="big" style="text-align:center;margin-top:12px;">🟡 CONTROL: WAIT</div>
   <div id="controlReadDetail" class="small" style="margin-top:8px;">Waiting for independent price and pressure evidence.</div>
   <div class="small" style="margin-top:8px;opacity:.72;">Important: a large bid/ask wall alone is not proof of direction. This panel checks whether price actually responds to pressure.</div>
+</div>
+
+<div id="marketMakerCard" class="card" style="margin-top:14px;border:2px solid rgba(255,255,255,.16);">
+  <div class="small">⚡ REAL-TIME MICROSTRUCTURE • MARKET-MAKER-STYLE PRESSURE</div>
+  <div id="marketMakerLabel" class="big" style="text-align:center;margin-top:8px;">⚪ WAIT — BUILDING LIVE DATA</div>
+  <div id="marketMakerMeta" class="small" style="text-align:center;">Waiting for live trades and best bid/ask sizes...</div>
+  <div id="marketMakerMetrics" class="small" style="margin-top:8px;line-height:1.7;">Trade flow -- • book imbalance -- • microprice -- • spread --</div>
+  <div id="marketMakerEvidence" class="small" style="margin-top:8px;white-space:pre-wrap;">Waiting for evidence.</div>
+  <div id="marketMakerWarning" class="small" style="margin-top:8px;opacity:.72;">Pressure estimate only; no participant identity or guaranteed future move.</div>
 </div>
 
 <div id="winnerForecast" class="card" style="margin-top:14px;text-align:center;border:2px solid rgba(255,255,255,.16);">
@@ -6389,6 +6592,28 @@ const control = data.control_read || {};
 const controlDir = control.direction || "WAIT";
 setText("controlReadLabel", (controlDir === "UP" ? "🟢 CONTROL: UP" : controlDir === "DOWN" ? "🔴 CONTROL: DOWN" : "🟡 CONTROL: WAIT") + " • score " + (control.score == null ? "--" : control.score + "/100"));
 setText("controlReadDetail", (control.status || "INSUFFICIENT DATA") + " • " + (control.detail || "Waiting for evidence."));
+
+// ---------------------------------------------------------
+// REAL-TIME MICROSTRUCTURE / MARKET-MAKER-STYLE PRESSURE
+// ---------------------------------------------------------
+const mm = data.market_maker || {};
+const mmCard = document.getElementById("marketMakerCard");
+const mmDir = mm.direction || "WAIT";
+if (mmDir === "UP") mmCard.style.borderColor = "rgba(60,220,120,.8)";
+else if (mmDir === "DOWN") mmCard.style.borderColor = "rgba(255,70,70,.8)";
+else mmCard.style.borderColor = "rgba(196,166,58,.65)";
+setText("marketMakerLabel", mm.label || "⚪ WAIT — BUILDING LIVE DATA");
+setText("marketMakerMeta", (mm.available ? "LIVE • " : "FEED WARMING • ") + (mm.trade_count_10s || 0) + " trades / 10s • rule score " + (mm.rule_score || 0) + "/100 • book age " + (mm.book_age_ms == null ? "--" : mm.book_age_ms + " ms"));
+setText("marketMakerMetrics",
+  "Trade delta " + (mm.trade_delta_pct_10s == null ? "--" : (mm.trade_delta_pct_10s > 0 ? "+" : "") + mm.trade_delta_pct_10s + "%") +
+  " • Aggressive buys " + (mm.aggressive_buy_pct_10s == null ? "--" : mm.aggressive_buy_pct_10s + "%") +
+  " • Top-book imbalance " + (mm.book_imbalance_pct == null ? "--" : (mm.book_imbalance_pct > 0 ? "+" : "") + mm.book_imbalance_pct + "%") +
+  " • Microprice edge " + (mm.microprice_edge_bps == null ? "--" : (mm.microprice_edge_bps > 0 ? "+" : "") + mm.microprice_edge_bps + " bps") +
+  " • Spread " + (mm.spread_bps == null ? "--" : mm.spread_bps + " bps") +
+  " • 10s move " + (mm.price_move_bps_10s == null ? "--" : (mm.price_move_bps_10s > 0 ? "+" : "") + mm.price_move_bps_10s + " bps")
+);
+setText("marketMakerEvidence", (mm.evidence || []).map(x => "• " + x).join("\n") || (mm.reason || "Waiting for independent evidence."));
+setText("marketMakerWarning", (mm.warning || "Market-pressure estimate only.") + " • reconnects " + (mm.reconnects || 0));
 
 
 const verdict =
